@@ -1501,6 +1501,18 @@ impl AppStoreReducer {
         if !self.chat.is_tracked(&key) {
             return;
         }
+        if let UiEvent::TurnRetrying { turn_id, .. } = event {
+            let snapshot = self.snapshot.read().expect("app store lock poisoned");
+            if !snapshot
+                .threads
+                .get(&key)
+                .is_some_and(|thread| thread.active_turn_id.as_deref() == Some(turn_id.as_str()))
+            {
+                // A replayed retry for a settled or replaced turn must not
+                // resurrect its reconnecting indicator.
+                return;
+            }
+        }
         let Some((key, mut events)) = crate::source::app_server::source_events(event) else {
             return;
         };
@@ -1679,6 +1691,9 @@ impl AppStoreReducer {
                 ExternalSourceEvent::StopFailed => {
                     self.chat
                         .apply_local_if_tracked(key, super::turn::LocalAction::StopFailed);
+                }
+                ExternalSourceEvent::CarriedOverTranscript { messages } => {
+                    self.chat.set_carried_over(key, source_kind.clone(), &messages);
                 }
                 other => {
                     tracing::warn!(
@@ -2429,6 +2444,9 @@ impl AppStoreReducer {
                     }
                 }
             }
+            // Recoverable failures are rendered through the turn machine's
+            // progress label and must never become historical error items.
+            UiEvent::TurnRetrying { .. } => {}
             UiEvent::UserInputRequested { request, seed } => {
                 let requests = {
                     let mut snapshot = self.snapshot.write().expect("app store lock poisoned");

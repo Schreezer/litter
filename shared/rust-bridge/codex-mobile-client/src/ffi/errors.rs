@@ -14,6 +14,8 @@ pub enum ClientError {
     MinigameGenerationFailed(String),
     #[error("ChatGPT sign-in required")]
     AuthenticationRequired,
+    #[error("Thread history is unavailable")]
+    ThreadHistoryUnavailable,
 }
 
 impl From<crate::RpcClientError> for ClientError {

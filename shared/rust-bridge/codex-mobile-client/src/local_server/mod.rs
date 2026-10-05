@@ -5,8 +5,8 @@
 //! terminal command. Not used on the App Store Mac lane (sandboxed) or iOS.
 //!
 //! Flow per `attach_or_spawn`:
-//!   1. Try a cheap TCP probe on `127.0.0.1:{port}`. If something is
-//!      listening, attach to it and do not spawn.
+//!   1. Verify the Codex initialize handshake on `127.0.0.1:{port}`. If a
+//!      compatible app-server is listening, attach to it and do not spawn.
 //!   2. Resolve a `codex` binary from the same candidate paths the SSH
 //!      bootstrap would probe remotely.
 //!   3. If not found, fail with a clear "install Codex" error.
@@ -16,26 +16,29 @@
 //! The returned `LocalServerHandle` keeps the child alive; dropping it or
 //! calling `stop()` terminates the process.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use futures::{SinkExt, StreamExt};
+use serde_json::json;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
 /// How long to wait for a single connect attempt before considering nothing
 /// is listening. Matches the "quick attach check" semantics in the plan.
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(150);
+const PROBE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const BINARY_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Max number of readiness poll iterations after spawn. 20 × 250 ms == 5 s.
 const READINESS_MAX_ATTEMPTS: u32 = 20;
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
-
-const OPENAI_BASE_URL_ENV_KEY: &str = "OPENAI_BASE_URL";
 
 /// POSIX candidate lines shared with Alleycat's Codex resolver.
 pub(crate) const fn shell_candidate_lines() -> &'static [&'static str] {
@@ -46,25 +49,180 @@ pub(crate) const fn shell_candidate_lines() -> &'static [&'static str] {
 // Probe + resolve
 // ---------------------------------------------------------------------------
 
-/// Attempt a quick TCP connect to `127.0.0.1:{port}` with a short timeout.
-/// Returns `true` if something accepted the connection.
+/// Verify that a listener speaks Codex app-server's initialize protocol.
+/// An arbitrary TCP or WebSocket listener is not a valid local Codex.
 pub async fn probe_local_server(port: u16) -> bool {
-    let addr = ("127.0.0.1", port);
-    match tokio::time::timeout(PROBE_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-        Ok(Ok(mut stream)) => {
-            // Be polite — immediately shut down so we don't leave a dangling
-            // half-open connection on the app-server.
-            let _ = stream.shutdown().await;
-            true
+    tokio::time::timeout(PROBE_HANDSHAKE_TIMEOUT, async {
+        let (mut socket, _) = connect_async(format!("ws://127.0.0.1:{port}")).await.ok()?;
+        socket
+            .send(Message::Text(
+                json!({
+                    "id": "learnfold-local-probe",
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": {
+                            "name": "learnfold_local_probe",
+                            "title": "Learnfold",
+                            "version": env!("CARGO_PKG_VERSION")
+                        },
+                        "capabilities": {"experimentalApi": true}
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .ok()?;
+        while let Some(message) = socket.next().await {
+            let message = message.ok()?;
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+            if value.get("id") != Some(&json!("learnfold-local-probe")) {
+                continue;
+            }
+            let valid = value.get("error").is_none()
+                && value
+                    .pointer("/result/userAgent")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|agent| !agent.is_empty())
+                && value
+                    .pointer("/result/codexHome")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|home| Path::new(home).is_absolute());
+            let _ = socket.close(None).await;
+            return Some(valid);
         }
-        _ => false,
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+/// Find installed Codex without relying on Finder inheriting a login-shell
+/// PATH. NVM's versioned bins also need their sibling `node` on the child PATH.
+pub async fn resolve_codex_binary_local() -> Option<PathBuf> {
+    let mut candidates =
+        alleycat_bridge_core::codex_resolver::program_candidates(Path::new("codex"));
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let nvm_dir = std::env::var_os("NVM_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".nvm"));
+        candidates.extend(nvm_codex_candidates(&nvm_dir));
+        // Catalyst's Rust target is iOS, so the shared resolver's macOS
+        // cfg does not include these app-bundled candidates.
+        candidates.push(home.join("Applications/Codex.app/Contents/Resources/codex"));
+        candidates.push(PathBuf::from(
+            "/Applications/Codex.app/Contents/Resources/codex",
+        ));
+    }
+    resolve_codex_candidates(candidates).await
+}
+
+async fn resolve_codex_candidates(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut best = None;
+    for candidate in candidates {
+        if !is_executable_file(&candidate) || !seen.insert(candidate.clone()) {
+            continue;
+        }
+        let output = tokio::time::timeout(
+            BINARY_VERSION_TIMEOUT,
+            Command::new(&candidate)
+                .arg("--version")
+                .env("PATH", codex_child_path(&candidate))
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        let Ok(Ok(output)) = output else { continue };
+        if !output.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let Some(version) = alleycat_bridge_core::codex_resolver::parse_codex_cli_version(&text)
+        else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(previous, _)| version > *previous)
+        {
+            best = Some((version, candidate));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+fn nvm_codex_candidates(nvm_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(nvm_dir.join("versions/node")) else {
+        return Vec::new();
+    };
+    let mut candidates = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("bin/codex"))
+        .filter(|path| is_executable_file(path))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
-/// Resolve a local `codex` binary using Alleycat's shared newest-version
-/// resolver, which is also used by SSH bootstrap and the Alleycat daemon.
-pub fn resolve_codex_binary_local() -> Option<PathBuf> {
-    alleycat_bridge_core::codex_resolver::resolve_latest_codex_binary(Path::new("codex"))
+fn codex_child_path(codex_path: &Path) -> OsString {
+    let mut paths = Vec::new();
+    if let Some(parent) = codex_path.parent() {
+        paths.push(parent.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        paths.extend(
+            [".local/bin", ".cargo/bin", ".volta/bin", ".bun/bin"].map(|path| home.join(path)),
+        );
+    }
+    paths.extend(
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+        .map(PathBuf::from),
+    );
+    let mut seen = HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
+    std::env::join_paths(paths).unwrap_or_else(|_| {
+        codex_path
+            .parent()
+            .unwrap_or(Path::new("/usr/bin"))
+            .as_os_str()
+            .to_os_string()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +238,12 @@ pub enum LocalServerError {
     BinaryNotFound,
     #[error("failed to spawn codex app-server: {0}")]
     Spawn(String),
+    #[error(
+        "127.0.0.1:{port} is occupied by a listener that does not speak compatible Codex app-server; choose another port or stop that listener"
+    )]
+    EndpointOccupied { port: u16 },
+    #[error("codex app-server exited before becoming ready: {0}")]
+    ProcessExited(String),
     #[error(
         "codex app-server did not become ready on 127.0.0.1:{port} within {timeout_ms}ms: {reason}"
     )]
@@ -180,8 +344,8 @@ unsafe extern "C" {
     fn raw_kill(pid: i32, sig: i32) -> i32;
 }
 
-/// Attach to an existing `127.0.0.1:{port}` listener, or spawn one if
-/// nothing is listening. Returns a handle describing the connection and,
+/// Attach to a compatible app-server, or spawn one if nothing is listening.
+/// Returns a handle describing the connection and,
 /// when we spawned, a process to keep alive.
 pub async fn attach_or_spawn_local_server(
     port: u16,
@@ -197,16 +361,29 @@ pub async fn attach_or_spawn_local_server(
         });
     }
 
+    if matches!(
+        tokio::time::timeout(
+            PROBE_CONNECT_TIMEOUT,
+            TcpStream::connect(("127.0.0.1", port))
+        )
+        .await,
+        Ok(Ok(_))
+    ) {
+        return Err(LocalServerError::EndpointOccupied { port });
+    }
+
     info!(
         "no existing codex on 127.0.0.1:{}; attempting to spawn",
         port
     );
 
-    let codex_path = resolve_codex_binary_local().ok_or(LocalServerError::BinaryNotFound)?;
+    let codex_path = resolve_codex_binary_local()
+        .await
+        .ok_or(LocalServerError::BinaryNotFound)?;
 
-    let handle = spawn_local_server(port, &codex_path, codex_home.as_deref()).await?;
+    let mut handle = spawn_local_server(port, &codex_path, codex_home.as_deref()).await?;
 
-    match wait_for_local_server_ready(port).await {
+    match wait_for_local_server_ready(port, &mut handle).await {
         Ok(()) => Ok(LocalServerAttach {
             port,
             handle: Some(handle),
@@ -228,15 +405,6 @@ async fn spawn_local_server(
 ) -> Result<LocalServerHandle, LocalServerError> {
     let listen_url = format!("ws://127.0.0.1:{port}");
     let mut cmd = Command::new(codex_path);
-    cmd.arg("--enable").arg("goals");
-
-    if let Some(base_url) = openai_base_url_from_env() {
-        cmd.arg("--config").arg(format!(
-            "openai_base_url={}",
-            toml_string_literal(&base_url)
-        ));
-    }
-
     cmd.arg("app-server")
         .arg("--listen")
         .arg(&listen_url)
@@ -245,6 +413,7 @@ async fn spawn_local_server(
         // alongside the app's own logs (Console.app on Mac).
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
+        .env("PATH", codex_child_path(codex_path))
         .kill_on_drop(true);
 
     if let Some(home) = codex_home {
@@ -269,14 +438,28 @@ async fn spawn_local_server(
     })
 }
 
-async fn wait_for_local_server_ready(port: u16) -> Result<(), LocalServerError> {
-    let url = format!("ws://127.0.0.1:{port}");
-    let mut last_error = String::new();
+async fn wait_for_local_server_ready(
+    port: u16,
+    handle: &mut LocalServerHandle,
+) -> Result<(), LocalServerError> {
+    let timeout = READINESS_POLL_INTERVAL * READINESS_MAX_ATTEMPTS;
+    let deadline = tokio::time::Instant::now() + timeout;
 
     for attempt in 0..READINESS_MAX_ATTEMPTS {
-        match connect_async(&url).await {
-            Ok((mut ws, _)) => {
-                let _ = ws.close(None).await;
+        if let Some(child) = handle.child.as_mut() {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| LocalServerError::Spawn(error.to_string()))?
+            {
+                return Err(LocalServerError::ProcessExited(status.to_string()));
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, probe_local_server(port)).await {
+            Ok(true) => {
                 debug!(
                     "local codex ready on 127.0.0.1:{} after attempt {}",
                     port,
@@ -284,58 +467,28 @@ async fn wait_for_local_server_ready(port: u16) -> Result<(), LocalServerError> 
                 );
                 return Ok(());
             }
-            Err(err) => {
-                last_error = err.to_string();
+            _ => {
                 if attempt == 0 || attempt + 1 == READINESS_MAX_ATTEMPTS {
                     debug!(
                         "local codex readiness attempt {} failed: {}",
                         attempt + 1,
-                        last_error
+                        "initialize handshake not ready"
                     );
                 }
             }
         }
-        sleep(READINESS_POLL_INTERVAL).await;
+        sleep(
+            READINESS_POLL_INTERVAL
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
     }
 
     Err(LocalServerError::ReadinessTimeout {
         port,
-        timeout_ms: (READINESS_POLL_INTERVAL * READINESS_MAX_ATTEMPTS).as_millis() as u64,
-        reason: last_error,
+        timeout_ms: timeout.as_millis() as u64,
+        reason: "compatible initialize handshake was not received; check Codex installation and Console logs".to_string(),
     })
-}
-
-fn openai_base_url_from_env() -> Option<String> {
-    std::env::var(OPENAI_BASE_URL_ENV_KEY)
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn toml_string_literal(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len() + 2);
-    escaped.push('"');
-    for ch in value.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            ch if ch.is_control() => {
-                use std::fmt::Write as _;
-                let codepoint = ch as u32;
-                if codepoint <= 0xFFFF {
-                    let _ = write!(escaped, "\\u{codepoint:04X}");
-                } else {
-                    let _ = write!(escaped, "\\U{codepoint:08X}");
-                }
-            }
-            ch => escaped.push(ch),
-        }
-    }
-    escaped.push('"');
-    escaped
 }
 
 // ---------------------------------------------------------------------------
@@ -371,22 +524,98 @@ mod tests {
         assert!(shell.contains("/usr/bin/codex"));
     }
 
-    #[test]
-    fn toml_string_literal_escapes_base_url_value() {
-        assert_eq!(
-            toml_string_literal("http://localhost:11434/v1"),
-            "\"http://localhost:11434/v1\""
-        );
-        assert_eq!(
-            toml_string_literal("http://host/quote\"slash\\"),
-            "\"http://host/quote\\\"slash\\\\\""
-        );
-    }
-
     #[tokio::test]
     async fn probe_returns_false_for_unused_port() {
         // Pick a high port unlikely to be in use in CI. If a flake
         // happens, bump this to a different port.
         assert!(!probe_local_server(1).await);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_an_unrelated_tcp_listener() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = stream
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        let result = attach_or_spawn_local_server(port, None).await;
+        assert!(
+            matches!(result, Err(LocalServerError::EndpointOccupied { port: occupied }) if occupied == port)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_attaches_only_after_a_codex_initialize_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "initialize");
+            socket.send(Message::Text(json!({
+                "id": request["id"],
+                "result": {"userAgent": "codex-cli/0.160.0", "codexHome": "/tmp/test-codex-home"}
+            }).to_string().into())).await.unwrap();
+            let _ = socket.next().await;
+        });
+        let connection = attach_or_spawn_local_server(port, None).await.unwrap();
+        assert!(connection.attached_to_existing);
+        assert!(connection.handle.is_none());
+        assert_eq!(connection.port, port);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_a_websocket_without_codex_initialize_fields() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"id": request["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket.next().await;
+        });
+        assert!(!probe_local_server(port).await);
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nvm_codex_resolves_with_its_sibling_node_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let nvm_dir = directory.path().join(".nvm");
+        let bin = nvm_dir.join("versions/node/v22.18.0/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        let node = bin.join("node");
+        std::fs::write(&codex, "#!/usr/bin/env node\n").unwrap();
+        std::fs::write(&node, "#!/bin/sh\nprintf 'codex-cli 0.160.0\\n'\n").unwrap();
+        for executable in [&codex, &node] {
+            std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let candidates = nvm_codex_candidates(&nvm_dir);
+        assert_eq!(candidates, vec![codex.clone()]);
+        let paths = std::env::split_paths(&codex_child_path(&codex)).collect::<Vec<_>>();
+        assert_eq!(paths.first(), Some(&bin));
+        assert_eq!(resolve_codex_candidates(candidates).await, Some(codex));
     }
 }

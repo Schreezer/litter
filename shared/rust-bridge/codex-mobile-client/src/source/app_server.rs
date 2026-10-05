@@ -34,6 +34,12 @@ pub(crate) fn source_events(event: &UiEvent) -> Option<(ThreadKey, Vec<SourceEve
                 outcome: turn_outcome(error.as_deref(), *interrupted),
             }],
         )),
+        UiEvent::TurnRetrying { key, message, .. } => Some((
+            key.clone(),
+            vec![SourceEvent::Progress {
+                label: Some(message.clone()),
+            }],
+        )),
         UiEvent::ItemStarted { key, notification } => {
             let item = hydrated(&notification.item, &notification.turn_id)?;
             Some((key.clone(), vec![SourceEvent::ItemStarted { item }]))
@@ -112,6 +118,7 @@ pub(crate) fn event_thread_key(event: &UiEvent) -> Option<ThreadKey> {
     match event {
         UiEvent::TurnStarted { key, .. }
         | UiEvent::TurnCompleted { key, .. }
+        | UiEvent::TurnRetrying { key, .. }
         | UiEvent::ItemStarted { key, .. }
         | UiEvent::ItemCompleted { key, .. }
         | UiEvent::MessageDelta { key, .. }
@@ -216,6 +223,29 @@ mod tests {
                 thread_name: None
             })
             .is_none()
+        );
+    }
+
+    #[test]
+    fn retryable_turn_errors_map_to_progress_only() {
+        let key = ThreadKey {
+            server_id: "srv".into(),
+            thread_id: "thr".into(),
+        };
+        let event = UiEvent::TurnRetrying {
+            key: key.clone(),
+            turn_id: "turn-1".into(),
+            message: "Reconnecting... 1/5".into(),
+        };
+        assert_eq!(event_thread_key(&event), Some(key.clone()));
+        assert_eq!(
+            source_events(&event),
+            Some((
+                key,
+                vec![SourceEvent::Progress {
+                    label: Some("Reconnecting... 1/5".into()),
+                }],
+            )),
         );
     }
 }

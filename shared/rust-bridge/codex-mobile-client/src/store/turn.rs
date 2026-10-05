@@ -364,6 +364,7 @@ impl TurnMachine {
                     }
                     if self.active_turn_id.as_deref() != Some(turn_id.as_str()) {
                         self.running_tools.clear();
+                        self.progress_label = None;
                     }
                     self.active_turn_id = Some(turn_id.clone());
                     self.pending_request_at_ms = None;
@@ -386,19 +387,34 @@ impl TurnMachine {
             SourceEvent::Progress { label } => {
                 self.progress_label = label.clone().filter(|label| !label.trim().is_empty());
             }
-            SourceEvent::TextDelta { .. } | SourceEvent::ItemStarted { .. } => {
+            SourceEvent::TextDelta { .. } => {
                 if !matches!(self.phase, TurnPhase::Settled { .. }) {
                     self.progress_label = None;
-                    if let SourceEvent::ItemStarted { item } = event
+                }
+            }
+            SourceEvent::ItemStarted { item }
+            | SourceEvent::ItemUpdated { item }
+            | SourceEvent::ItemCompleted { item } => {
+                if !matches!(self.phase, TurnPhase::Settled { .. }) {
+                    if item
+                        .source_turn_id
+                        .as_deref()
+                        .is_none_or(|turn_id| self.active_turn_id.as_deref() == Some(turn_id))
+                    {
+                        self.progress_label = None;
+                    }
+                    if matches!(event, SourceEvent::ItemStarted { .. })
                         && item_activity(item) == ItemActivity::Tool
                         && !is_finished_tool(item)
                     {
                         self.running_tools.insert(item.id.clone());
                     }
                 }
-            }
-            SourceEvent::ItemCompleted { item } if item_activity(item) == ItemActivity::Tool => {
-                self.running_tools.remove(&item.id);
+                if matches!(event, SourceEvent::ItemCompleted { .. })
+                    && item_activity(item) == ItemActivity::Tool
+                {
+                    self.running_tools.remove(&item.id);
+                }
             }
             _ => {}
         }
@@ -796,6 +812,62 @@ mod tests {
         assert_eq!(machine.progress_label(), None);
         assert_eq!(machine.phase(), &TurnPhase::Streaming);
     }
+
+    #[test]
+    fn progress_label_clears_when_item_activity_resumes() {
+        for event in [
+            SourceEvent::ItemStarted { item: answer() },
+            SourceEvent::ItemUpdated { item: answer() },
+            SourceEvent::ItemCompleted { item: answer() },
+        ] {
+            let mut machine = TurnMachine::new(TurnPhase::Streaming);
+            machine.apply(
+                &SourceEvent::TurnStarted {
+                    turn_id: "t".into(),
+                },
+                0,
+            );
+            machine.apply(
+                &SourceEvent::Progress {
+                    label: Some("Reconnecting... 1/5".into()),
+                },
+                1,
+            );
+            assert_eq!(machine.progress_label(), Some("Reconnecting... 1/5"));
+            machine.apply(&event, 2);
+            assert_eq!(machine.progress_label(), None, "resumed event: {event:?}");
+        }
+    }
+
+    #[test]
+    fn progress_label_ignores_item_activity_from_an_older_turn() {
+        let mut machine = TurnMachine::new(TurnPhase::Streaming);
+        machine.apply(
+            &SourceEvent::TurnStarted {
+                turn_id: "new-turn".into(),
+            },
+            0,
+        );
+        machine.apply(
+            &SourceEvent::Progress {
+                label: Some("Reconnecting... 1/5".into()),
+            },
+            1,
+        );
+        for event in [
+            SourceEvent::ItemStarted { item: answer() },
+            SourceEvent::ItemUpdated { item: answer() },
+            SourceEvent::ItemCompleted { item: answer() },
+        ] {
+            machine.apply(&event, 2);
+            assert_eq!(machine.progress_label(), Some("Reconnecting... 1/5"));
+        }
+        let mut unscoped = answer();
+        unscoped.source_turn_id = None;
+        machine.apply(&SourceEvent::ItemUpdated { item: unscoped }, 3);
+        assert_eq!(machine.progress_label(), None);
+    }
+
     #[test]
     fn failed_stop_restores_the_phase_the_turn_reached() {
         let mut machine = TurnMachine::new(TurnPhase::Thinking);

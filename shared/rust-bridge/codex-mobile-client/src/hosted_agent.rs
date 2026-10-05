@@ -70,6 +70,14 @@ pub struct HostedAgentMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct HostedAgentSessionSnapshot {
+    pub messages: Vec<HostedAgentMessage>,
+    pub active: bool,
+    pub originating_device: bool,
+    pub waiting_for_tools: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct HostedAgentTurnResult {
     pub session_id: String,
     pub response_text: String,
@@ -91,6 +99,7 @@ pub struct HostedAgentClient {
     base_url: Url,
     access_token: String,
     guest_secret: Option<String>,
+    origin_id: Mutex<Option<String>>,
     active_cancellations: Arc<Mutex<HashMap<String, ActiveCancellation>>>,
 }
 
@@ -133,6 +142,7 @@ impl HostedAgentClient {
             base_url,
             access_token,
             guest_secret: None,
+            origin_id: Mutex::new(None),
             active_cancellations: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -165,8 +175,23 @@ impl HostedAgentClient {
             base_url,
             access_token: String::new(),
             guest_secret: Some(guest_secret),
+            origin_id: Mutex::new(None),
             active_cancellations: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Nonsecret, device-local identity for native tool ownership. It must not
+    /// be synchronized with the account credential or course session locator.
+    pub fn set_origin_id(&self, origin_id: String) -> Result<(), HostedAgentError> {
+        let id =
+            Uuid::parse_str(&origin_id).map_err(|_| HostedAgentError::InvalidConfiguration {
+                detail: "the hosted device origin must be a UUID".into(),
+            })?;
+        *self
+            .origin_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.to_string());
+        Ok(())
     }
 
     /// Cancels an in-flight turn for this client and session. The send loop
@@ -183,8 +208,7 @@ impl HostedAgentClient {
             .map(|entry| entry.sender.send(true).is_ok())
             .unwrap_or(false);
         drop(active);
-        if cancelled
-            && let Some(client) = crate::ffi::shared::shared_mobile_client_if_initialized()
+        if cancelled && let Some(client) = crate::ffi::shared::shared_mobile_client_if_initialized()
         {
             // The chat shows "Stopping…" until `send` settles the turn.
             client.app_store.chat_local_action(
@@ -202,11 +226,91 @@ impl HostedAgentClient {
         &self,
         session_id: String,
     ) -> Result<Vec<HostedAgentMessage>, HostedAgentError> {
+        Ok(self.load_session(session_id).await?.messages)
+    }
+
+    /// Session activity is authoritative alongside its persisted transcript.
+    pub async fn load_session(
+        &self,
+        session_id: String,
+    ) -> Result<HostedAgentSessionSnapshot, HostedAgentError> {
         validate_session_id(&session_id)?;
-        let (mut socket, messages) = self.connect(&session_id).await?;
+        let (mut socket, messages, activity) = self.connect(&session_id).await?;
         let _ = socket.close(None).await;
-        crate::source::hosted::HostedAdapter::attach(&session_id).hydrate(&messages);
-        Ok(project_messages(&messages))
+        let adapter = crate::source::hosted::HostedAdapter::attach(&session_id);
+        if !activity.active {
+            adapter.hydrate_idle_activity(&messages, activity.terminal_status.as_deref());
+        }
+        adapter.hydrate(&messages);
+        if activity.active {
+            adapter.hydrate_activity(
+                &messages,
+                activity.originating_device,
+                activity.waiting_for_tools,
+            );
+        }
+        Ok(HostedAgentSessionSnapshot {
+            messages: project_messages(&messages),
+            active: activity.active,
+            originating_device: activity.originating_device,
+            waiting_for_tools: activity.waiting_for_tools,
+        })
+    }
+
+    /// Only the originating device may recover an interrupted client-tool
+    /// pause. The platform must first flush/re-read its authoritative pages.
+    /// No tool execution or model turn is started by this operation.
+    pub async fn recover_interrupted_session(
+        &self,
+        session_id: String,
+        workspace_id: String,
+        refreshed_pages_receipt: String,
+    ) -> Result<bool, HostedAgentError> {
+        validate_session_id(&session_id)?;
+        validate_workspace_id(&workspace_id)?;
+        if refreshed_pages_receipt.len() != 64
+            || !refreshed_pages_receipt
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(HostedAgentError::InvalidConfiguration {
+                detail: "course pages must be refreshed before recovering a hosted tool pause"
+                    .into(),
+            });
+        }
+        let (mut socket, _, activity) = self.connect(&session_id).await?;
+        if !activity.active {
+            let _ = socket.close(None).await;
+            return Ok(false);
+        }
+        if !activity.originating_device || !activity.waiting_for_tools {
+            let _ = socket.close(None).await;
+            return Err(HostedAgentError::Request { detail: "Only the original device can recover an interrupted Hosted tool pause. A running task must finish or be cancelled there first.".into() });
+        }
+        let request_id = Uuid::new_v4().to_string();
+        send_json(
+            &mut socket,
+            &json!({
+                "type":"learnfold_hosted_recover_interrupted", "id":request_id,
+                "workspaceId":workspace_id, "refreshedPagesReceipt":refreshed_pages_receipt,
+            }),
+        )
+        .await?;
+        loop {
+            let frame = next_json(&mut socket).await?;
+            if frame.get("type").and_then(Value::as_str) != Some("learnfold_hosted_recovery_result")
+                || frame.get("id").and_then(Value::as_str) != Some(request_id.as_str())
+            {
+                continue;
+            }
+            let _ = socket.close(None).await;
+            if frame.get("success").and_then(Value::as_bool) == Some(true) {
+                return Ok(true);
+            }
+            return Err(HostedAgentError::Request {
+                detail: frame.get("error").and_then(Value::as_str).unwrap_or("The interrupted Hosted task could not be recovered. Its history remains saved.").to_string(),
+            });
+        }
     }
 
     /// Sends one user turn. Think remains authoritative for persistence,
@@ -245,7 +349,6 @@ impl HostedAgentClient {
             .filter(|id| !id.is_empty())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let request_id = Uuid::new_v4().to_string();
-        adapter.begin(&message_id, &prompt);
         let result = self
             .send_turn(
                 session_id,
@@ -259,7 +362,9 @@ impl HostedAgentClient {
                 &mut adapter,
             )
             .await;
-        adapter.finish(&result);
+        if adapter.has_started() {
+            adapter.finish(&result);
+        }
         result
     }
 }
@@ -279,10 +384,17 @@ impl HostedAgentClient {
         adapter: &mut crate::source::hosted::HostedAdapter,
     ) -> Result<HostedAgentTurnResult, HostedAgentError> {
         let mut cancellation = self.register_cancellation(&session_id);
-        let (mut socket, mut messages) = self.connect(&session_id).await?;
+        let (mut socket, mut messages, activity) = self.connect(&session_id).await?;
+        if activity.active {
+            let _ = socket.close(None).await;
+            return Err(HostedAgentError::Request {
+                detail: "This Hosted conversation is still working on its original device. Wait for that task to finish, sync the course, then reopen the discussion to continue.".into(),
+            });
+        }
         if *cancellation.receiver.borrow() {
             return Err(HostedAgentError::Cancelled);
         }
+        adapter.begin(&message_id, &prompt);
         messages.push(json!({
             "id": message_id,
             "role": "user",
@@ -394,7 +506,8 @@ impl HostedAgentClient {
                         if !handled_tool_calls.insert(tool_call_id.to_string()) {
                             continue;
                         }
-                        let arguments_json = serde_json::to_string(input).map_err(protocol_error)?;
+                        let arguments_json =
+                            serde_json::to_string(input).map_err(protocol_error)?;
                         adapter.tool_started(tool_call_id, tool_name, &arguments_json);
                         let result = tool_handler.execute_hosted_tool(HostedAgentToolInvocation {
                             session_id: session_id.clone(),
@@ -501,6 +614,14 @@ fn stream_chunk_error(chunk: &Value) -> Option<HostedAgentError> {
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+#[derive(Default)]
+struct HostedSessionActivity {
+    active: bool,
+    originating_device: bool,
+    waiting_for_tools: bool,
+    terminal_status: Option<String>,
+}
+
 impl HostedAgentClient {
     fn register_cancellation(&self, session_id: &str) -> CancellationRegistration {
         let token = Uuid::new_v4();
@@ -522,7 +643,10 @@ impl HostedAgentClient {
         }
     }
 
-    async fn connect(&self, session_id: &str) -> Result<(Socket, Vec<Value>), HostedAgentError> {
+    async fn connect(
+        &self,
+        session_id: &str,
+    ) -> Result<(Socket, Vec<Value>, HostedSessionActivity), HostedAgentError> {
         let access_token = self.session_access_token(session_id).await?;
         let url = websocket_url(&self.base_url, session_id)?;
         let mut request = url
@@ -537,6 +661,17 @@ impl HostedAgentClient {
                 }
             })?,
         );
+        let origin_id = self
+            .origin_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(origin_id) = origin_id {
+            request.headers_mut().insert(
+                "x-learnfold-origin-id",
+                HeaderValue::from_str(&origin_id).map_err(protocol_error)?,
+            );
+        }
         let (mut socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request))
             .await
             .map_err(|_| HostedAgentError::Connection {
@@ -544,6 +679,7 @@ impl HostedAgentClient {
             })?
             .map_err(connection_error)?;
 
+        let mut activity = HostedSessionActivity::default();
         loop {
             let frame = next_json(&mut socket).await?;
             match frame.get("type").and_then(Value::as_str) {
@@ -553,7 +689,25 @@ impl HostedAgentClient {
                         .and_then(Value::as_array)
                         .cloned()
                         .unwrap_or_default();
-                    return Ok((socket, messages));
+                    return Ok((socket, messages, activity));
+                }
+                Some("learnfold_hosted_session_status") => {
+                    activity.active = frame
+                        .get("active")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    activity.originating_device = frame
+                        .get("originatingDevice")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    activity.waiting_for_tools = frame
+                        .get("waitingForTools")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    activity.terminal_status = frame
+                        .get("terminalStatus")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
                 }
                 Some("cf_agent_stream_resuming") => {
                     if let Some(id) = frame.get("id").and_then(Value::as_str) {
@@ -1086,6 +1240,120 @@ mod tests {
     impl HostedAgentEventListener for TestListener {
         fn on_response_delta(&self, _: String) {}
         fn on_recovering_changed(&self, _: bool) {}
+    }
+
+    #[tokio::test]
+    async fn observing_an_active_turn_never_submits_a_duplicate_or_executes_replayed_tools() {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = server.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for frame in [
+                json!({"type":"learnfold_hosted_session_status", "active":true, "originatingDevice":false, "waitingForTools":true}),
+                json!({"type":"cf_agent_chat_messages", "messages":[{"id":"original", "role":"user", "parts":[{"type":"text", "text":"Generate the lesson"}]}]}),
+                json!({"type":"cf_agent_stream_resuming", "id":"origin-request"}),
+            ] {
+                let _ = ws.send(WsMessage::Text(frame.to_string().into())).await;
+            }
+            while let Some(frame) = ws.next().await {
+                match frame.unwrap() {
+                    WsMessage::Close(_) => break,
+                    WsMessage::Text(text) => {
+                        panic!("observer must neither submit nor execute replay: {text}")
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let client =
+            HostedAgentClient::new(format!("http://{address}"), "test-token".into()).unwrap();
+        let result = client
+            .send(
+                Uuid::new_v4().to_string(),
+                "course-a".into(),
+                "Continue".into(),
+                Some("duplicate".into()),
+                vec![],
+                Box::new(TestToolHandler),
+                Box::new(TestListener),
+            )
+            .await;
+        assert!(result.unwrap_err().to_string().contains("original device"));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_history_load_is_read_only_and_retains_saved_assistant_text() {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = server.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(WsMessage::Text(json!({"type":"learnfold_hosted_session_status", "active":true, "waitingForTools":true}).to_string().into())).await.unwrap();
+            ws.send(WsMessage::Text(json!({"type":"cf_agent_chat_messages", "messages":[
+                {"id":"user-1", "role":"user", "parts":[{"type":"text", "text":"Explain the lesson"}]},
+                {"id":"assistant-1", "role":"assistant", "parts":[{"type":"text", "text":"Your saved answer"}, {"type":"tool-native-editor-fetch", "state":"output-available", "output":{}}]},
+            ]}).to_string().into())).await.unwrap();
+            assert!(matches!(
+                ws.next().await.unwrap().unwrap(),
+                WsMessage::Close(_)
+            ));
+        });
+        let client =
+            HostedAgentClient::new(format!("http://{address}"), "test-token".into()).unwrap();
+        let messages = client
+            .load_messages(Uuid::new_v4().to_string())
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].text, "Your saved answer");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_recovery_requires_original_device_and_a_page_refresh_receipt() {
+        for originating_device in [false, true] {
+            let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = server.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (tcp, _) = server.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                ws.send(WsMessage::Text(json!({"type":"learnfold_hosted_session_status", "active":true, "originatingDevice":originating_device, "waitingForTools":true}).to_string().into())).await.unwrap();
+                ws.send(WsMessage::Text(
+                    json!({"type":"cf_agent_chat_messages", "messages":[]})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+                let frame = ws.next().await.unwrap().unwrap();
+                if originating_device {
+                    let request: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                    assert_eq!(request["type"], "learnfold_hosted_recover_interrupted");
+                    assert_eq!(request["workspaceId"], "course-a");
+                    assert_eq!(request["refreshedPagesReceipt"], "a".repeat(64));
+                    ws.send(WsMessage::Text(json!({"type":"learnfold_hosted_recovery_result", "id":request["id"], "success":true}).to_string().into())).await.unwrap();
+                } else {
+                    assert!(matches!(frame, WsMessage::Close(_)));
+                }
+            });
+            let client =
+                HostedAgentClient::new(format!("http://{address}"), "test-token".into()).unwrap();
+            let result = client
+                .recover_interrupted_session(
+                    Uuid::new_v4().to_string(),
+                    "course-a".into(),
+                    "a".repeat(64),
+                )
+                .await;
+            if originating_device {
+                assert!(result.unwrap());
+            } else {
+                assert!(result.unwrap_err().to_string().contains("original device"));
+            }
+            task.await.unwrap();
+        }
     }
 
     #[tokio::test]

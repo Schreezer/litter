@@ -186,6 +186,13 @@ pub(crate) enum UiEvent {
     },
 
     // ── Errors ─────────────────────────────────────────────────────────
+    /// The server is retrying a recoverable turn failure. This belongs to
+    /// transient turn progress, never the persisted conversation history.
+    TurnRetrying {
+        key: ThreadKey,
+        turn_id: String,
+        message: String,
+    },
     Error {
         key: Option<ThreadKey>,
         message: String,
@@ -504,16 +511,24 @@ impl EventProcessor {
             }
             // ── Errors ──────────────────────────────────────────────
             ServerNotification::Error(n) => {
-                let key = Some(Self::make_key(server_id, &n.thread_id));
-                self.emit(UiEvent::Error {
-                    key,
-                    message: n.error.message.clone(),
-                    code: n.error.codex_error_info.as_ref().map(|_| {
-                        // CodexErrorInfo doesn't expose a numeric code directly;
-                        // no numeric code from the typed error.
-                        0i64
-                    }),
-                });
+                let key = Self::make_key(server_id, &n.thread_id);
+                if n.will_retry {
+                    self.emit(UiEvent::TurnRetrying {
+                        key,
+                        turn_id: n.turn_id.clone(),
+                        message: n.error.message.clone(),
+                    });
+                } else {
+                    self.emit(UiEvent::Error {
+                        key: Some(key),
+                        message: n.error.message.clone(),
+                        code: n.error.codex_error_info.as_ref().map(|_| {
+                            // CodexErrorInfo doesn't expose a numeric code directly;
+                            // no numeric code from the typed error.
+                            0i64
+                        }),
+                    });
+                }
             }
             ServerNotification::ThreadRealtimeError(n) => {
                 let key = Self::make_key(server_id, &n.thread_id);
@@ -1774,6 +1789,34 @@ mod tests {
                 assert_eq!(message, "oops");
             }
             other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retryable_error_notification_keeps_turn_scope_without_emitting_error() {
+        let notification = ServerNotification::Error(proto::ErrorNotification {
+            error: proto::TurnError {
+                message: "Reconnecting... 1/5".to_string(),
+                codex_error_info: None,
+                additional_details: None,
+            },
+            will_retry: true,
+            thread_id: "thr_1".to_string(),
+            turn_id: "turn_1".to_string(),
+        });
+        let evt = process_and_recv("srv1", &notification).expect("should emit");
+        match evt {
+            UiEvent::TurnRetrying {
+                key,
+                turn_id,
+                message,
+            } => {
+                assert_eq!(key.server_id, "srv1");
+                assert_eq!(key.thread_id, "thr_1");
+                assert_eq!(turn_id, "turn_1");
+                assert_eq!(message, "Reconnecting... 1/5");
+            }
+            other => panic!("expected transient TurnRetrying, got {other:?}"),
         }
     }
 

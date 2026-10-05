@@ -6,12 +6,12 @@
 use codex_app_server_protocol as upstream;
 use serde_json::{Value, json};
 
-use crate::session::events::UiEvent;
+use crate::session::events::{EventProcessor, UiEvent};
 use crate::source::{ExternalSourceEvent, SourceKind, TextChannel, TurnOutcome};
 use crate::store::AppStoreReducer;
 use crate::store::chat::{ChatView, ChatViewOptions};
 use crate::store::snapshot::ThreadSnapshot;
-use crate::store::timeline::{MessageDelivery, TimelineRowKind};
+use crate::store::timeline::{MessageDelivery, NoticeTone, TimelineRowKind};
 use crate::store::turn::TurnPhase;
 use crate::types::{ThreadInfo, ThreadKey, ThreadSummaryStatus};
 
@@ -107,6 +107,26 @@ fn turn_completed(turn: &str) -> UiEvent {
     }
 }
 
+fn error_notification(turn: &str, message: &str, will_retry: bool) -> UiEvent {
+    let processor = EventProcessor::new();
+    let mut events = processor.subscribe();
+    processor.process_notification(
+        "srv",
+        "codex".into(),
+        &upstream::ServerNotification::Error(upstream::ErrorNotification {
+            error: upstream::TurnError {
+                message: message.into(),
+                codex_error_info: None,
+                additional_details: None,
+            },
+            will_retry,
+            thread_id: "thread".into(),
+            turn_id: turn.into(),
+        }),
+    );
+    events.try_recv().expect("error notification event")
+}
+
 fn text_input(text: &str) -> Vec<upstream::UserInput> {
     vec![upstream::UserInput::Text {
         text: text.into(),
@@ -120,6 +140,164 @@ fn view(reducer: &AppStoreReducer) -> ChatView {
 
 fn ids(view: &ChatView) -> Vec<&str> {
     view.rows.iter().map(|row| row.id.as_str()).collect()
+}
+
+#[test]
+fn fixture_retry_notice_clears_when_output_resumes_and_turn_settles() {
+    for runtime in ["codex", "hermes"] {
+        let reducer = AppStoreReducer::new();
+        reducer.upsert_thread_snapshot(thread(runtime));
+        let _chat = reducer.chat_subscribe(&key());
+        reducer.apply_ui_event(&turn_started("t1"));
+        let retry = error_notification("t1", "Reconnecting... 1/5", true);
+
+        reducer.apply_ui_event(&retry);
+        assert_eq!(
+            view(&reducer).progress_label.as_deref(),
+            Some("Reconnecting... 1/5")
+        );
+        assert!(
+            view(&reducer).rows.is_empty(),
+            "retry is not a transcript row"
+        );
+        assert!(reducer.snapshot().threads[&key()].items.is_empty());
+
+        reducer.apply_ui_event(&started("t1", agent_message("a1", "The connection")));
+        assert_eq!(
+            view(&reducer).progress_label,
+            None,
+            "new output clears retry"
+        );
+
+        reducer.apply_ui_event(&retry);
+        reducer.apply_ui_event(&UiEvent::MessageDelta {
+            key: key(),
+            item_id: "a1".into(),
+            delta: " recovered.".into(),
+        });
+        assert_eq!(
+            view(&reducer).progress_label,
+            None,
+            "streaming clears retry"
+        );
+
+        reducer.apply_ui_event(&retry);
+        reducer.apply_ui_event(&completed(
+            "t1",
+            agent_message("a1", "The connection recovered."),
+        ));
+        assert_eq!(
+            view(&reducer).progress_label,
+            None,
+            "completed output clears retry"
+        );
+
+        reducer.apply_ui_event(&retry);
+        reducer.apply_ui_event(&turn_completed("t1"));
+        let settled = view(&reducer);
+        assert_eq!(
+            settled.progress_label, None,
+            "successful completion clears retry"
+        );
+        assert!(
+            !settled
+                .rows
+                .iter()
+                .any(|row| matches!(row.kind, TimelineRowKind::Notice { .. }))
+        );
+        assert!(
+            reducer.snapshot().threads[&key()]
+                .items
+                .iter()
+                .all(|item| !matches!(
+                    item.content,
+                    crate::conversation_uniffi::HydratedConversationItemContent::Error(_)
+                ))
+        );
+    }
+}
+
+#[test]
+fn fixture_retry_notice_ignores_settled_and_replaced_turns() {
+    let reducer = AppStoreReducer::new();
+    reducer.upsert_thread_snapshot(thread("codex"));
+    let _chat = reducer.chat_subscribe(&key());
+    reducer.apply_ui_event(&turn_started("t1"));
+    reducer.apply_ui_event(&turn_completed("t1"));
+    reducer.apply_ui_event(&error_notification("t1", "Reconnecting... 1/5", true));
+    assert_eq!(
+        view(&reducer).progress_label,
+        None,
+        "settled retry is stale"
+    );
+
+    reducer.apply_ui_event(&turn_started("t2"));
+    reducer.apply_ui_event(&error_notification("t1", "Reconnecting... 1/5", true));
+    assert_eq!(
+        view(&reducer).progress_label,
+        None,
+        "previous turn retry is stale"
+    );
+
+    reducer.apply_ui_event(&error_notification("t2", "Reconnecting... 2/5", true));
+    assert_eq!(
+        view(&reducer).progress_label.as_deref(),
+        Some("Reconnecting... 2/5")
+    );
+    reducer.apply_ui_event(&completed("t1", agent_message("a1", "Older turn output.")));
+    assert_eq!(
+        view(&reducer).progress_label.as_deref(),
+        Some("Reconnecting... 2/5"),
+        "older turn completion must not clear the active turn retry"
+    );
+    reducer.apply_ui_event(&completed("t2", agent_message("a2", "Recovered output.")));
+    assert_eq!(view(&reducer).progress_label, None);
+
+    reducer.apply_ui_event(&error_notification("t2", "Reconnecting... 3/5", true));
+    reducer.apply_ui_event(&turn_started("t3"));
+    assert_eq!(
+        view(&reducer).progress_label,
+        None,
+        "new turn clears old retry"
+    );
+    assert!(
+        reducer.snapshot().threads[&key()]
+            .items
+            .iter()
+            .all(|item| !matches!(
+                item.content,
+                crate::conversation_uniffi::HydratedConversationItemContent::Error(_)
+            ))
+    );
+}
+
+#[test]
+fn fixture_retry_notice_preserves_final_errors() {
+    let reducer = AppStoreReducer::new();
+    reducer.upsert_thread_snapshot(thread("codex"));
+    let _chat = reducer.chat_subscribe(&key());
+    reducer.apply_ui_event(&turn_started("t1"));
+    reducer.apply_ui_event(&error_notification("t1", "Reconnecting... 1/5", true));
+    reducer.apply_ui_event(&error_notification(
+        "t1",
+        "Connection failed after retries",
+        false,
+    ));
+    reducer.apply_ui_event(&UiEvent::TurnCompleted {
+        key: key(),
+        turn_id: "t1".into(),
+        error: Some("Connection failed after retries".into()),
+        interrupted: false,
+    });
+
+    let failed = view(&reducer);
+    assert_eq!(failed.progress_label, None);
+    assert!(failed.rows.iter().any(|row| matches!(
+        &row.kind,
+        TimelineRowKind::Notice { tone: NoticeTone::Error, message: Some(message), .. }
+            if message == "Connection failed after retries"
+    )));
+    assert_eq!(reducer.snapshot().threads[&key()].items.len(), 1);
 }
 
 /// Codex turn: optimistic send, server echo, two parallel tools, a streamed
@@ -537,4 +715,38 @@ impl AppStoreReducer {
             }],
         );
     }
+}
+
+#[test]
+fn fixture_discussion_options_drop_plan_rows_but_keep_the_prose() {
+    let reducer = AppStoreReducer::new();
+    reducer.upsert_thread_snapshot(thread("codex"));
+    let _chat = reducer.chat_subscribe(&key());
+    reducer.apply_ui_event(&turn_started("t1"));
+    let text = "Here is a route.\n\n```learnfold-plan\n# Bonds\nSummary: x\n```";
+    reducer.apply_ui_event(&completed("t1", agent_message("a1", text)));
+    reducer.apply_ui_event(&turn_completed("t1"));
+
+    let has_plan = |view: &ChatView| {
+        view.rows
+            .iter()
+            .any(|row| matches!(row.kind, TimelineRowKind::Plan { .. }))
+    };
+    assert!(has_plan(&view(&reducer)), "course chat keeps plan rows");
+
+    let discussion = reducer.chat_view(
+        &key(),
+        &ChatViewOptions {
+            hides_plan_rows: true,
+            ..ChatViewOptions::default()
+        },
+    );
+    assert!(!has_plan(&discussion), "discussion drops plan rows");
+    assert!(
+        discussion
+            .rows
+            .iter()
+            .any(|row| row.answer_text() == Some("Here is a route.")),
+        "the prose around the fence stays visible"
+    );
 }

@@ -23,6 +23,7 @@ use crate::conversation_uniffi::{
     HydratedConversationItem, HydratedConversationItemContent, HydratedDynamicToolCallData,
     HydratedErrorData, HydratedUserMessageData,
 };
+use crate::course_assessment::is_course_assessment_discussion_instruction;
 use crate::types::AppOperationStatus;
 
 pub const QUESTION_FENCE: &str = "learnfold-question";
@@ -903,7 +904,9 @@ pub fn learner_visible_text(text: &str, hides_selection_envelope: bool) -> Optio
         None
     };
     let learner_text = projected.as_deref().unwrap_or(text);
-    if is_internal_instruction(learner_text) {
+    if is_course_assessment_discussion_instruction(learner_text.to_string())
+        || is_internal_instruction(learner_text)
+    {
         return None;
     }
     Some(projected.unwrap_or_else(|| text.to_string()))
@@ -1010,7 +1013,18 @@ fn is_internal_course_action_user_item(item: &HydratedConversationItem) -> bool 
         return false;
     };
     let learner_text = remote_learner_message(&data.text).unwrap_or_else(|| data.text.clone());
-    is_internal_instruction(&learner_text)
+    // Assessment controls contain quoted lesson data. A quoted generation marker
+    // must not turn their assistant-initiated discussion into a hidden course action.
+    !is_course_assessment_discussion_instruction(learner_text.clone())
+        && is_internal_instruction(&learner_text)
+}
+
+fn is_assessment_discussion_user_item(item: &HydratedConversationItem) -> bool {
+    let HydratedConversationItemContent::User(data) = &item.content else {
+        return false;
+    };
+    let learner_text = remote_learner_message(&data.text).unwrap_or_else(|| data.text.clone());
+    is_course_assessment_discussion_instruction(learner_text)
 }
 
 fn course_action_failure(item: &HydratedConversationItem, tool: &str) -> HydratedConversationItem {
@@ -1107,7 +1121,8 @@ pub fn type_hermes_envelopes(
 
 /// Port of `CourseChatTimelinePolicy.projectLiveItems`: hides internal course
 /// turns and internal course tools (surfacing their failures), and projects
-/// learner text out of Learnfold's prompt wrappers.
+/// learner text out of Learnfold's prompt wrappers. Assessment discussion
+/// controls hide only their user item; the assistant's opening question remains visible.
 pub fn project_course_items(
     items: Vec<HydratedConversationItem>,
     hides_selection_envelope: bool,
@@ -1125,6 +1140,13 @@ pub fn project_course_items(
     let mut suppresses_unscoped_internal_turn = false;
     let mut projected = Vec::with_capacity(items.len());
     for item in items {
+        if is_assessment_discussion_user_item(&item) {
+            // This control starts a teaching conversation, rather than a course
+            // generation action. Reset legacy unscoped suppression so its first
+            // assistant question survives both live and restored projections.
+            suppresses_unscoped_internal_turn = false;
+            continue;
+        }
         if is_internal_course_action_user_item(&item) {
             // Treat every internal learner instruction as a whole-turn
             // boundary until the next genuine learner message.
@@ -1645,6 +1667,110 @@ mod tests {
             .map(|item| item.id)
             .collect();
         assert_eq!(ids, vec!["u1", "a1", "u3"]);
+    }
+
+    const ASSESSMENT_DISCUSSION_PROMPT: &str = "<learnfold_assessment_discussion version=\"1\">\n{\"assessment\":{\"id\":\"oxygen-loss\"},\"lesson\":\"Oxygen accepts electrons.\"}\n</learnfold_assessment_discussion>";
+
+    fn with_turn_metadata(
+        mut items: Vec<HydratedConversationItem>,
+        mode: u8,
+    ) -> Vec<HydratedConversationItem> {
+        for item in &mut items {
+            if mode != 0 {
+                let index = match item.source_turn_id.as_deref() {
+                    Some("t1") => Some(1),
+                    Some("t2") => Some(2),
+                    _ => Some(3),
+                };
+                item.source_turn_id = None;
+                item.source_turn_index = if mode == 1 { index } else { None };
+            }
+        }
+        items
+    }
+
+    #[test]
+    fn course_projection_hides_assessment_control_and_keeps_live_and_restored_ai_opening() {
+        let items = vec![
+            user_item("control", "t1", ASSESSMENT_DISCUSSION_PROMPT),
+            assistant_item("opening", "t1", "What happens to the proton gradient without oxygen?"),
+            user_item("answer", "t2", "It collapses because electron transport stalls."),
+            assistant_item("feedback", "t2", "Yes. How does that affect ATP production?"),
+        ];
+        // Live sources use turn IDs; restored sources may retain indices or no
+        // turn metadata. All projections must hide exactly the control item.
+        for mode in 0..3 {
+            let projected = project_course_items(with_turn_metadata(items.clone(), mode), false);
+            let ids: Vec<&str> = projected.iter().map(|item| item.id.as_str()).collect();
+            assert_eq!(ids, vec!["opening", "answer", "feedback"], "metadata mode {mode}");
+            let HydratedConversationItemContent::Assistant(opening) = &projected[0].content else {
+                panic!("the AI's first question must remain an assistant message");
+            };
+            assert_eq!(opening.text, "What happens to the proton gradient without oxygen?");
+        }
+    }
+
+    #[test]
+    fn course_projection_assessment_control_ends_previous_internal_generation_suppression() {
+        let items = vec![
+            user_item("generation", "t1", INTERNAL_INSTRUCTION_MARKER),
+            assistant_item("generation-reply", "t1", "Generated the lesson."),
+            user_item("control", "t2", ASSESSMENT_DISCUSSION_PROMPT),
+            assistant_item("opening", "t2", "Why does ATP production fall?"),
+        ];
+        for mode in 0..3 {
+            let projected = project_course_items(with_turn_metadata(items.clone(), mode), false);
+            let ids: Vec<&str> = projected.iter().map(|item| item.id.as_str()).collect();
+            assert_eq!(ids, vec!["opening"], "metadata mode {mode}");
+        }
+    }
+
+    #[test]
+    fn assessment_control_quoted_generation_marker_does_not_hide_the_ai_question() {
+        let control = format!(
+            "{ASSESSMENT_DISCUSSION_PROMPT}\nQuoted lesson example: {INTERNAL_INSTRUCTION_MARKER}"
+        );
+        let projected = project_course_items(
+            vec![
+                user_item("control", "t1", &control),
+                assistant_item("opening", "t1", "Which part of the lesson would you like to explain?"),
+            ],
+            false,
+        );
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].id, "opening");
+    }
+
+    #[test]
+    fn assessment_control_is_hidden_through_remote_wrappers_without_hiding_the_reply() {
+        let remote = format!(
+            "Instructions\n\n{REMOTE_PROTOCOL_MARKER}\n- rules{REMOTE_LEARNER_MARKER}{ASSESSMENT_DISCUSSION_PROMPT}"
+        );
+        assert_eq!(learner_visible_text(&remote, false), None);
+        let projected = project_course_items(
+            vec![
+                user_item("control", "t1", &remote),
+                assistant_item("opening", "t1", "What supplies the energy for the pump?"),
+            ],
+            false,
+        );
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].id, "opening");
+    }
+
+    #[test]
+    fn ordinary_learner_messages_quoting_assessment_controls_remain_visible() {
+        let quoted = format!("What does this Markdown example mean?\n\n{ASSESSMENT_DISCUSSION_PROMPT}");
+        assert_eq!(learner_visible_text(&quoted, false), Some(quoted.clone()));
+        let projected = project_course_items(
+            vec![
+                user_item("question", "t1", &quoted),
+                assistant_item("reply", "t1", "That marker starts an exercise discussion."),
+            ],
+            false,
+        );
+        let ids: Vec<&str> = projected.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["question", "reply"]);
     }
 
     #[test]

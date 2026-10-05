@@ -6,7 +6,8 @@
 //! [`hosted_thread_key`], so hosted turns become real thread items that a
 //! chat subscription renders like any other source.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
 
@@ -39,7 +40,16 @@ pub(crate) struct HostedAdapter {
     segment_has_text: bool,
 }
 
+fn observed_active_sessions() -> &'static Mutex<HashSet<String>> {
+    static SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 impl HostedAdapter {
+    pub(crate) fn has_started(&self) -> bool {
+        self.turn_id.is_some()
+    }
+
     /// Routes into the process-wide store when one exists. Without a store
     /// (unit tests, early launch) the adapter is inert.
     pub(crate) fn attach(session_id: &str) -> Self {
@@ -162,7 +172,12 @@ impl HostedAdapter {
         )
     }
 
-    pub(crate) fn tool_started(&mut self, tool_call_id: &str, tool_name: &str, arguments_json: &str) {
+    pub(crate) fn tool_started(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+    ) {
         if self.segment_has_text {
             self.segment += 1;
             self.segment_has_text = false;
@@ -240,6 +255,68 @@ impl HostedAdapter {
         };
         sink.chat_replace_owned_transcript(&self.key, SourceKind::Hosted, hydrated_items(messages));
     }
+
+    /// A history snapshot does not imply the originating device's work ended.
+    /// Keep that turn busy until a later authoritative idle history load.
+    pub(crate) fn hydrate_activity(
+        &self,
+        messages: &[Value],
+        originating_device: bool,
+        waiting_for_tools: bool,
+    ) {
+        let turn_id = messages
+            .iter()
+            .rev()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|message| message.get("id").and_then(Value::as_str));
+        let Some(turn_id) = turn_id else {
+            return;
+        };
+        observed_active_sessions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(self.key.thread_id.clone());
+        let label = if waiting_for_tools && originating_device {
+            "This Hosted task is waiting for its original device's course tools."
+        } else {
+            "Hosted is still working on the original device. Sync the course when it finishes, then reopen this discussion."
+        };
+        self.emit(vec![
+            SourceEvent::TurnStarted {
+                turn_id: turn_id.to_string(),
+            },
+            SourceEvent::Progress {
+                label: Some(label.to_string()),
+            },
+        ]);
+    }
+
+    pub(crate) fn hydrate_idle_activity(&self, messages: &[Value], terminal_status: Option<&str>) {
+        if !observed_active_sessions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.key.thread_id)
+        {
+            return;
+        }
+        let turn_id = messages
+            .iter()
+            .rev()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|message| message.get("id").and_then(Value::as_str));
+        let outcome = match terminal_status {
+            Some("completed") => TurnOutcome::Completed,
+            Some("error") => TurnOutcome::Failed {
+                message: "The Hosted task stopped before it completed. Its history is saved."
+                    .into(),
+            },
+            _ => TurnOutcome::Interrupted,
+        };
+        self.emit(vec![SourceEvent::TurnSettled {
+            turn_id: turn_id.map(str::to_string),
+            outcome,
+        }]);
+    }
 }
 
 /// Raw Think messages as source-owned transcript items.
@@ -306,7 +383,10 @@ pub(crate) fn hydrated_items(messages: &[Value]) -> Vec<HydratedConversationItem
                     };
                     // Consecutive parts of one segment extend its item, as
                     // the live deltas did.
-                    match items.iter_mut().find(|existing: &&mut HydratedConversationItem| existing.id == item_id) {
+                    match items
+                        .iter_mut()
+                        .find(|existing: &&mut HydratedConversationItem| existing.id == item_id)
+                    {
                         Some(existing) => append_item_text(existing, &item),
                         None => items.push(item),
                     }
@@ -374,7 +454,9 @@ fn hydrated_tool(part: &Value, kind: &str, turn: Option<&str>) -> Option<Hydrate
         Some("output-error") => (
             AppOperationStatus::Failed,
             Some(false),
-            part.get("errorText").and_then(Value::as_str).map(str::to_string),
+            part.get("errorText")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         ),
         // A call the stored turn never finished is not running any more.
         _ => (AppOperationStatus::Unknown, None, None),
@@ -439,23 +521,48 @@ mod tests {
 
         let recorded = [
             ("req-1", json!({"type": "start", "messageId": "srv-a1"})),
-            ("req-1", json!({"type": "reasoning-delta", "id": "r1", "delta": "Need the page."})),
-            ("req-1", json!({"type": "text-delta", "id": "p1", "delta": "Let me "})),
-            ("req-1", json!({"type": "text-delta", "id": "p1", "delta": "check."})),
+            (
+                "req-1",
+                json!({"type": "reasoning-delta", "id": "r1", "delta": "Need the page."}),
+            ),
+            (
+                "req-1",
+                json!({"type": "text-delta", "id": "p1", "delta": "Let me "}),
+            ),
+            (
+                "req-1",
+                json!({"type": "text-delta", "id": "p1", "delta": "check."}),
+            ),
         ];
         for (_request, chunk) in &recorded {
             adapter.chunk(chunk);
         }
-        assert_eq!(reducer.chat_view(&key, &ChatViewOptions::default()).phase, TurnPhase::Streaming);
+        assert_eq!(
+            reducer.chat_view(&key, &ChatViewOptions::default()).phase,
+            TurnPhase::Streaming
+        );
         adapter.tool_started("call-1", "native-editor-fetch", r#"{"page":"intro"}"#);
-        assert_eq!(reducer.chat_view(&key, &ChatViewOptions::default()).phase, TurnPhase::Acting);
-        adapter.tool_finished("call-1", "native-editor-fetch", r#"{"page":"intro"}"#, true, None);
-        adapter.chunk(&json!({"type": "text-delta", "id": "p1", "delta": "OLED pixels emit light."}));
+        assert_eq!(
+            reducer.chat_view(&key, &ChatViewOptions::default()).phase,
+            TurnPhase::Acting
+        );
+        adapter.tool_finished(
+            "call-1",
+            "native-editor-fetch",
+            r#"{"page":"intro"}"#,
+            true,
+            None,
+        );
+        adapter
+            .chunk(&json!({"type": "text-delta", "id": "p1", "delta": "OLED pixels emit light."}));
         adapter.finish::<()>(&Ok(()));
 
         let live = reducer.chat_view(&key, &all_activity());
         assert!(matches!(live.phase, TurnPhase::Settled { .. }));
-        assert_eq!(kinds(&live.rows), vec!["user", "fold", "work", "answer", "work", "answer"]);
+        assert_eq!(
+            kinds(&live.rows),
+            vec!["user", "fold", "work", "answer", "work", "answer"]
+        );
         assert_eq!(live.rows[0].id, "user:m1");
         // The hosted session never appears in the app-server session list.
         assert!(reducer.snapshot().threads.is_empty());
@@ -493,10 +600,12 @@ mod tests {
             TurnPhase::Settled { outcome: TurnOutcome::Failed { message } } if message.contains("model overloaded")
         ));
         let notice = |rows: &[crate::store::timeline::TimelineRow]| {
-            rows.iter().any(|row| matches!(
-                &row.kind,
-                TimelineRowKind::Notice { title, .. } if title == "The agent stopped"
-            ))
+            rows.iter().any(|row| {
+                matches!(
+                    &row.kind,
+                    TimelineRowKind::Notice { title, .. } if title == "The agent stopped"
+                )
+            })
         };
         assert!(notice(&view.rows));
 
@@ -517,7 +626,10 @@ mod tests {
         let mut adapter = HostedAdapter::with_sink(Some(Arc::clone(&reducer)), session);
         adapter.begin("m1", "Hi");
         reducer.chat_local_action(&key, LocalAction::Stop);
-        assert_eq!(reducer.chat_view(&key, &ChatViewOptions::default()).phase, TurnPhase::Stopping);
+        assert_eq!(
+            reducer.chat_view(&key, &ChatViewOptions::default()).phase,
+            TurnPhase::Stopping
+        );
         adapter.finish::<()>(&Err(crate::hosted_agent::HostedAgentError::Cancelled));
         assert_eq!(
             reducer.chat_view(&key, &ChatViewOptions::default()).phase,
@@ -543,10 +655,21 @@ mod tests {
         ]);
         let view = reducer.chat_view(&hosted_thread_key(session), &all_activity());
         let ids: Vec<&str> = view.rows.iter().map(|row| row.id.as_str()).collect();
-        assert_eq!(ids, vec!["user:turn:u1", "answer:a1", "fold:u1", "work:hosted-tool:c9"]);
+        assert_eq!(
+            ids,
+            vec![
+                "user:turn:u1",
+                "answer:a1",
+                "fold:u1",
+                "work:hosted-tool:c9"
+            ]
+        );
         assert!(matches!(
             &view.rows[3].kind,
-            TimelineRowKind::Work { has_failure: true, .. }
+            TimelineRowKind::Work {
+                has_failure: true,
+                ..
+            }
         ));
     }
 }

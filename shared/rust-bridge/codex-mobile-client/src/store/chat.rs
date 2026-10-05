@@ -67,6 +67,9 @@ pub struct ChatViewOptions {
     /// Show internal course turns and course tools that the course chat
     /// normally hides.
     pub shows_internal_course_activity: bool,
+    /// Drop course-plan rows. Discussions about an existing course never
+    /// propose a new plan, so a stray plan fence must not render as one.
+    pub hides_plan_rows: bool,
 }
 
 /// One update on a chat subscription. `seq` is the thread's sequence
@@ -260,6 +263,9 @@ pub(crate) struct ChatThreadState {
     /// stays in the transcript, including the notice of its failed settle,
     /// so the failure never attaches to the previous turn.
     withdrawn_turns: HashSet<String>,
+    /// History an app-server thread carries over from the thread it replaced
+    /// (`ExternalSourceEvent::CarriedOverTranscript`), shown before its items.
+    carried_over: Vec<HydratedConversationItem>,
     /// Open `ChatSubscription`s.
     subscribers: usize,
     /// The last subscriber left mid-turn; drop the state once it settles.
@@ -281,6 +287,7 @@ impl ChatThreadState {
             pending_input_ids: HashSet::new(),
             user_row_aliases: HashMap::new(),
             withdrawn_turns: HashSet::new(),
+            carried_over: Vec::new(),
             subscribers: 0,
             evict_when_resting: false,
         }
@@ -355,7 +362,12 @@ impl ChatThreadState {
                 turn_id,
             } => {
                 changed |= self.pending_ids.remove(client_msg_id);
-                for item in self.owned.iter_mut().flatten().chain(self.outbox.iter_mut()) {
+                for item in self
+                    .owned
+                    .iter_mut()
+                    .flatten()
+                    .chain(self.outbox.iter_mut())
+                {
                     if item.id == *client_msg_id && item.source_turn_id.is_none() {
                         item.source_turn_id = Some(turn_id.clone());
                         changed = true;
@@ -408,8 +420,7 @@ impl ChatThreadState {
             });
         if let Some(items) = self.owned.as_mut() {
             items.retain(|item| {
-                item.id != client_msg_id
-                    && (turn_id.is_none() || item.source_turn_id != turn_id)
+                item.id != client_msg_id && (turn_id.is_none() || item.source_turn_id != turn_id)
             });
         }
         self.pending_ids.remove(client_msg_id);
@@ -509,25 +520,25 @@ fn streamed_item(
     active_turn_id: Option<&str>,
 ) -> HydratedConversationItem {
     let content = match channel {
-        TextChannel::Answer => HydratedConversationItemContent::Assistant(
-            HydratedAssistantMessageData {
+        TextChannel::Answer => {
+            HydratedConversationItemContent::Assistant(HydratedAssistantMessageData {
                 text: String::new(),
                 agent_nickname: None,
                 agent_role: None,
                 phase: None,
-            },
-        ),
-        TextChannel::Reasoning => HydratedConversationItemContent::Reasoning(
-            HydratedReasoningData {
+            })
+        }
+        TextChannel::Reasoning => {
+            HydratedConversationItemContent::Reasoning(HydratedReasoningData {
                 summary: Vec::new(),
                 content: Vec::new(),
-            },
-        ),
-        TextChannel::Plan => HydratedConversationItemContent::ProposedPlan(
-            HydratedProposedPlanData {
+            })
+        }
+        TextChannel::Plan => {
+            HydratedConversationItemContent::ProposedPlan(HydratedProposedPlanData {
                 content: String::new(),
-            },
-        ),
+            })
+        }
     };
     HydratedConversationItem {
         id: item_id.to_string(),
@@ -592,6 +603,23 @@ pub(crate) fn tool_item(
     }
 }
 
+/// Carried-over rows get their own id space so they never collide with the
+/// new thread's items.
+fn carried_over_items(
+    messages: &[crate::source::ExternalTranscriptMessage],
+) -> Vec<HydratedConversationItem> {
+    messages
+        .iter()
+        .map(|message| {
+            let id = format!("carried:{}", message.id);
+            match message.role {
+                ExternalMessageRole::User => user_item(&id, &message.text, None),
+                ExternalMessageRole::Assistant => assistant_item(&id, &message.text, None),
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn user_item(id: &str, text: &str, turn_id: Option<&str>) -> HydratedConversationItem {
     HydratedConversationItem {
         id: id.to_string(),
@@ -634,7 +662,8 @@ pub(crate) fn pending_fence_question(items: &[HydratedConversationItem]) -> Opti
     let last = items.iter().rev().find(|item| {
         matches!(
             item.content,
-            HydratedConversationItemContent::User(_) | HydratedConversationItemContent::Assistant(_)
+            HydratedConversationItemContent::User(_)
+                | HydratedConversationItemContent::Assistant(_)
         )
     })?;
     let HydratedConversationItemContent::Assistant(data) = &last.content else {
@@ -792,7 +821,12 @@ impl ChatHub {
 
     /// Like `apply_events`, for server-owned threads: does nothing unless the
     /// thread is tracked, so threads without an open chat cost nothing.
-    pub(crate) fn apply_events_if_tracked(&self, key: &ThreadKey, events: &[SourceEvent], now: i64) {
+    pub(crate) fn apply_events_if_tracked(
+        &self,
+        key: &ThreadKey,
+        events: &[SourceEvent],
+        now: i64,
+    ) {
         if events.is_empty() || !self.any_tracked() {
             return;
         }
@@ -813,7 +847,53 @@ impl ChatHub {
         }
     }
 
-    pub(crate) fn apply_local(&self, key: &ThreadKey, source_kind: SourceKind, action: LocalAction) {
+    /// A bounded authoritative history query can recover a missed settle
+    /// notification. Compare identities under the hub lock so an older page
+    /// never settles a turn accepted after the query started.
+    pub(crate) fn settle_matching_turn_if_tracked(
+        &self,
+        key: &ThreadKey,
+        turn_id: &str,
+        outcome: TurnOutcome,
+        question: Option<InputRequest>,
+        now: i64,
+    ) {
+        if !self.any_tracked() {
+            return;
+        }
+        let mut threads = self.lock();
+        let Some(state) = threads.get_mut(key) else {
+            return;
+        };
+        if state.machine.active_turn_id() != Some(turn_id) {
+            return;
+        }
+        let completed = outcome == TurnOutcome::Completed;
+        let mut changed = state.apply(
+            &SourceEvent::TurnSettled {
+                turn_id: Some(turn_id.to_string()),
+                outcome,
+            },
+            now,
+        );
+        if completed && let Some(request) = question {
+            changed |= state.apply(&SourceEvent::InputRequested { request }, now);
+        }
+        if changed {
+            state.bump();
+        }
+        if state.evict_when_resting && state.can_evict() {
+            threads.remove(key);
+            self.sync_tracked(&threads);
+        }
+    }
+
+    pub(crate) fn apply_local(
+        &self,
+        key: &ThreadKey,
+        source_kind: SourceKind,
+        action: LocalAction,
+    ) {
         let now = now_ms();
         self.with_state(
             key,
@@ -890,7 +970,11 @@ impl ChatHub {
     }
 
     /// Registers a chat subscription.
-    pub(crate) fn subscribe(&self, key: &ThreadKey, default_kind: SourceKind) -> watch::Receiver<u64> {
+    pub(crate) fn subscribe(
+        &self,
+        key: &ThreadKey,
+        default_kind: SourceKind,
+    ) -> watch::Receiver<u64> {
         self.with_state(
             key,
             || default_kind,
@@ -928,8 +1012,30 @@ impl ChatHub {
             .and_then(pending_fence_question)
     }
 
+    /// Replaces the history shown before an app-server thread's own items.
+    pub(crate) fn set_carried_over(
+        &self,
+        key: &ThreadKey,
+        source_kind: SourceKind,
+        messages: &[crate::source::ExternalTranscriptMessage],
+    ) {
+        let items = carried_over_items(messages);
+        self.with_state(
+            key,
+            || source_kind,
+            |state| {
+                if state.carried_over != items {
+                    state.carried_over = items;
+                    state.bump();
+                }
+            },
+        );
+    }
+
     pub(crate) fn owns_transcript(&self, key: &ThreadKey) -> bool {
-        self.lock().get(key).is_some_and(|state| state.owned.is_some())
+        self.lock()
+            .get(key)
+            .is_some_and(|state| state.owned.is_some())
     }
 
     /// Converts platform-run source events into canonical events against the
@@ -980,7 +1086,11 @@ impl ChatHub {
                 if state.machine.phase().is_working() {
                     return;
                 }
-                let next = merge_unpersisted(state.owned.as_deref().unwrap_or(&[]), items, &state.pending_ids);
+                let next = merge_unpersisted(
+                    state.owned.as_deref().unwrap_or(&[]),
+                    items,
+                    &state.pending_ids,
+                );
                 if state.owned.as_ref() != Some(&next) {
                     state.owned = Some(next);
                     state.bump();
@@ -1017,18 +1127,23 @@ impl ChatHub {
                     let thread = facts.thread;
                     state.source_kind = SourceKind::app_server(&thread.agent_runtime_kind);
                     reconcile_with_thread(state, thread, &facts.pending_request_ids, now);
-                    let mut items = super::boundary::merged_hydrated_items(
+                    let mut items = state.carried_over.clone();
+                    items.extend(super::boundary::merged_hydrated_items(
                         &thread.items,
                         &thread.local_overlay_items,
-                    );
+                    ));
                     // Outbox entries the server echoed (or the store took
                     // over) are done.
                     let before = state.outbox.len();
-                    state.outbox.retain(|entry| !outbox_entry_echoed(entry, &items));
+                    state
+                        .outbox
+                        .retain(|entry| !outbox_entry_echoed(entry, &items));
                     if state.outbox.len() != before {
                         let outbox_ids: HashSet<&str> =
                             state.outbox.iter().map(|entry| entry.id.as_str()).collect();
-                        state.pending_ids.retain(|id| outbox_ids.contains(id.as_str()));
+                        state
+                            .pending_ids
+                            .retain(|id| outbox_ids.contains(id.as_str()));
                     }
                     items.extend(state.outbox.iter().cloned());
                     // Pending: outbox entries the source has not accepted, and
@@ -1051,10 +1166,20 @@ impl ChatHub {
                         .active_turn_id
                         .clone()
                         .or_else(|| state.machine.active_turn_id().map(str::to_string));
-                    (items, app_server_connection(thread, facts.server), active, pending_ids)
+                    (
+                        items,
+                        app_server_connection(thread, facts.server),
+                        active,
+                        pending_ids,
+                    )
                 }
                 (None, None) => (
-                    state.outbox.clone(),
+                    state
+                        .carried_over
+                        .iter()
+                        .chain(state.outbox.iter())
+                        .cloned()
+                        .collect(),
                     ConnectionPhase::Syncing,
                     state.machine.active_turn_id().map(str::to_string),
                     state.pending_ids.clone(),
@@ -1119,7 +1244,7 @@ pub(crate) fn derive_view(capture: ChatCapture, options: &ChatViewOptions) -> Ch
     } else {
         project_course_items(items, options.hides_selection_envelope)
     };
-    let rows = derive_rows(&TimelineInput {
+    let mut rows = derive_rows(&TimelineInput {
         items: &items,
         pending_item_ids: &pending_ids,
         pending_questions: &pending_questions,
@@ -1128,6 +1253,9 @@ pub(crate) fn derive_view(capture: ChatCapture, options: &ChatViewOptions) -> Ch
         timings: &timings,
         user_row_aliases: &user_row_aliases,
     });
+    if options.hides_plan_rows {
+        rows.retain(|row| !matches!(row.kind, TimelineRowKind::Plan { .. }));
+    }
     ChatView {
         rows,
         phase,
@@ -1164,7 +1292,9 @@ fn merge_unpersisted(
     }
     let pending: Vec<HydratedConversationItem> = current
         .iter()
-        .filter(|item| pending_ids.contains(&item.id) && !next.iter().any(|kept| kept.id == item.id))
+        .filter(|item| {
+            pending_ids.contains(&item.id) && !next.iter().any(|kept| kept.id == item.id)
+        })
         .cloned()
         .collect();
     next.extend(pending);
@@ -1175,7 +1305,10 @@ fn merge_unpersisted(
 /// the overlay) or the server echoed a learner message for the turn it was
 /// bound to. Never matched by text: the learner may send the same words
 /// twice.
-fn outbox_entry_echoed(entry: &HydratedConversationItem, items: &[HydratedConversationItem]) -> bool {
+fn outbox_entry_echoed(
+    entry: &HydratedConversationItem,
+    items: &[HydratedConversationItem],
+) -> bool {
     if !matches!(entry.content, HydratedConversationItemContent::User(_)) {
         return true;
     }
@@ -1188,7 +1321,10 @@ fn outbox_entry_echoed(entry: &HydratedConversationItem, items: &[HydratedConver
     })
 }
 
-fn app_server_connection(thread: &ThreadSnapshot, server: Option<&ServerSnapshot>) -> ConnectionPhase {
+fn app_server_connection(
+    thread: &ThreadSnapshot,
+    server: Option<&ServerSnapshot>,
+) -> ConnectionPhase {
     let Some(server) = server else {
         return ConnectionPhase::Offline;
     };
@@ -1231,7 +1367,10 @@ fn reconcile_with_thread(
         Some(turn_id) => {
             if matches!(
                 state.machine.phase(),
-                TurnPhase::Idle | TurnPhase::Queued | TurnPhase::Accepted | TurnPhase::Settled { .. }
+                TurnPhase::Idle
+                    | TurnPhase::Queued
+                    | TurnPhase::Accepted
+                    | TurnPhase::Settled { .. }
             ) {
                 changed |= state.apply(
                     &SourceEvent::TurnStarted {
@@ -1260,7 +1399,10 @@ fn reconcile_with_thread(
             let phase = state.machine.phase().clone();
             let running = matches!(
                 phase,
-                TurnPhase::Thinking | TurnPhase::Streaming | TurnPhase::Acting | TurnPhase::Stopping
+                TurnPhase::Thinking
+                    | TurnPhase::Streaming
+                    | TurnPhase::Acting
+                    | TurnPhase::Stopping
             );
             if running && thread.info.status != ThreadSummaryStatus::Active {
                 let outcome = match (&phase, &thread.info.status) {
@@ -1422,7 +1564,9 @@ fn ingest_one(state: &mut ChatThreadState, event: ExternalSourceEvent, now: i64)
                 now,
             )
         }
-        ExternalSourceEvent::Progress { label } => state.apply(&SourceEvent::Progress { label }, now),
+        ExternalSourceEvent::Progress { label } => {
+            state.apply(&SourceEvent::Progress { label }, now)
+        }
         ExternalSourceEvent::StopRequested => state.apply_local(&LocalAction::Stop, now),
         ExternalSourceEvent::StopFailed => state.apply_local(&LocalAction::StopFailed, now),
         ExternalSourceEvent::TurnSettled { outcome } => {
@@ -1443,6 +1587,13 @@ fn ingest_one(state: &mut ChatThreadState, event: ExternalSourceEvent, now: i64)
         }
         ExternalSourceEvent::Connection { phase } => {
             state.apply(&SourceEvent::Connection { phase }, now)
+        }
+        ExternalSourceEvent::CarriedOverTranscript { .. } => {
+            tracing::warn!(
+                target: "store",
+                "ignoring carried-over transcript for a platform-owned chat"
+            );
+            false
         }
         ExternalSourceEvent::ReplaceTranscript { messages } => {
             // The platform's copy lags a live turn (it is written when the
@@ -1472,7 +1623,6 @@ fn ingest_one(state: &mut ChatThreadState, event: ExternalSourceEvent, now: i64)
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1507,7 +1657,10 @@ mod tests {
         assert_eq!(queued.phase, TurnPhase::Queued);
         assert!(matches!(
             &queued.rows[0].kind,
-            TimelineRowKind::User { delivery: crate::store::timeline::MessageDelivery::Pending, .. }
+            TimelineRowKind::User {
+                delivery: crate::store::timeline::MessageDelivery::Pending,
+                ..
+            }
         ));
 
         hub.ingest_external(
@@ -1591,7 +1744,13 @@ mod tests {
         let ids: Vec<&str> = settled.rows.iter().map(|row| row.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["user:c1", "fold:t1", "answer:a1", "work:tool-1", "answer:a2"]
+            vec![
+                "user:c1",
+                "fold:t1",
+                "answer:a1",
+                "work:tool-1",
+                "answer:a2"
+            ]
         );
         assert!(matches!(
             &settled.rows[1].kind,
@@ -1940,6 +2099,85 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn carried(
+        id: &str,
+        role: ExternalMessageRole,
+        text: &str,
+    ) -> crate::source::ExternalTranscriptMessage {
+        crate::source::ExternalTranscriptMessage {
+            id: id.into(),
+            role,
+            text: text.into(),
+            turn_id: None,
+        }
+    }
+
+    fn rebuilt_thread(key: &ThreadKey) -> crate::store::snapshot::ThreadSnapshot {
+        let mut thread = crate::store::snapshot::ThreadSnapshot::from_info(
+            &key.server_id,
+            crate::types::ThreadInfo {
+                id: key.thread_id.clone(),
+                title: None,
+                model: None,
+                status: crate::types::ThreadSummaryStatus::Idle,
+                preview: None,
+                cwd: None,
+                path: None,
+                model_provider: None,
+                agent_nickname: None,
+                agent_role: None,
+                parent_thread_id: None,
+                forked_from_id: None,
+                agent_status: None,
+                created_at: None,
+                updated_at: None,
+            },
+        );
+        thread.items = vec![
+            user_item("u2", "Telomeres shorten", Some("t2")),
+            assistant_item("a2", "Good start", Some("t2")),
+        ];
+        thread
+    }
+
+    #[test]
+    fn carried_over_transcript_precedes_a_rebuilt_app_server_thread() {
+        // A Codex thread rebuilt after its rollout was lost holds only the new
+        // turns; the conversation the learner already saw stays above them.
+        let reducer = crate::store::AppStoreReducer::new();
+        let key = key("srv");
+        reducer.upsert_thread_snapshot(rebuilt_thread(&key));
+        let _rx = reducer.chat_subscribe(&key);
+        let carry = || {
+            vec![ExternalSourceEvent::CarriedOverTranscript {
+                messages: vec![
+                    carried("m0", ExternalMessageRole::User, "Hey there"),
+                    carried(
+                        "m1",
+                        ExternalMessageRole::Assistant,
+                        "What would you like to learn?",
+                    ),
+                ],
+            }]
+        };
+        reducer.chat_ingest_external(&key, SourceKind::app_server("codex"), carry());
+        // The platform re-sends it whenever the chat reopens.
+        reducer.chat_ingest_external(&key, SourceKind::app_server("codex"), carry());
+
+        let view = reducer.chat_view(&key, &ChatViewOptions::default());
+        let ids: Vec<&str> = view.rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "user:carried:m0",
+                "answer:carried:m1",
+                "user:turn:t2",
+                "answer:a2"
+            ]
+        );
+        assert!(!reducer.chat.owns_transcript(&key));
     }
 
     #[test]

@@ -23,6 +23,94 @@ mod mobile_client_tests {
         assert!(!runtime_kinds_support_account_sync(&[]));
     }
 
+    fn host_local_config() -> ServerConfig {
+        ServerConfig {
+            server_id: "local-mac".to_string(),
+            display_name: "This Mac".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8390,
+            websocket_url: None,
+            is_local: true,
+            tls: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn host_local_connect_hydrates_installed_account_before_returning() {
+        let client = MobileClient::new();
+        let config = host_local_config();
+        let handler: TestRequestHandler = Arc::new(|request| {
+            assert!(matches!(
+                request,
+                upstream::ClientRequest::GetAccount { .. }
+            ));
+            Ok(json!({
+                "account": {"type": "chatgpt", "email": null, "planType": "plus"},
+                "requiresOpenaiAuth": true,
+                "workspaceRouting": null
+            }))
+        });
+        let session = Arc::new(ServerSession::test_stub_with_handlers(
+            config.clone(),
+            Some(handler),
+            None,
+            None,
+        ));
+        client
+            .sessions_write()
+            .insert(config.server_id.clone(), session);
+        client
+            .app_store
+            .upsert_server(&config, ServerHealthSnapshot::Connected);
+        assert!(client.app_snapshot().servers["local-mac"].account.is_none());
+
+        let server_id = client
+            .connect_host_local(config)
+            .await
+            .expect("host-local account read");
+        let snapshot = client.app_snapshot();
+        assert_eq!(server_id, "local-mac");
+        assert!(matches!(
+            snapshot.servers[&server_id].account,
+            Some(crate::types::Account::Chatgpt { .. })
+        ));
+        assert!(snapshot.servers[&server_id].requires_openai_auth);
+    }
+
+    #[tokio::test]
+    async fn host_local_connect_reports_account_read_failure_instead_of_ready_signed_out() {
+        let client = MobileClient::new();
+        let config = host_local_config();
+        let handler: TestRequestHandler = Arc::new(|_| {
+            Err(RpcError::Deserialization(
+                "unsupported account response".to_string(),
+            ))
+        });
+        let session = Arc::new(ServerSession::test_stub_with_handlers(
+            config.clone(),
+            Some(handler),
+            None,
+            None,
+        ));
+        client
+            .sessions_write()
+            .insert(config.server_id.clone(), session);
+        client
+            .app_store
+            .upsert_server(&config, ServerHealthSnapshot::Connected);
+
+        let error = client
+            .connect_host_local(config)
+            .await
+            .expect_err("account read must gate readiness");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read installed Codex account")
+        );
+        assert!(!client.app_snapshot().servers.contains_key("local-mac"));
+    }
+
     fn make_thread_info(id: &str) -> ThreadInfo {
         ThreadInfo {
             id: id.to_string(),

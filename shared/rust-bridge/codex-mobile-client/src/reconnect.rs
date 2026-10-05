@@ -114,6 +114,12 @@ pub(crate) enum ReconnectPlan {
         server_id: String,
         display_name: String,
     },
+    HostLocal {
+        server_id: String,
+        display_name: String,
+        host: String,
+        port: u16,
+    },
     DirectRemote {
         server_id: String,
         display_name: String,
@@ -294,6 +300,17 @@ pub(crate) fn compute_reconnect_plan_with_slingshot(
     // 1. Skip if already connected
     if is_connected {
         return None;
+    }
+
+    // A saved Mac-local endpoint must retain locality and its external
+    // transport, including when a WebSocket URL is also present.
+    if server.source == "local" && server.port > 0 {
+        return Some(ReconnectPlan::HostLocal {
+            server_id: server.id.clone(),
+            display_name: server.name.clone(),
+            host: server.hostname.clone(),
+            port: server.port,
+        });
     }
 
     // 2. Stable Alleycat pairing wins before legacy tunnel/direct transports.
@@ -614,6 +631,36 @@ pub(crate) async fn execute_reconnect_plan(
                         error_message: Some(e.to_string()),
                     }
                 }
+            }
+        }
+        ReconnectPlan::HostLocal {
+            server_id,
+            display_name,
+            host,
+            port,
+        } => {
+            let config = ServerConfig {
+                server_id: server_id.clone(),
+                display_name: display_name.clone(),
+                host: host.clone(),
+                port: *port,
+                websocket_url: None,
+                is_local: true,
+                tls: false,
+            };
+            match client.connect_host_local(config).await {
+                Ok(_) => ReconnectResult {
+                    server_id: server_id.clone(),
+                    success: true,
+                    needs_local_auth_restore: false,
+                    error_message: None,
+                },
+                Err(error) => ReconnectResult {
+                    server_id: server_id.clone(),
+                    success: false,
+                    needs_local_auth_restore: false,
+                    error_message: Some(error.to_string()),
+                },
             }
         }
         ReconnectPlan::DirectRemote {
@@ -1241,6 +1288,21 @@ mod tests {
         s.codex_ports = vec![];
         let plan = compute_reconnect_plan(&s, None, false, false);
         assert!(matches!(plan, Some(ReconnectPlan::Local { .. })));
+    }
+
+    #[test]
+    fn plan_host_local_preserves_external_endpoint_even_with_websocket_override() {
+        let mut server = base_server();
+        server.id = "local-mac".into();
+        server.source = "local".into();
+        server.hostname = "127.0.0.1".into();
+        server.port = 8390;
+        server.websocket_url = Some("ws://127.0.0.1:8390".into());
+        let plan = compute_reconnect_plan(&server, None, false, false);
+        assert!(
+            matches!(plan, Some(ReconnectPlan::HostLocal { ref server_id, port: 8390, .. }) if server_id == "local-mac")
+        );
+        assert!(compute_reconnect_plan(&server, None, true, false).is_none());
     }
 
     #[test]

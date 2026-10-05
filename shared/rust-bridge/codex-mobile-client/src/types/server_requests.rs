@@ -430,6 +430,12 @@ pub struct AppResumeThreadRequest {
     #[serde(default)]
     #[uniffi(default = false)]
     pub exclude_turns: bool,
+    /// Thread-scoped Codex config overrides, as on `AppStartThreadRequest`.
+    /// They are not persisted in the rollout, so a thread that is reloaded
+    /// after the app-server restarts needs them passed again.
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub config_json: Option<String>,
 }
 
 impl TryFrom<AppResumeThreadRequest> for upstream::ThreadResumeParams {
@@ -449,7 +455,19 @@ impl TryFrom<AppResumeThreadRequest> for upstream::ThreadResumeParams {
             approvals_reviewer: None,
             sandbox: value.sandbox.map(sandbox_mode_into_upstream),
             permissions: None,
-            config: None,
+            config: value
+                .config_json
+                .map(|json| {
+                    serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(
+                        &json,
+                    )
+                    .map_err(|error| {
+                        RpcClientError::Serialization(format!(
+                            "parse AppResumeThreadRequest.config_json: {error}"
+                        ))
+                    })
+                })
+                .transpose()?,
             base_instructions: None,
             developer_instructions: value.developer_instructions,
             personality: None,
@@ -779,6 +797,47 @@ impl From<AppReadThreadRequest> for upstream::ThreadReadParams {
         Self {
             thread_id: value.thread_id,
             include_turns: value.include_turns,
+        }
+    }
+}
+
+/// One message of a conversation replayed into a thread's model-visible
+/// history (see `AppInjectThreadMessagesRequest`).
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AppInjectedThreadMessage {
+    pub role: crate::source::ExternalMessageRole,
+    pub text: String,
+}
+
+/// Appends earlier conversation to a thread's model-visible history without
+/// starting a turn (`thread/inject_items`). The items do not appear in the
+/// thread's own transcript.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AppInjectThreadMessagesRequest {
+    pub thread_id: String,
+    pub messages: Vec<AppInjectedThreadMessage>,
+}
+
+impl From<AppInjectThreadMessagesRequest> for upstream::ThreadInjectItemsParams {
+    fn from(value: AppInjectThreadMessagesRequest) -> Self {
+        Self {
+            thread_id: value.thread_id,
+            items: value
+                .messages
+                .into_iter()
+                .map(|message| match message.role {
+                    crate::source::ExternalMessageRole::User => serde_json::json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": message.text }],
+                    }),
+                    crate::source::ExternalMessageRole::Assistant => serde_json::json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": message.text }],
+                    }),
+                })
+                .collect(),
         }
     }
 }
@@ -1513,6 +1572,7 @@ mod tests {
             developer_instructions: None,
             persist_extended_history: false,
             exclude_turns: true,
+            config_json: None,
         };
         let upstream_params: upstream::ThreadResumeParams = request.try_into().unwrap();
         assert!(upstream_params.exclude_turns);
@@ -1529,6 +1589,7 @@ mod tests {
             developer_instructions: None,
             persist_extended_history: false,
             exclude_turns: false,
+            config_json: None,
         };
         let upstream_params: upstream::ThreadResumeParams = request.try_into().unwrap();
         assert!(!upstream_params.exclude_turns);
@@ -1612,9 +1673,93 @@ mod tests {
             developer_instructions: None,
             persist_extended_history: false,
             exclude_turns: false,
+            config_json: None,
         };
         let upstream_params: upstream::ThreadResumeParams = request.try_into().unwrap();
         assert_eq!(upstream_params.cwd, None);
+    }
+
+    #[test]
+    fn inject_thread_messages_request_builds_model_visible_messages() {
+        // Rebuilding a thread whose rollout is gone replays the conversation
+        // the learner can still see as model-visible history.
+        let request = AppInjectThreadMessagesRequest {
+            thread_id: "rebuilt".to_string(),
+            messages: vec![
+                AppInjectedThreadMessage {
+                    role: crate::source::ExternalMessageRole::User,
+                    text: "Hey there".to_string(),
+                },
+                AppInjectedThreadMessage {
+                    role: crate::source::ExternalMessageRole::Assistant,
+                    text: "What would you like to learn?".to_string(),
+                },
+            ],
+        };
+        let params: upstream::ThreadInjectItemsParams = request.into();
+        assert_eq!(params.thread_id, "rebuilt");
+        let items: Vec<codex_protocol::models::ResponseItem> = params
+            .items
+            .into_iter()
+            .map(|value| serde_json::from_value(value).expect("valid response item"))
+            .collect();
+        let messages: Vec<(String, String)> = items
+            .iter()
+            .map(|item| match item {
+                codex_protocol::models::ResponseItem::Message { role, content, .. } => {
+                    let text = match content.as_slice() {
+                        [codex_protocol::models::ContentItem::InputText { text }] => {
+                            format!("input:{text}")
+                        }
+                        [codex_protocol::models::ContentItem::OutputText { text }] => {
+                            format!("output:{text}")
+                        }
+                        other => panic!("unexpected content {other:?}"),
+                    };
+                    (role.clone(), text)
+                }
+                other => panic!("unexpected item {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                ("user".to_string(), "input:Hey there".to_string()),
+                (
+                    "assistant".to_string(),
+                    "output:What would you like to learn?".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_thread_request_forwards_thread_scoped_config() {
+        // App-owned MCP servers are thread-scoped config, not persisted in the
+        // rollout, so reloading a thread after relaunch must pass them again.
+        let request = AppResumeThreadRequest {
+            thread_id: "t1".to_string(),
+            model: None,
+            cwd: None,
+            approval_policy: None,
+            sandbox: None,
+            developer_instructions: None,
+            persist_extended_history: false,
+            exclude_turns: false,
+            config_json: Some(
+                serde_json::json!({
+                    "mcp_servers.learnfold_course.url": "http://127.0.0.1:8765/mcp",
+                    "mcp_servers.learnfold_course.required": true
+                })
+                .to_string(),
+            ),
+        };
+        let upstream_params: upstream::ThreadResumeParams = request.try_into().unwrap();
+        let config = upstream_params.config.unwrap();
+        assert_eq!(
+            config["mcp_servers.learnfold_course.url"],
+            "http://127.0.0.1:8765/mcp"
+        );
     }
 
     #[test]

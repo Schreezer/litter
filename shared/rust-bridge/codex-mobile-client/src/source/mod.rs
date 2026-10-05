@@ -239,4 +239,12 @@ pub enum ExternalSourceEvent {
     ReplaceTranscript {
         messages: Vec<ExternalTranscriptMessage>,
     },
+    /// The conversation an app-server thread replaced. A Codex course thread
+    /// whose rollout was lost is rebuilt as a new thread seeded with this
+    /// history; the chat shows it above the new thread's own items. Accepted
+    /// for app-server threads only. Chat state is dropped when its last
+    /// subscription closes, so re-send this when the chat reopens.
+    CarriedOverTranscript {
+        messages: Vec<ExternalTranscriptMessage>,
+    },
 }

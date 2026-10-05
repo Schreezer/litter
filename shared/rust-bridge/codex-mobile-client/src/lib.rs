@@ -166,6 +166,7 @@ pub mod capability;
 pub mod cloud_sync;
 pub mod conversation;
 pub mod conversation_uniffi;
+pub mod course_assessment;
 pub mod discovery;
 pub mod discovery_uniffi;
 pub mod ffi;
@@ -206,7 +207,10 @@ pub use mobile_client::*;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 static REQUEST_COUNTER: AtomicI64 = AtomicI64::new(1);
-pub(crate) const MOBILE_ASYNC_THREAD_STACK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+/// The in-process app-server runs on these workers. In Debug builds a
+/// `thread/resume` with config overrides parses `ConfigToml` deep enough to
+/// overflow 4 MiB. Untouched stack pages stay virtual.
+pub(crate) const MOBILE_ASYNC_THREAD_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) fn next_request_id() -> i64 {
     REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)

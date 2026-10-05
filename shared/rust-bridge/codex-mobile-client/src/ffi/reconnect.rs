@@ -8,7 +8,7 @@ use crate::reconnect::{
     ReconnectResult, SavedServerRecord, SlingshotCredentialProvider, SshCredentialProvider,
     compute_reconnect_plan_with_slingshot, execute_reconnect_plan,
 };
-use crate::session::connection::{InProcessConfig, ServerConfig};
+use crate::session::connection::{InProcessConfig, ServerConfig, ServerConnectionKind};
 use crate::store::ServerHealthSnapshot;
 use crate::store::snapshot::AppLifecyclePhaseSnapshot;
 use codex_app_server_protocol as upstream;
@@ -59,6 +59,59 @@ fn server_counts_as_connected_for_reconnect(
     server: &crate::store::snapshot::ServerSnapshot,
 ) -> bool {
     matches!(server.health, ServerHealthSnapshot::Connected)
+}
+
+fn resolved_local_config(
+    snapshot: &crate::store::AppSnapshot,
+    saved_servers: &[SavedServerRecord],
+    server_id: &str,
+) -> ServerConfig {
+    let endpoint = snapshot
+        .servers
+        .get(server_id)
+        .filter(|server| server.is_local)
+        .map(|server| (server.host.clone(), server.port))
+        .or_else(|| {
+            saved_servers
+                .iter()
+                .find(|server| server.id == server_id && server.source == "local")
+                .map(|server| (server.hostname.clone(), server.port))
+        });
+    let (host, port) = endpoint.unwrap_or_else(|| ("127.0.0.1".to_string(), 0));
+    ServerConfig {
+        server_id: server_id.to_string(),
+        display_name: resolved_local_display_name(snapshot, saved_servers, server_id),
+        host,
+        port,
+        websocket_url: None,
+        is_local: true,
+        tls: false,
+    }
+}
+
+fn uses_installed_host_codex() -> bool {
+    cfg!(any(target_os = "macos", target_abi = "macabi"))
+}
+
+async fn connect_local_runtime(
+    inner: &MobileClient,
+    config: ServerConfig,
+) -> Result<bool, crate::transport::TransportError> {
+    match config.connection_kind() {
+        ServerConnectionKind::HostLocal => {
+            inner.connect_host_local(config).await?;
+            Ok(false)
+        }
+        ServerConnectionKind::EmbeddedLocal if !uses_installed_host_codex() => {
+            inner
+                .connect_local(config, InProcessConfig::default())
+                .await?;
+            Ok(true)
+        }
+        _ => Err(crate::transport::TransportError::ConnectionFailed(
+            "Start installed Mac Codex before connecting the local runtime".to_string(),
+        )),
+    }
 }
 
 #[derive(uniffi::Object)]
@@ -368,33 +421,32 @@ async fn reconnect_saved_servers_inner(
         .map(|s| s.server_id.clone())
         .collect();
 
-    let local_display_name = resolved_local_display_name(&snapshot, &servers, "local");
-
     let has_local = snapshot
         .servers
         .values()
         .any(|server| server.is_local && server_counts_as_connected_for_reconnect(server));
     let mut local_result: Option<ReconnectResult> = None;
     if !has_local {
+        let local_id = snapshot
+            .servers
+            .values()
+            .find(|server| server.is_local && server.port > 0)
+            .map(|server| server.server_id.as_str())
+            .or_else(|| {
+                servers
+                    .iter()
+                    .find(|server| server.source == "local" && server.port > 0)
+                    .map(|server| server.id.as_str())
+            })
+            .unwrap_or("local");
+        let config = resolved_local_config(&snapshot, &servers, local_id);
         info!("ReconnectController: ensuring local server connected");
-        let config = ServerConfig {
-            server_id: "local".to_string(),
-            display_name: local_display_name,
-            host: "127.0.0.1".to_string(),
-            port: 0,
-            websocket_url: None,
-            is_local: true,
-            tls: false,
-        };
-        match inner
-            .connect_local(config, InProcessConfig::default())
-            .await
-        {
-            Ok(_) => {
+        match connect_local_runtime(&inner, config).await {
+            Ok(needs_local_auth_restore) => {
                 local_result = Some(ReconnectResult {
-                    server_id: "local".to_string(),
+                    server_id: local_id.to_string(),
                     success: true,
-                    needs_local_auth_restore: true,
+                    needs_local_auth_restore,
                     error_message: None,
                 });
             }
@@ -480,28 +532,17 @@ async fn reconnect_server_inner(
             .is_some_and(|server| server.source == "local");
 
     if is_local {
-        let config = ServerConfig {
-            server_id: server_id.clone(),
-            display_name: resolved_local_display_name(
-                &snapshot,
-                saved_server.as_ref().map_or(&[], std::slice::from_ref),
-                &server_id,
-            ),
-            host: "127.0.0.1".to_string(),
-            port: 0,
-            websocket_url: None,
-            is_local: true,
-            tls: false,
-        };
+        let config = resolved_local_config(
+            &snapshot,
+            saved_server.as_ref().map_or(&[], std::slice::from_ref),
+            &server_id,
+        );
         inner.disconnect_server(&server_id);
-        return match inner
-            .connect_local(config, InProcessConfig::default())
-            .await
-        {
-            Ok(_) => ReconnectResult {
+        return match connect_local_runtime(&inner, config).await {
+            Ok(needs_local_auth_restore) => ReconnectResult {
                 server_id,
                 success: true,
-                needs_local_auth_restore: true,
+                needs_local_auth_restore,
                 error_message: None,
             },
             Err(e) => ReconnectResult {
@@ -575,8 +616,12 @@ async fn reconnect_server_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolved_local_display_name, server_counts_as_connected_for_reconnect};
+    use super::{
+        resolved_local_config, resolved_local_display_name,
+        server_counts_as_connected_for_reconnect,
+    };
     use crate::reconnect::SavedServerRecord;
+    use crate::session::connection::ServerConnectionKind;
     use crate::store::snapshot::{
         AppSnapshot, AppVoiceSessionSnapshot, ServerHealthSnapshot, ServerSnapshot,
         ServerTransportDiagnostics,
@@ -634,6 +679,21 @@ mod tests {
         assert!(!server_counts_as_connected_for_reconnect(
             &server_with_health(ServerHealthSnapshot::Unresponsive)
         ));
+    }
+
+    #[test]
+    fn reconnect_keeps_mac_local_port_instead_of_embedded_runtime() {
+        let mut snapshot = empty_snapshot();
+        let mut server = server_with_health(ServerHealthSnapshot::Disconnected);
+        server.server_id = "local-mac".into();
+        server.is_local = true;
+        server.port = 8390;
+        snapshot.servers.insert(server.server_id.clone(), server);
+        let config = resolved_local_config(&snapshot, &[], "local-mac");
+        assert_eq!(config.connection_kind(), ServerConnectionKind::HostLocal);
+        assert_eq!(config.server_id, "local-mac");
+        assert_eq!(config.port, 8390);
+        assert!(config.validate_host_local().is_ok());
     }
 
     #[test]
