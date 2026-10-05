@@ -18,12 +18,18 @@ final class FixtureChatSource: ChatTimelineSource {
         /// The connection drops mid-answer, resyncs with a snapshot, then
         /// keeps streaming.
         case reconnect
+        /// One short paragraph and no question, so the settled turn fits
+        /// above the keyboard.
+        case brief
     }
 
     let scenario: Scenario
     /// Multiplies every pause. `0` runs the script as fast as the main
     /// actor allows, which tests use.
     let timeScale: Double
+    /// Seconds before the source stages a sent message, as a hosted agent's
+    /// round trip does. Until then only the local preview shows it.
+    let stagingDelay: Double
     /// Called when the interrupt scenario reaches its stop point. The harness
     /// routes it through `ChatScreenModel.stop()` so the real stop path runs.
     var onAutoStop: (() -> Void)?
@@ -44,10 +50,12 @@ final class FixtureChatSource: ChatTimelineSource {
     init(
         scenario: Scenario = .happy,
         timeScale: Double = 1,
+        stagingDelay: Double = 0,
         initialRows: [ChatTimelineRow] = []
     ) {
         self.scenario = scenario
         self.timeScale = timeScale
+        self.stagingDelay = stagingDelay
         self.rows = initialRows
         self.turnCount = initialRows.filter(\.isUser).count
     }
@@ -99,6 +107,9 @@ final class FixtureChatSource: ChatTimelineSource {
 
     private func runTurn(_ turn: Int, userRow: ChatTimelineRow) async {
         let startedAt = ContinuousClock.now
+        if stagingDelay > 0 {
+            try? await Task.sleep(for: .milliseconds(Int(stagingDelay * 1000)))
+        }
         upsert([userRow])
         setPhase(.queued)
 
@@ -165,7 +176,8 @@ final class FixtureChatSource: ChatTimelineSource {
         setPhase(.streaming)
 
         var wordCount = 0
-        for (paragraphIndex, paragraph) in Self.answerParagraphs.enumerated() {
+        let paragraphs = scenario == .brief ? [Self.answerParagraphs[0]] : Self.answerParagraphs
+        for (paragraphIndex, paragraph) in paragraphs.enumerated() {
             let words = paragraph.split(separator: " ", omittingEmptySubsequences: false)
             for (index, word) in words.enumerated() {
                 if Task.isCancelled { return }
@@ -181,31 +193,35 @@ final class FixtureChatSource: ChatTimelineSource {
             await pause(0.2)
 
             if scenario == .reconnect, paragraphIndex == 1 {
+                setPhase(.streaming, progress: "Reconnecting... 1/5")
                 emit(.connectionChanged(connection: .reconnecting, seq: nextSeq()))
                 await pause(1.6)
                 emit(.connectionChanged(connection: .syncing, seq: nextSeq()))
                 await pause(0.6)
                 emit(snapshot(connection: .live))
+                setPhase(.streaming)
             }
         }
 
         upsert([ChatTimelineRow(id: answerID, kind: .answer(
-            text: Self.answerParagraphs.joined(separator: "\n\n"),
+            text: paragraphs.joined(separator: "\n\n"),
             isStreaming: false,
             agentLabel: nil
         ))])
-        upsert([ChatTimelineRow(
-            id: "question-\(turn)",
-            kind: .question(
-                prompt: "Which part should the course go deepest on?",
-                options: ["Signal decoding", "Electrode materials", "Brain aging and repair"],
-                isPending: true,
-                allowsFreeText: true,
-                requestId: nil,
-                questionId: nil,
-                sourceItemId: answerID
-            )
-        )])
+        if scenario != .brief {
+            upsert([ChatTimelineRow(
+                id: "question-\(turn)",
+                kind: .question(
+                    prompt: "Which part should the course go deepest on?",
+                    options: ["Signal decoding", "Electrode materials", "Brain aging and repair"],
+                    isPending: true,
+                    allowsFreeText: true,
+                    requestId: nil,
+                    questionId: nil,
+                    sourceItemId: answerID
+                )
+            )])
+        }
         await pause(0.5)
         upsert([foldRow(turn, label: "Worked for \(elapsed(since: startedAt))s", folding: [workID])])
         setPhase(.settled(outcome: .completed))

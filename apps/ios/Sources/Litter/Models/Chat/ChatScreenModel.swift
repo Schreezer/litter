@@ -15,8 +15,20 @@ struct ChatTurn: Identifiable, Equatable {
     static let localPreviewID = "chat-local-preview"
 
     let id: String
+    /// The identity views use. A sent message shows as the local preview
+    /// until the source stages it; the staged turn keeps the preview's view
+    /// identity, so it stays the same view instead of fading out and back
+    /// in. Defaults to `id`.
+    let viewID: String
     var user: ChatTimelineRow?
     var rows: [ChatTimelineRow]
+
+    init(id: String, viewID: String? = nil, user: ChatTimelineRow?, rows: [ChatTimelineRow]) {
+        self.id = id
+        self.viewID = viewID ?? id
+        self.user = user
+        self.rows = rows
+    }
 
     var hasFold: Bool {
         rows.contains(where: \.isFold)
@@ -58,11 +70,16 @@ final class SharedChatStreamingRenderer: ChatStreamingRendering {
 @MainActor
 final class ChatScreenModel {
     /// Timeline grouped by learner message, oldest first.
-    private(set) var turns: [ChatTurn] = []
+    var turns: [ChatTurn] { layout.turns }
     /// The turn that owns the reserved viewport space. It is set when a new
     /// learner turn appears and stays set after the turn settles, until the
     /// next one, so settling never moves anything.
-    private(set) var liveTurnID: String?
+    var liveTurnID: String? { layout.liveTurnID }
+    /// Turns and the live turn change in one assignment. A view that saw
+    /// one without the other would lay the new turn out without its
+    /// reserved space for a frame, and the scroll view would clamp its
+    /// offset and drop the turn.
+    private var layout = TurnLayout()
     private(set) var phase: ChatTurnPhase = .idle
     private(set) var connection: ChatConnectionPhase = .live
     private(set) var progressLabel: String?
@@ -79,6 +96,14 @@ final class ChatScreenModel {
     /// Bumps when a learner send starts, so the screen can arm its scroll
     /// hand-off before the new turn arrives.
     private(set) var sendGeneration = 0
+    /// View identity of the current local preview. Unique per send, so a
+    /// staged turn can keep it without clashing with the next preview.
+    private(set) var previewViewID = ChatTurn.localPreviewID
+    /// The view identity the next send's preview gets, so the composer can
+    /// hand its draft's position to that bubble.
+    var nextPreviewViewID: String {
+        "\(ChatTurn.localPreviewID)-\(previewCount + 1)"
+    }
 
     /// Called after rows change, with the full row list. Course logic uses it
     /// to react to plan and tool rows without polling.
@@ -96,6 +121,10 @@ final class ChatScreenModel {
     @ObservationIgnored private var updatesTask: Task<Void, Never>?
     /// Updates at or below this sequence number predate the applied snapshot.
     @ObservationIgnored private var snapshotSeq: UInt64?
+    @ObservationIgnored private var previewCount = 0
+    /// Staged learner rows that replaced a local preview, and the preview's
+    /// view identity they keep.
+    @ObservationIgnored private var stagedPreviewViewIDs: [String: String] = [:]
 
     init(source: ChatTimelineSource?, renderer: ChatStreamingRendering? = nil) {
         self.source = source
@@ -236,23 +265,35 @@ final class ChatScreenModel {
     func continuePendingSend(from previous: ChatScreenModel) {
         guard let text = previous.localPreviewText else { return }
         sendGeneration = previous.sendGeneration
-        setLocalPreview(text)
+        setLocalPreview(text, viewID: previous.previewViewID)
     }
 
     /// Shows or clears the pending bubble for a message the platform is
     /// still preparing.
     func setLocalPreview(_ text: String?) {
+        setLocalPreview(text, viewID: nil)
+    }
+
+    private func setLocalPreview(_ text: String?, viewID: String?) {
         let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines)
         let next = trimmed?.isEmpty == false ? trimmed : nil
         guard next != localPreviewText else { return }
-        localPreviewText = next
-        if next != nil {
-            liveTurnID = ChatTurn.localPreviewID
-            if progressLabel != nil { progressLabel = nil }
+        if next != nil, localPreviewText == nil {
+            if let viewID {
+                previewViewID = viewID
+            } else {
+                previewCount += 1
+                previewViewID = "\(ChatTurn.localPreviewID)-\(previewCount)"
+            }
         }
-        rebuildTurns(animated: next != nil)
-        if next == nil, liveTurnID == ChatTurn.localPreviewID {
-            liveTurnID = turns.last(where: { $0.user != nil })?.id
+        localPreviewText = next
+        if next != nil, progressLabel != nil { progressLabel = nil }
+        rebuildTurns(animated: next != nil) { live, turns in
+            if next != nil {
+                live = ChatTurn.localPreviewID
+            } else if live == ChatTurn.localPreviewID {
+                live = turns.last(where: { $0.user != nil })?.id
+            }
         }
     }
 
@@ -300,15 +341,24 @@ final class ChatScreenModel {
             self.streamingRowID = nil
         }
         let newUserID = rows.last(where: { $0.isUser && !previousUserIDs.contains($0.id) })?.id
-        if newUserID != nil, !previousUserIDs.isEmpty || localPreviewText != nil {
+        var stagedPreviewID: String?
+        if let newUserID, !previousUserIDs.isEmpty || localPreviewText != nil {
+            if localPreviewText != nil {
+                stagePreview(as: newUserID)
+                stagedPreviewID = newUserID
+            }
             localPreviewText = nil
         }
-        rebuildTurns(animated: false)
-
-        if snapshotPhase.isActive {
-            liveTurnID = turns.last(where: { $0.user != nil })?.id ?? liveTurnID
-        } else if let liveTurnID, !turns.contains(where: { $0.id == liveTurnID }) {
-            self.liveTurnID = nil
+        rebuildTurns(animated: false) { live, turns in
+            if snapshotPhase.isActive {
+                live = turns.last(where: { $0.user != nil })?.id ?? live
+            } else if let stagedPreviewID {
+                // The sent message is staged before its turn starts; it owns
+                // the reserve the preview had.
+                live = stagedPreviewID
+            } else if let current = live, !turns.contains(where: { $0.id == current }) {
+                live = nil
+            }
         }
         applyPhase(snapshotPhase)
         onRowsChanged?(rows)
@@ -344,16 +394,20 @@ final class ChatScreenModel {
         rows = ordered
 
         let newTurnID = newUserIDs.last
-        if newTurnID != nil {
+        if let newTurnID {
+            if localPreviewText != nil {
+                stagePreview(as: newTurnID)
+            }
             localPreviewText = nil
         }
-        rebuildTurns(animated: newTurnID != nil)
-        if let newTurnID {
-            liveTurnID = newTurnID
-            progressLabel = nil
-        } else if let liveTurnID, liveTurnID != ChatTurn.localPreviewID,
-                  !turns.contains(where: { $0.id == liveTurnID }) {
-            self.liveTurnID = turns.last(where: { $0.user != nil })?.id
+        if newTurnID != nil { progressLabel = nil }
+        rebuildTurns(animated: newTurnID != nil) { live, turns in
+            if let newTurnID {
+                live = newTurnID
+            } else if let current = live, current != ChatTurn.localPreviewID,
+                      !turns.contains(where: { $0.id == current }) {
+                live = turns.last(where: { $0.user != nil })?.id
+            }
         }
         onRowsChanged?(rows)
     }
@@ -393,9 +447,10 @@ final class ChatScreenModel {
         if !newPhase.isActive, newPhase != phase {
             if localPreviewText != nil {
                 localPreviewText = nil
-                rebuildTurns(animated: false)
-                if liveTurnID == ChatTurn.localPreviewID {
-                    liveTurnID = turns.last(where: { $0.user != nil })?.id
+                rebuildTurns(animated: false) { live, turns in
+                    if live == ChatTurn.localPreviewID {
+                        live = turns.last(where: { $0.user != nil })?.id
+                    }
                 }
             }
         }
@@ -468,14 +523,24 @@ final class ChatScreenModel {
         renderer.finish(itemID: Self.rendererItemID(for: rowID))
     }
 
-    private func rebuildTurns(animated: Bool) {
+    /// The staged learner row takes over the local preview's view identity.
+    private func stagePreview(as userRowID: String) {
+        stagedPreviewViewIDs[userRowID] = previewViewID
+    }
+
+    /// Regroups rows into turns. `updateLive` picks the live turn against
+    /// the new turns, and both land in one assignment (see `layout`).
+    private func rebuildTurns(
+        animated: Bool,
+        updateLive: (_ live: inout String?, _ turns: [ChatTurn]) -> Void = { _, _ in }
+    ) {
         var result: [ChatTurn] = []
         var current: ChatTurn?
         var latestQuestion: String?
         for row in rows {
             if row.isUser {
                 if let current { result.append(current) }
-                current = ChatTurn(id: row.id, user: row, rows: [])
+                current = ChatTurn(id: row.id, viewID: stagedPreviewViewIDs[row.id], user: row, rows: [])
                 latestQuestion = nil
                 continue
             }
@@ -491,6 +556,7 @@ final class ChatScreenModel {
         if let localPreviewText {
             result.append(ChatTurn(
                 id: ChatTurn.localPreviewID,
+                viewID: previewViewID,
                 user: ChatTimelineRow(
                     id: ChatTurn.localPreviewID,
                     kind: .user(text: localPreviewText, imageDataUris: [], delivery: .pending)
@@ -499,15 +565,22 @@ final class ChatScreenModel {
             ))
         }
 
-        if turns != result {
+        var next = TurnLayout(turns: result, liveTurnID: layout.liveTurnID)
+        updateLive(&next.liveTurnID, result)
+        if next != layout {
             if animated, let turnInsertionAnimation {
-                withAnimation(turnInsertionAnimation) { turns = result }
+                withAnimation(turnInsertionAnimation) { layout = next }
             } else {
-                turns = result
+                layout = next
             }
         }
         if latestQuestionRowID != latestQuestion {
             latestQuestionRowID = latestQuestion
         }
     }
+}
+
+private struct TurnLayout: Equatable {
+    var turns: [ChatTurn] = []
+    var liveTurnID: String?
 }

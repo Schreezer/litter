@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// One learner message and the agent's reply, laid out in a `TurnContainer`.
+/// One learner message and the agent's reply.
 ///
 /// Equatable on its value inputs only, so streaming in one turn, or a phase
 /// change, never re-evaluates the other turns.
@@ -72,43 +72,43 @@ struct TurnSection: View, Equatable {
     }
 
     var body: some View {
-        TurnContainer(isHighlighted: livePhase?.isWorking == true) {
-            VStack(alignment: .leading, spacing: 14) {
-                if let user = turn.user, case .user(let text, let images, let delivery) = user.kind {
-                    ChatUserBubble(text: text, imageDataURIs: images, isPending: delivery == .pending)
-                        // Position only: borrowing the composer's width would make
-                        // the row wider than the screen mid-flight and push the
-                        // whole scroll view sideways.
-                        .matchedGeometryEffect(id: turn.id, in: bubbleNamespace, properties: .position)
-                        .transition(.asymmetric(
-                            insertion: .opacity.combined(with: .scale(scale: 0.92, anchor: .bottomTrailing)),
-                            removal: .opacity
-                        ))
-                        .padding(.leading, 48)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                }
+        VStack(alignment: .leading, spacing: 14) {
+            if let user = turn.user, case .user(let text, let images, let delivery) = user.kind {
+                ChatUserBubble(text: text, imageDataURIs: images, isPending: delivery == .pending)
+                    // Position only: borrowing the composer's width would make
+                    // the row wider than the screen mid-flight and push the
+                    // whole scroll view sideways.
+                    .matchedGeometryEffect(id: turn.viewID, in: bubbleNamespace, properties: .position)
+                    .transition(.asymmetric(
+                        insertion: .opacity.combined(with: .scale(scale: 0.92, anchor: .bottomTrailing)),
+                        removal: .opacity
+                    ))
+                    .padding(.leading, 48)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
 
-                ForEach(displayRows) { row in
-                    rowView(row)
+            ForEach(displayRows) { row in
+                rowView(row)
+                    .transition(.opacity)
+            }
+
+            if let livePhase {
+                let presentation = ChatPhasePresentation.make(phase: livePhase, progress: progressLabel)
+                // Rust already shows a failed turn as an error notice row.
+                if presentation.style != .none,
+                   !(presentation.style == .error && (hasErrorNotice || hidesErrorNotices)) {
+                    ChatPhaseIndicator(presentation: presentation)
+                        .frame(maxWidth: .infinity, alignment: presentation.trailing ? .trailing : .leading)
                         .transition(.opacity)
                 }
+            }
 
-                if let livePhase {
-                    let presentation = ChatPhasePresentation.make(phase: livePhase, progress: progressLabel)
-                    // Rust already shows a failed turn as an error notice row.
-                    if presentation.style != .none,
-                       !(presentation.style == .error && (hasErrorNotice || hidesErrorNotices)) {
-                        ChatPhaseIndicator(presentation: presentation)
-                            .frame(maxWidth: .infinity, alignment: presentation.trailing ? .trailing : .leading)
-                            .transition(.opacity)
-                    }
-                }
-
-                if let trailing {
-                    trailing
-                }
+            if let trailing {
+                trailing
             }
         }
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .onGeometryChange(for: CGFloat.self) { proxy in
             proxy.size.height
         } action: { height in
@@ -209,38 +209,6 @@ struct TurnSection: View, Equatable {
                 }
             }
         }
-    }
-}
-
-/// The frame around a turn. While the turn is active it carries a faint
-/// tint and outline; both fade out when it settles. The reserved space is
-/// applied outside this view, so fading the chrome never moves anything.
-struct TurnContainer<Content: View>: View {
-    let isHighlighted: Bool
-    @ViewBuilder let content: Content
-
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        content
-            .padding(.horizontal, 12)
-            .padding(.vertical, 12)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-            .background {
-                let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
-                shape
-                    .fill(LitterTheme.accent.opacity(colorScheme == .dark ? 0.08 : 0.045))
-                    .overlay {
-                        shape.strokeBorder(
-                            LitterTheme.accent.opacity(colorScheme == .dark ? 0.35 : 0.22),
-                            lineWidth: 1
-                        )
-                    }
-                    .opacity(isHighlighted ? 1 : 0)
-                    .animation(reduceMotion ? nil : .easeOut(duration: 0.5), value: isHighlighted)
-            }
-            .padding(.horizontal, -12)
     }
 }
 

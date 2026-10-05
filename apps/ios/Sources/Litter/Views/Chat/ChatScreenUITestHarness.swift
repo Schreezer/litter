@@ -7,13 +7,15 @@ import SwiftUI
 /// Launch arguments:
 /// - `--chat-screen-harness` enables the harness. It deliberately avoids the
 ///   `--ui-test-` prefix, which the strict checkpoint parser claims.
-/// - `--chat-scenario <happy|interrupt|failure|reconnect>` picks the script.
+/// - `--chat-scenario <happy|interrupt|failure|reconnect|brief>` picks the script.
 /// - `--chat-history` starts with one settled exchange.
 /// - `--chat-autosend` types a message and sends it after a second.
 /// - `--chat-draft <text>` replaces the auto-sent message.
 /// - `--chat-reserve-guide` hatches the live turn's reserved space.
 /// - `--chat-debug-metrics` prints viewport and scroll numbers.
 /// - `--chat-time-scale <number>` slows down (>1) or speeds up the script.
+/// - `--chat-staging-delay <seconds>` holds a sent message in the local
+///   preview before the source stages it, like a hosted agent.
 struct ChatScreenUITestHarness: View {
     static let argument = "--chat-screen-harness"
 
@@ -45,6 +47,7 @@ struct ChatScreenUITestHarness: View {
         let source = FixtureChatSource(
             scenario: scenario,
             timeScale: timeScale,
+            stagingDelay: value(after: "--chat-staging-delay").flatMap(Double.init) ?? 0,
             initialRows: arguments.contains("--chat-history") ? FixtureChatSource.historyRows : []
         )
         let model = ChatScreenModel(source: source)
@@ -74,6 +77,17 @@ struct ChatScreenUITestHarness: View {
                         Image(systemName: "chevron.left")
                     }
                     .accessibilityLabel("Back")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        UIApplication.shared.sendAction(
+                            #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil
+                        )
+                    } label: {
+                        Image(systemName: "keyboard.chevron.compact.down")
+                    }
+                    .accessibilityLabel("Hide keyboard")
+                    .accessibilityIdentifier("chat-harness-hide-keyboard")
                 }
             }
         }

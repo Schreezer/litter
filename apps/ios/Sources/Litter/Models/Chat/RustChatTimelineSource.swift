@@ -34,7 +34,7 @@ final class RustChatTimelineSource: ChatTimelineSource {
     init(
         store: AppStore,
         key: ThreadKey,
-        options: ChatViewOptions = ChatViewOptions(hidesSelectionEnvelope: false, showsInternalCourseActivity: false),
+        options: ChatViewOptions = ChatViewOptions(hidesSelectionEnvelope: false, showsInternalCourseActivity: false, hidesPlanRows: false),
         routing: ChatIntentRouting,
         prepare: (() -> Void)? = nil
     ) {

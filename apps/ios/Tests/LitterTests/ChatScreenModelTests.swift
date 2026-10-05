@@ -211,6 +211,45 @@ final class ChatScreenModelTests: XCTestCase {
         XCTAssertEqual(second.liveTurnID, "user:c1")
     }
 
+    func testStagedMessageKeepsThePreviewsViewIdentity() {
+        let model = ChatScreenModel(source: RecordingSource(), renderer: RecordingRenderer())
+        XCTAssertTrue(model.send("First"))
+        let firstPreview = model.turns.last?.viewID
+        XCTAssertNotNil(firstPreview)
+        model.apply(.rowsChanged(
+            upserts: [row("user:c1", user("First", delivery: .pending))],
+            removals: [],
+            order: ["user:c1"],
+            seq: 1
+        ))
+        XCTAssertEqual(model.turns.map(\.id), ["user:c1"])
+        XCTAssertEqual(model.turns.map(\.viewID), [firstPreview], "Staging doesn't replace the bubble's view")
+
+        model.apply(.phaseChanged(phase: .settled(outcome: .completed), progressLabel: nil, activeTurnStartedAtMs: nil, seq: 2))
+        XCTAssertTrue(model.send("Second"))
+        let secondPreview = model.turns.last?.viewID
+        XCTAssertNotEqual(secondPreview, firstPreview, "Each send gets its own preview identity")
+        XCTAssertEqual(model.turns.map(\.viewID), [firstPreview, secondPreview])
+    }
+
+    func testModelSwapKeepsThePreviewsViewIdentityThroughStaging() {
+        let first = ChatScreenModel(source: nil, renderer: RecordingRenderer())
+        first.noteLocalSend(previewText: "Teach me OLED")
+        let previewViewID = first.turns.last?.viewID
+
+        let second = ChatScreenModel(source: RecordingSource(), renderer: RecordingRenderer())
+        second.continuePendingSend(from: first)
+        XCTAssertEqual(second.previewViewID, first.previewViewID)
+        XCTAssertEqual(second.turns.map(\.viewID), [previewViewID])
+
+        // The new thread's snapshot already has the staged message, before
+        // its turn starts.
+        second.apply(snapshot(rows: [row("user:c1", user("Teach me OLED", delivery: .pending))], phase: .idle))
+        XCTAssertNil(second.localPreviewText)
+        XCTAssertEqual(second.turns.map(\.viewID), [previewViewID])
+        XCTAssertEqual(second.liveTurnID, "user:c1", "The staged message keeps the preview's reserve")
+    }
+
     func testModelSwapWithoutAPendingSendCarriesNothing() {
         let first = ChatScreenModel(source: nil, renderer: RecordingRenderer())
         let second = ChatScreenModel(source: nil, renderer: RecordingRenderer())
@@ -568,6 +607,23 @@ final class ChatScreenModelTests: XCTestCase {
         XCTAssertEqual(ChatConnectionPresentation.make(.reconnecting)?.label, "Reconnecting…")
     }
 
+    func testRetryProgressDisappearsWhileTheSameTurnKeepsStreaming() {
+        let model = ChatScreenModel(source: nil, renderer: RecordingRenderer())
+        model.apply(snapshot(rows: [row("user:c1", user("q")), row("a1", answer("Partial"))], phase: .streaming))
+        model.apply(.phaseChanged(phase: .streaming, progressLabel: "Reconnecting... 1/5", activeTurnStartedAtMs: nil, seq: 2))
+        for phase in [ChatTurnPhase.streaming, .acting] {
+            let presentation = ChatPhasePresentation.make(phase: phase, progress: model.progressLabel)
+            XCTAssertEqual(presentation.style, .caption)
+            XCTAssertEqual(presentation.label, "Reconnecting... 1/5")
+        }
+
+        model.apply(.phaseChanged(phase: .streaming, progressLabel: nil, activeTurnStartedAtMs: nil, seq: 3))
+        XCTAssertEqual(model.phase, .streaming)
+        XCTAssertNil(model.progressLabel)
+        XCTAssertEqual(ChatPhasePresentation.make(phase: model.phase, progress: model.progressLabel).style, .none)
+        XCTAssertEqual(model.turns[0].rows.map(\.id), ["a1"])
+    }
+
     // MARK: - Fixture scenarios
 
     func testFixtureHappyPathSettlesWithQuestionAndFold() async {
@@ -608,7 +664,10 @@ final class ChatScreenModelTests: XCTestCase {
         let (model, source) = makeFixture(.failure)
         model.send("q")
         await source.waitForIdle()
-        await waitUntil { !model.phase.isActive }
+        await waitUntil {
+            if case .settled(.failed) = model.phase { return true }
+            return false
+        }
 
         guard case .settled(.failed(let message)) = model.phase else {
             return XCTFail("Expected failure, got \(model.phase)")
@@ -625,6 +684,7 @@ final class ChatScreenModelTests: XCTestCase {
 
         XCTAssertEqual(model.connection, .live)
         XCTAssertEqual(model.phase, .settled(outcome: .completed))
+        XCTAssertNil(model.progressLabel)
         XCTAssertEqual(
             model.buffer(for: "answer-1")?.text,
             FixtureChatSource.answerParagraphs.joined(separator: "\n\n")

@@ -30,6 +30,9 @@ struct ChatPhasePresentation: Equatable {
         case .accepted, .thinking:
             return ChatPhasePresentation(style: .shimmer, label: "Thinking", subtitle: progress)
         case .acting, .streaming:
+            if let progress {
+                return ChatPhasePresentation(style: .caption, label: progress, subtitle: nil)
+            }
             // The live tool row or the growing text is the indicator.
             return .hidden
         case .awaitingInput:

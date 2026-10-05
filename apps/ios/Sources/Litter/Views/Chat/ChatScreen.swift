@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 /// The chat screen: a turn-grouped timeline over a composer.
@@ -11,6 +12,10 @@ import SwiftUI
 /// - Once the reply outgrows the reserve, and only if the learner hasn't
 ///   dragged, the view follows the bottom.
 /// - When the turn settles, its reserve stays until the next send.
+/// - The keyboard leaves the newest turn where it is. Its reserve never
+///   shrinks while it is live, so the keyboard opening doesn't pull content
+///   out from under the reader; when the reader is at the turn's end, the
+///   end rides up with the keyboard instead of going behind it.
 struct ChatScreen: View {
     let model: ChatScreenModel
     var placeholder = "Message your course agent"
@@ -50,8 +55,15 @@ struct ChatScreen: View {
     @State private var viewportHeight: CGFloat = 0
     @State private var liveContentHeight: CGFloat = 0
     /// The tallest the live turn has been. Its reserve never drops below
-    /// this, so a fold collapsing or chrome fading can't shift the view.
+    /// this, so a fold collapsing can't shift the view.
     @State private var liveHeightFloor: CGFloat = 0
+    /// The tallest viewport the live turn has reserved. SwiftUI applies the
+    /// keyboard in several layout steps (the frame shrinks, then grows back
+    /// as the bottom inset catches up). Content that shrinks in between no
+    /// longer reaches the offset, so the scroll view clamps it and the turn
+    /// drops below the composer. The reserve only grows until the next turn
+    /// takes over.
+    @State private var reserveFloor: CGFloat = 0
     @State private var userDragged = false
     @State private var isNearBottom = true
     /// Set by a send until the new turn has been laid out, so the insertion
@@ -61,7 +73,11 @@ struct ChatScreen: View {
     /// release the old one.
     @State private var attachedModel: ChatScreenModel?
     /// A just-sent turn to scroll to because the reader was scrolled up.
+    /// A turn's `viewID`.
     @State private var jumpTargetID: String?
+    /// The live turn's `viewID`. A staged message keeps its preview's, which
+    /// is how `adoptLiveTurn` tells it from a new turn.
+    @State private var liveViewID: String?
     @State private var debugOffset: CGFloat = 0
     @State private var debugContentHeight: CGFloat = 0
     @State private var debugGeometry = ""
@@ -71,6 +87,9 @@ struct ChatScreen: View {
     /// A send happened while the reader was scrolled up; jump to the new
     /// turn once it exists.
     @State private var jumpOnNextTurn = false
+    /// Text editing just began, so the keyboard is about to open.
+    @State private var keyboardOpening = false
+    @State private var keyboardSettleTask: Task<Void, Never>?
     @Namespace private var bubbleNamespace
     @FocusState private var composerFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -85,10 +104,10 @@ struct ChatScreen: View {
                             .padding(.horizontal, 16)
                             .id("chat-header")
                     }
-                    ForEach(model.turns) { turn in
+                    ForEach(model.turns, id: \.viewID) { turn in
                         turnSection(turn)
                             .padding(.horizontal, 16)
-                            .id(turn.id)
+                            .id(turn.viewID)
                     }
                     if model.turns.isEmpty, let trailing {
                         trailing
@@ -105,6 +124,7 @@ struct ChatScreen: View {
                     if abs(width - floorWidth) > 0.5 {
                         floorWidth = width
                         liveHeightFloor = liveContentHeight
+                        reserveFloor = viewportHeight
                     }
                 }
                 // Bottom-pinning keeps the distance from the bottom, so it
@@ -130,6 +150,8 @@ struct ChatScreen: View {
         //   still bottom-pinned, the view follows it.
         // - A drag, or the turn settling, switches to top-pinning, so growth
         //   (a late row, an expanded fold) never pulls the reader along.
+        // - While the keyboard opens, a reader at the end of the newest turn
+        //   stays there.
         .defaultScrollAnchor(pinsToBottom ? .bottom : .top, for: .sizeChanges)
         .defaultScrollAnchor(.bottom, for: .initialOffset)
         .scrollDismissesKeyboard(.interactively)
@@ -141,6 +163,7 @@ struct ChatScreen: View {
             geometry.visibleRect.height - geometry.contentInsets.top - geometry.contentInsets.bottom
         } action: { _, height in
             viewportHeight = max(0, height)
+            reserveFloor = max(reserveFloor, viewportHeight)
         }
         .onScrollGeometryChange(for: CGSize.self) { geometry in
             CGSize(width: geometry.contentOffset.y, height: geometry.contentSize.height)
@@ -188,7 +211,7 @@ struct ChatScreen: View {
                     placeholder: placeholder,
                     phase: model.phase,
                     canSend: model.canSend,
-                    pendingBubbleID: ChatTurn.localPreviewID,
+                    pendingBubbleID: model.nextPreviewViewID,
                     bubbleNamespace: bubbleNamespace,
                     isFocused: $composerFocused,
                     onSend: { send(draft) },
@@ -206,7 +229,9 @@ struct ChatScreen: View {
         .onChange(of: dynamicTypeSize) { _, _ in
             // Text sizes changed, so the floor measured before is stale.
             liveHeightFloor = liveContentHeight
+            reserveFloor = viewportHeight
         }
+        .onReceive(editingBegan) { _ in keyboardWillOpen() }
         .litterFontFamily(.system)
         .environment(\.textScale, 1.0)
         .accessibilityElement(children: .contain)
@@ -266,30 +291,40 @@ struct ChatScreen: View {
     }
 
     /// The live turn's minimum height: the visible viewport, or more if the
-    /// turn has already been taller than that.
+    /// turn has already been taller than that or reserved a taller viewport.
     private var reservedHeight: CGFloat? {
         guard viewportHeight > 0 else { return nil }
-        return max(viewportHeight, liveHeightFloor)
+        return max(viewportHeight, liveHeightFloor, reserveFloor)
     }
 
     // MARK: - Lifecycle
 
     private func attach(_ model: ChatScreenModel) {
+        // The course chat's first message creates its thread, so the model
+        // is swapped mid-send. The new model carries the same pending turn,
+        // so the send keeps its scroll state and hand-off.
+        let continuesSend = attachedModel.map {
+            $0 !== model && model.localPreviewText != nil && model.previewViewID == $0.previewViewID
+        } ?? false
         if let attachedModel, attachedModel !== model {
             attachedModel.tearDown()
+        }
+        if let attachedModel, attachedModel !== model, !continuesSend {
             // Scroll state belongs to the previous thread.
             draft = ""
             userDragged = false
             liveContentHeight = 0
             liveHeightFloor = 0
+            reserveFloor = viewportHeight
             sendingTurnID = nil
             jumpTargetID = nil
+            liveViewID = nil
         }
         attachedModel = model
         model.turnInsertionAnimation = reduceMotion ? nil : .smooth(duration: 0.5)
-        if model.localPreviewText != nil {
-            // The model arrived mid-send (the send created its thread), so
-            // the send's hand-off carries over.
+        if model.localPreviewText != nil, !continuesSend {
+            // The model arrived mid-send, so the send's hand-off carries
+            // over.
             beginSendHandOff()
         }
         model.start()
@@ -321,14 +356,23 @@ struct ChatScreen: View {
     /// A new turn owns the reserve: the old turn gives it up in the same
     /// transaction, and the new one scrolls to the top.
     private func adoptLiveTurn(_ turnID: String) {
+        let viewID = model.turns.first(where: { $0.id == turnID })?.viewID ?? turnID
+        if viewID == liveViewID {
+            // The source staged the message shown as the preview. It is the
+            // same view, so it keeps its reserve and nothing moves.
+            if sendingTurnID != nil { sendingTurnID = turnID }
+            return
+        }
+        liveViewID = viewID
         liveContentHeight = 0
         liveHeightFloor = 0
+        reserveFloor = viewportHeight
         if sendingTurnID != nil || model.phase.isActive {
             sendingTurnID = turnID
         }
         if jumpOnNextTurn {
             jumpOnNextTurn = false
-            jumpTargetID = turnID
+            jumpTargetID = viewID
         }
     }
 
@@ -337,12 +381,39 @@ struct ChatScreen: View {
     }
 
     /// The only follow rule: pin growth to the bottom while the just-sent
-    /// turn is settling into place, and while the live turn is active and
-    /// the learner hasn't dragged. With reserve > 0 bottom-pinning moves
+    /// turn is settling into place, while the live turn is active and the
+    /// learner hasn't dragged, and while the keyboard opens under a reader
+    /// at the end of the newest turn. With reserve > 0 bottom-pinning moves
     /// nothing, because the content size doesn't change.
     private var pinsToBottom: Bool {
         if sendingTurnID != nil { return true }
+        // The keyboard opening keeps the end of the newest turn in view. A
+        // turn with blank reserve below it stays put instead, since the
+        // reserve absorbs the keyboard.
+        if keyboardOpening, readsNewestTurnEnd { return true }
         return model.liveTurnID != nil && model.phase.isWorking && !userDragged
+    }
+
+    // MARK: - Keyboard
+
+    /// Text editing began, so the keyboard is about to open. SwiftUI resizes
+    /// the scroll view inside its own keyboard notification, so the anchor
+    /// has to be set before that, and editing begins first.
+    private func keyboardWillOpen() {
+        keyboardOpening = true
+        keyboardSettleTask?.cancel()
+        keyboardSettleTask = Task {
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            keyboardOpening = false
+        }
+    }
+
+    /// The reader sees the end of the newest turn: they are at the bottom
+    /// and the turn fills its reserve, so no blank space sits below it.
+    private var readsNewestTurnEnd: Bool {
+        guard isNearBottom, model.liveTurnID != nil, let reservedHeight else { return false }
+        return liveContentHeight >= reservedHeight - 1
     }
 
     // MARK: - Chrome
@@ -374,4 +445,15 @@ struct ChatScreen: View {
             .accessibilityIdentifier("chat-state-probe")
             .accessibilityValue(value)
     }
+}
+
+/// Text editing beginning anywhere in the app. SwiftUI's `TextField` posts
+/// this from its backing `UITextField` or `UITextView` before the keyboard
+/// notifications.
+@MainActor
+private var editingBegan: AnyPublisher<Notification, Never> {
+    let center = NotificationCenter.default
+    return center.publisher(for: UITextField.textDidBeginEditingNotification)
+        .merge(with: center.publisher(for: UITextView.textDidBeginEditingNotification))
+        .eraseToAnyPublisher()
 }
