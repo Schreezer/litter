@@ -2,19 +2,20 @@
 * { margin: 0; }
 
 :root {
-  --indigo: #4b3cf0;
-  --indigo-deep: #1f1a6b;
-  --chartreuse: #d7ff45;
-  --paper: #fffaf0;
-  --ink: #121428;
-  --muted: #62677d;
-  --line: rgba(31, 26, 107, 0.16);
-  --surface: rgba(255, 255, 255, 0.78);
-  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --mono: 'SF Mono', ui-monospace, monospace;
-  --serif: ui-serif, Georgia, serif;
+  --indigo: #0a84ff;
+  --indigo-deep: #2b95ff;
+  --chartreuse: #30d158;
+  --paper: #000000;
+  --ink: #ffffff;
+  --muted: #888888;
+  --line: #1e1e1e;
+  --surface: #1a1a1a;
+  --sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Inter, sans-serif;
+  --mono: ui-monospace, 'SF Mono', Menlo, monospace;
+  --serif: var(--sans);
   --max-width: 1120px;
 }
+html { color-scheme: dark; }
 
 html { scroll-behavior: smooth; }
 body {
@@ -35,7 +36,7 @@ nav {
   position: sticky;
   top: 0;
   z-index: 20;
-  background: rgba(255, 250, 240, 0.9);
+  background: rgba(0, 0, 0, 0.72);
   border-bottom: 1px solid var(--line);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
@@ -50,7 +51,7 @@ nav .container, footer .container {
 }
 
 .nav-brand, .footer-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; }
-.nav-brand img, .footer-brand img { width: 32px; height: 32px; }
+.nav-brand img, .footer-brand img { width: 30px; height: 30px; border-radius: 8px; }
 .nav-links, .footer-links { display: flex; align-items: center; gap: 24px; }
 .nav-links a, .footer-links a { color: var(--muted); font-size: 14px; }
 .nav-links a:hover, .footer-links a:hover { color: var(--indigo); }
@@ -78,8 +79,8 @@ h1, h2, h3 { line-height: 1.08; letter-spacing: -.035em; }
 .hero h1 em, .difference h2 em { color: var(--indigo); font-family: var(--serif); font-weight: 500; }
 .hero-sub { max-width: 650px; margin-top: 26px; color: var(--muted); font-size: clamp(18px, 2.1vw, 22px); }
 .hero-cta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 34px; }
-.btn { display: inline-flex; align-items: center; gap: 10px; padding: 13px 18px; border-radius: 12px; font-weight: 700; }
-.btn-primary { background: var(--indigo); color: white; box-shadow: 0 12px 30px rgba(75, 60, 240, .22); }
+.btn { display: inline-flex; align-items: center; gap: 10px; padding: 13px 22px; border-radius: 999px; font-weight: 600; }
+.btn-primary { background: var(--indigo); color: white; }
 .btn-primary:hover { background: var(--indigo-deep); }
 .btn-secondary { border: 1px solid var(--line); background: var(--surface); }
 .focus-line { margin-top: 24px; color: var(--muted); font-size: 14px; }
@@ -140,19 +141,19 @@ h1, h2, h3 { line-height: 1.08; letter-spacing: -.035em; }
 .final-cta { padding: 90px 0; text-align: center; background: var(--chartreuse); }
 .final-cta h2 { margin-top: 14px; font-size: clamp(42px, 6vw, 70px); }
 .final-cta p:not(.section-label) { max-width: 620px; margin: 18px auto 28px; font-size: 18px; }
-footer { border-top: 1px solid var(--line); background: white; }
+footer { border-top: 1px solid var(--line); background: var(--paper); }
 
 .support, .legal, .four-oh-four { padding: 72px 0 100px; }
 .support h1, .legal h1, .four-oh-four h1 { font-size: clamp(40px, 6vw, 64px); }
 .support > p, .legal .updated, .four-oh-four p { margin-top: 12px; color: var(--muted); }
 .support-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 36px; }
-.support-card { padding: 24px; border: 1px solid var(--line); border-radius: 18px; background: white; }
+.support-card { padding: 24px; border: 1px solid var(--line); border-radius: 22px; background: var(--surface); }
 .support-card h3 { font-size: 20px; }
 .support-card p { margin-top: 12px; color: var(--muted); }
 .support-card a, .legal a { color: var(--indigo); text-decoration: underline; text-underline-offset: 3px; }
 .legal { max-width: 760px; }
 .legal h2 { margin-top: 34px; font-size: 24px; }
-.legal p, .legal ul { margin-top: 12px; color: #42465a; }
+.legal p, .legal ul { margin-top: 12px; color: #e0e0e0; }
 .legal ul { padding-left: 22px; }
 .four-oh-four { min-height: calc(100vh - 68px); display: grid; place-content: center; text-align: center; }
 .four-oh-four .btn { margin-top: 26px; }

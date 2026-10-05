@@ -1,0 +1,17 @@
+name = "learnfold-mail"
+main = "index.ts"
+compatibility_date = "2026-09-09"
+workers_dev = false
+[observability]
+enabled = true
+[triggers]
+crons = ["* * * * *"]
+[vars]
+MAIL_ENABLED = "true"
+MAIL_REGION = "us-east-1"
+MAIL_FROM = "Learnfold <chirag@forgeme.xyz>"
+MAIL_REPLY_TO = "chirag@forgeme.xyz"
+[[d1_databases]]
+binding = "EXPERIMENTS"
+database_name = "learnfold-landing-experiments"
+database_id = "740e7597-d731-471c-98f7-1f182f297d41"
