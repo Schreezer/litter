@@ -750,3 +750,186 @@ fn fixture_discussion_options_drop_plan_rows_but_keep_the_prose() {
         "the prose around the fence stays visible"
     );
 }
+
+fn course_fetch(id: &str, page_id: &str, status: &str, result: Value) -> upstream::ThreadItem {
+    item(json!({"type": "mcpToolCall", "id": id, "server": "learnfold_course",
+        "tool": "native-editor-fetch", "status": status, "arguments": {"id": page_id},
+        "appContext": null, "pluginId": null, "result": result, "error": null,
+        "durationMs": null}))
+}
+
+fn session_summary(reducer: &AppStoreReducer) -> crate::store::AppSessionSummary {
+    crate::store::AppSnapshotRecord::try_from(reducer.snapshot())
+        .expect("snapshot record")
+        .session_summaries
+        .into_iter()
+        .find(|summary| summary.key == key())
+        .expect("session summary")
+}
+
+/// The background banner reads `current_activity` and `last_turn_outcome`
+/// from the session summary while `last_tool_label` keeps its raw value.
+#[test]
+fn session_summary_tracks_course_fetch_lifecycle_and_failed_outcome() {
+    use crate::store::AppTurnActivityKind;
+    let reducer = AppStoreReducer::new();
+    reducer.upsert_thread_snapshot(thread("codex"));
+    let page = "4f6c2b1a-0d3e-4c7a-9b52-8e1f0a6d3c21";
+
+    reducer.apply_ui_event(&turn_started("t1"));
+    let queued = session_summary(&reducer);
+    assert_eq!(
+        queued.current_activity.map(|activity| activity.kind),
+        Some(AppTurnActivityKind::Starting)
+    );
+    reducer.apply_ui_event(&completed("t1", user_message("u1", "Write the lesson")));
+    reducer.apply_ui_event(&started(
+        "t1",
+        course_fetch(
+            "f1",
+            &format!("native-editor://page/{page}"),
+            "inProgress",
+            Value::Null,
+        ),
+    ));
+    let reading = session_summary(&reducer);
+    let activity = reading.current_activity.expect("activity");
+    assert_eq!(activity.kind, AppTurnActivityKind::ReadingCourse);
+    assert_eq!(activity.page_id.as_deref(), Some(page));
+    assert!(activity.is_running);
+    assert_eq!(
+        reading.last_tool_label.as_deref(),
+        Some("MCP native-editor-fetch")
+    );
+
+    let page_markdown = json!({"object": "page_markdown", "id": page,
+        "title": "Light Reactions", "markdown": "# Light Reactions"});
+    reducer.apply_ui_event(&completed(
+        "t1",
+        course_fetch(
+            "f1",
+            &format!("native-editor://page/{page}"),
+            "completed",
+            json!({"content": [{"type": "text", "text": page_markdown.to_string()}],
+                "structuredContent": page_markdown, "_meta": null}),
+        ),
+    ));
+    let thinking = session_summary(&reducer);
+    let activity = thinking.current_activity.expect("activity");
+    assert_eq!(activity.kind, AppTurnActivityKind::Thinking);
+    assert_eq!(activity.subject, None);
+    assert_eq!(activity.course_pages_read, 1);
+    assert_eq!(
+        thinking.last_tool_label.as_deref(),
+        Some("MCP native-editor-fetch"),
+        "the raw label stays for the dashboard"
+    );
+    assert_eq!(thinking.last_turn_outcome, None);
+
+    reducer.apply_ui_event(&UiEvent::TurnCompleted {
+        key: key(),
+        turn_id: "t1".into(),
+        error: Some("Model overloaded".into()),
+        interrupted: false,
+    });
+    let failed = session_summary(&reducer);
+    assert!(!failed.has_active_turn);
+    assert_eq!(
+        failed.last_turn_outcome,
+        Some(TurnOutcome::Failed {
+            message: "Model overloaded".into()
+        })
+    );
+
+    reducer.apply_ui_event(&turn_started("t2"));
+    let restarted = session_summary(&reducer);
+    assert_eq!(restarted.last_turn_outcome, None);
+    assert_eq!(
+        restarted.current_activity.map(|activity| activity.kind),
+        Some(AppTurnActivityKind::Starting)
+    );
+}
+
+fn server_event(notification: upstream::ServerNotification) -> UiEvent {
+    let processor = EventProcessor::new();
+    let mut events = processor.subscribe();
+    processor.process_notification("srv", "codex".into(), &notification);
+    events.try_recv().expect("server notification event")
+}
+
+fn status_changed(status: upstream::ThreadStatus) -> UiEvent {
+    server_event(upstream::ServerNotification::ThreadStatusChanged(
+        upstream::ThreadStatusChangedNotification {
+            thread_id: "thread".into(),
+            status,
+        },
+    ))
+}
+
+fn turn_finished(turn: &str, status: &str, error: Option<&str>) -> UiEvent {
+    let turn: upstream::Turn = serde_json::from_value(json!({"id": turn, "items": [],
+        "status": status,
+        "error": error.map(|message| json!({"message": message, "codexErrorInfo": null})),
+        "startedAt": null, "completedAt": null, "durationMs": null}))
+    .expect("turn");
+    server_event(upstream::ServerNotification::TurnCompleted(
+        upstream::TurnCompletedNotification {
+            thread_id: "thread".into(),
+            turn,
+        },
+    ))
+}
+
+/// Upstream publishes thread/status/changed before turn/completed. A failure
+/// never reads as a clean finish in the gap, a stop's idle gap carries no
+/// outcome yet, and turn/completed settles the exact outcome.
+#[test]
+fn session_summary_outcome_follows_upstream_status_then_turn_completed_order() {
+    let reducer = AppStoreReducer::new();
+    reducer.upsert_thread_snapshot(thread("codex"));
+
+    reducer.apply_ui_event(&turn_started("t1"));
+    reducer.apply_ui_event(&status_changed(upstream::ThreadStatus::SystemError));
+    let errored = session_summary(&reducer);
+    assert!(!errored.has_active_turn);
+    assert!(matches!(
+        errored.last_turn_outcome,
+        Some(TurnOutcome::Failed { .. })
+    ));
+    reducer.apply_ui_event(&turn_finished("t1", "failed", Some("Model overloaded")));
+    let failed = session_summary(&reducer);
+    assert!(!failed.has_active_turn);
+    assert_eq!(
+        failed.last_turn_outcome,
+        Some(TurnOutcome::Failed {
+            message: "Model overloaded".into()
+        })
+    );
+
+    reducer.apply_ui_event(&turn_started("t2"));
+    reducer.apply_ui_event(&status_changed(upstream::ThreadStatus::Idle));
+    let stopping = session_summary(&reducer);
+    assert!(!stopping.has_active_turn);
+    assert_eq!(stopping.last_turn_outcome, None);
+    reducer.apply_ui_event(&turn_finished("t2", "interrupted", None));
+    assert_eq!(
+        session_summary(&reducer).last_turn_outcome,
+        Some(TurnOutcome::Interrupted)
+    );
+
+    reducer.apply_ui_event(&turn_started("t3"));
+    reducer.apply_ui_event(&status_changed(upstream::ThreadStatus::Idle));
+    assert_eq!(session_summary(&reducer).last_turn_outcome, None);
+    reducer.apply_ui_event(&turn_finished("t3", "completed", None));
+    assert_eq!(
+        session_summary(&reducer).last_turn_outcome,
+        Some(TurnOutcome::Completed)
+    );
+
+    // A system error while nothing runs does not rewrite the last outcome.
+    reducer.apply_ui_event(&status_changed(upstream::ThreadStatus::SystemError));
+    assert_eq!(
+        session_summary(&reducer).last_turn_outcome,
+        Some(TurnOutcome::Completed)
+    );
+}

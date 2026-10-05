@@ -331,6 +331,7 @@ mod mobile_client_tests {
             older_turns_cursor: None,
             initial_turns_loaded: false,
             is_resumed: true,
+            last_turn_outcome: None,
         };
         let mut target = ThreadSnapshot::from_info("srv", {
             // The default `make_thread_info` returns `status: Active`,
@@ -397,6 +398,7 @@ mod mobile_client_tests {
             older_turns_cursor: None,
             initial_turns_loaded: false,
             is_resumed: false,
+            last_turn_outcome: None,
         };
         let mut target = ThreadSnapshot::from_info("srv", make_thread_info("thread-1"));
 
@@ -1345,6 +1347,110 @@ mod mobile_client_tests {
         assert_eq!(snapshot.active_turn_id, None);
         assert_eq!(snapshot.info.status, ThreadSummaryStatus::Idle);
         assert!(client.app_store.server_supports_turn_pagination(server_id));
+    }
+
+    /// A turn that failed while its turn/completed was lost (reconnect) is
+    /// cleared by the turn-list probe, which also records how it ended.
+    #[tokio::test]
+    async fn force_refresh_thread_authoritative_records_failed_outcome_from_turn_list_probe() {
+        let client = MobileClient::new();
+        let server_id = "srv";
+        let thread_id = "thread-failed";
+        let key = ThreadKey {
+            server_id: server_id.to_string(),
+            thread_id: thread_id.to_string(),
+        };
+        let config = make_server_config(server_id);
+        client
+            .app_store
+            .upsert_server(&config, ServerHealthSnapshot::Connected);
+        let mut thread = thread_snapshot_with_active_turn(server_id, thread_id, "turn-active");
+        thread.info.status = ThreadSummaryStatus::Active;
+        client.app_store.upsert_thread_snapshot(thread);
+
+        let request_handler: TestRequestHandler = Arc::new(move |request| match request {
+            upstream::ClientRequest::ThreadResume { .. } => serde_json::to_value(json!({
+                "thread": {
+                    "id": thread_id,
+                    "preview": "Write the lesson",
+                    "ephemeral": false,
+                    "modelProvider": "openai",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": { "type": "idle" },
+                    "path": "/tmp/thread",
+                    "cwd": "/tmp/thread",
+                    "cliVersion": "1.0.0",
+                    "source": "cli",
+                    "agentNickname": null,
+                    "agentRole": null,
+                    "gitInfo": null,
+                    "name": "thread",
+                    "turns": []
+                },
+                "model": "gpt-5",
+                "modelProvider": "openai",
+                "cwd": "/tmp/thread",
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "sandbox": { "type": "dangerFullAccess" },
+                "reasoningEffort": "medium"
+            }))
+            .map_err(|error| RpcError::Deserialization(error.to_string())),
+            upstream::ClientRequest::ThreadTurnsList { .. } => serde_json::to_value(json!({
+                "data": [{
+                    "id": "turn-active",
+                    "items": [],
+                    "itemsView": "notLoaded",
+                    "status": "failed",
+                    "error": {
+                        "message": "Model overloaded",
+                        "codexErrorInfo": null
+                    },
+                    "startedAt": 1,
+                    "completedAt": 2,
+                    "durationMs": 1
+                }],
+                "nextCursor": null,
+                "backwardsCursor": null
+            }))
+            .map_err(|error| RpcError::Deserialization(error.to_string())),
+            other => Err(RpcError::Deserialization(format!(
+                "unexpected request in test: {}",
+                other.method()
+            ))),
+        });
+        let session = Arc::new(ServerSession::test_stub_with_handlers(
+            config,
+            Some(request_handler),
+            None,
+            None,
+        ));
+        client
+            .sessions
+            .write()
+            .expect("sessions lock should not be poisoned")
+            .insert(server_id.to_string(), session);
+
+        client
+            .force_refresh_thread_authoritative(server_id, thread_id)
+            .await
+            .expect("force refresh should succeed");
+
+        let snapshot = client.app_store.snapshot();
+        let thread = snapshot
+            .threads
+            .get(&key)
+            .expect("thread snapshot after force refresh");
+        assert_eq!(thread.active_turn_id, None);
+        let summary = crate::store::boundary::app_session_summary(thread, None);
+        assert!(!summary.has_active_turn);
+        assert_eq!(
+            summary.last_turn_outcome,
+            Some(crate::source::TurnOutcome::Failed {
+                message: "Model overloaded".to_string()
+            })
+        );
     }
 
     #[tokio::test]

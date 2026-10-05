@@ -985,11 +985,18 @@ fn is_partial_fence_opener(line: &str) -> bool {
 
 // ── Course projection (`projectLiveItems`) ────────────────────────────────
 
-fn is_internal_course_server(server: &str) -> bool {
+pub(crate) fn is_internal_course_server(server: &str) -> bool {
     server == COURSE_MCP_SERVER || server == COURSE_MCP_DIRECT_NAMESPACE
 }
 
-fn is_internal_course_dynamic_tool(data: &HydratedDynamicToolCallData) -> bool {
+/// A course tool name without the direct `mcp__learnfold_course__` prefix.
+pub(crate) fn course_tool_name(tool: &str) -> &str {
+    tool.strip_prefix(COURSE_MCP_DIRECT_NAMESPACE)
+        .and_then(|rest| rest.strip_prefix("__"))
+        .unwrap_or(tool)
+}
+
+pub(crate) fn is_internal_course_dynamic_tool(data: &HydratedDynamicToolCallData) -> bool {
     if data.tool == PRESENT_PLAN_TOOL || is_editor_tool(&data.tool) {
         return true;
     }

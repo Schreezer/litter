@@ -3016,6 +3016,14 @@ impl MobileClient {
         target.active_turn_id = None;
         reconcile_active_turn(Some(&existing), &mut target, &response.data);
         let active_turn_cleared = was_active && target.active_turn_id.is_none();
+        // The target is a copy of the local snapshot, so its status still
+        // says running; nothing in the turn list is.
+        if active_turn_cleared
+            && matches!(target.info.status, ThreadSummaryStatus::Active)
+            && active_turn_id_from_turns(&response.data).is_none()
+        {
+            target.info.status = ThreadSummaryStatus::Idle;
+        }
         if target.active_turn_id != existing.active_turn_id
             || target.info.status != existing.info.status
         {

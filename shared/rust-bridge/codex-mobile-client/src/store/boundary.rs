@@ -14,6 +14,7 @@ use super::snapshot::{
     AppConnectionProgressSnapshot, AppQueuedFollowUpPreview, AppSnapshot, AppVoiceSessionSnapshot,
     ServerHealthSnapshot, ServerSnapshot, ThreadSnapshot,
 };
+use super::turn_activity::{AppTurnActivity, current_turn_activity};
 
 const LOCAL_USER_MESSAGE_ITEM_PREFIX: &str = "local-user-message:";
 
@@ -427,6 +428,10 @@ pub struct AppSessionSummary {
     // `stats.turn_count` even though the preview text hasn't changed yet).
     pub last_response_turn_id: Option<String>,
     pub last_user_message: Option<String>,
+    /// Raw label of the newest tool item ("MCP native-editor-fetch",
+    /// "Bash …"), kept for the dashboard's icon lookup. It is not
+    /// learner-facing and goes stale once the tool finishes; live surfaces
+    /// should use `current_activity`.
     pub last_tool_label: Option<String>,
     pub recent_tool_log: Vec<AppToolLogEntry>,
     // Bounds of the most recent turn, in milliseconds since epoch. The home
@@ -440,6 +445,14 @@ pub struct AppSessionSummary {
     pub stats: Option<AppConversationStats>,
     pub token_usage: Option<AppTokenUsage>,
     pub goal: Option<AppThreadGoal>,
+    /// What the latest request is doing now, typed for learner-facing
+    /// status lines (background task banner, watch).
+    #[uniffi(default = None)]
+    pub current_activity: Option<AppTurnActivity>,
+    /// How the most recent turn ended; `None` while a turn runs or when no
+    /// turn has completed since the store started.
+    #[uniffi(default = None)]
+    pub last_turn_outcome: Option<crate::source::TurnOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -693,6 +706,8 @@ pub(crate) fn empty_session_summary(key: ThreadKey) -> AppSessionSummary {
         stats: None,
         token_usage: None,
         goal: None,
+        current_activity: None,
+        last_turn_outcome: None,
     }
 }
 
@@ -796,6 +811,8 @@ pub(crate) fn app_session_summary(
         },
         token_usage: thread_token_usage(thread),
         goal: thread.goal.clone(),
+        current_activity: current_turn_activity(thread),
+        last_turn_outcome: thread.last_turn_outcome.clone(),
     }
 }
 
@@ -909,6 +926,22 @@ struct ConversationActivity {
     log: Vec<AppToolLogEntry>,
     last_turn_start_ms: Option<i64>,
     last_turn_end_ms: Option<i64>,
+}
+
+/// A command made only of reads, searches and listings, which the
+/// conversation view groups as exploration.
+pub(crate) fn is_pure_exploration(data: &HydratedCommandExecutionData) -> bool {
+    if data.actions.is_empty() {
+        return false;
+    }
+    data.actions.iter().all(|action| {
+        matches!(
+            action.kind,
+            HydratedCommandActionKind::Read
+                | HydratedCommandActionKind::Search
+                | HydratedCommandActionKind::ListFiles
+        )
+    })
 }
 
 /// Walk conversation items to extract full stats, last activity, and tool log.
@@ -1037,20 +1070,6 @@ fn extract_conversation_activity(items: &[HydratedConversationItem]) -> Conversa
         *fallback = 0;
         *count = 0;
         *in_progress = false;
-    }
-
-    fn is_pure_exploration(data: &HydratedCommandExecutionData) -> bool {
-        if data.actions.is_empty() {
-            return false;
-        }
-        data.actions.iter().all(|action| {
-            matches!(
-                action.kind,
-                HydratedCommandActionKind::Read
-                    | HydratedCommandActionKind::Search
-                    | HydratedCommandActionKind::ListFiles
-            )
-        })
     }
 
     // Forward pass — collect everything
@@ -1566,6 +1585,7 @@ mod tests {
                 older_turns_cursor: None,
                 initial_turns_loaded: false,
                 is_resumed: false,
+                last_turn_outcome: None,
             },
         );
 
@@ -2065,5 +2085,123 @@ mod tests {
         .expect("record");
         assert_eq!(record.older_turns_cursor.as_deref(), Some("older-cursor"));
         assert!(record.initial_turns_loaded);
+    }
+
+    fn course_fetch(
+        status: crate::types::AppOperationStatus,
+    ) -> crate::conversation_uniffi::HydratedConversationItem {
+        crate::conversation_uniffi::HydratedConversationItem {
+            id: "fetch-1".to_string(),
+            content: crate::conversation_uniffi::HydratedConversationItemContent::McpToolCall(
+                crate::conversation_uniffi::HydratedMcpToolCallData {
+                    server: "learnfold_course".to_string(),
+                    tool: "native-editor-fetch".to_string(),
+                    status,
+                    duration_ms: None,
+                    arguments_json: Some(
+                        "{\n  \"id\": \"native-editor://page/page-1\"\n}".to_string(),
+                    ),
+                    content_summary: None,
+                    structured_content_json: None,
+                    raw_output_json: None,
+                    error_message: None,
+                    progress_messages: Vec::new(),
+                    computer_use: None,
+                },
+            ),
+            source_turn_id: Some("turn-1".to_string()),
+            source_turn_index: None,
+            timestamp: None,
+            is_from_user_turn_boundary: false,
+        }
+    }
+
+    fn course_thread(status: crate::types::AppOperationStatus) -> ThreadSnapshot {
+        let mut thread = ThreadSnapshot::from_info(
+            "srv",
+            ThreadInfo {
+                id: "thread-course".to_string(),
+                title: None,
+                model: None,
+                preview: Some("<learnfold_internal_course_instruction version=\"1\">".to_string()),
+                cwd: None,
+                path: None,
+                model_provider: None,
+                agent_nickname: None,
+                agent_role: None,
+                parent_thread_id: None,
+                forked_from_id: None,
+                agent_status: None,
+                created_at: None,
+                status: ThreadSummaryStatus::Active,
+                updated_at: Some(20),
+            },
+        );
+        thread.active_turn_id = Some("turn-1".to_string());
+        thread.items = vec![
+            crate::store::chat::user_item("user-1", "Write the lesson", Some("turn-1")),
+            course_fetch(status),
+        ];
+        thread
+    }
+
+    #[test]
+    fn app_session_summary_exposes_activity_and_outcome() {
+        use crate::store::{AppTurnActivity, AppTurnActivityKind};
+        let mut thread = course_thread(crate::types::AppOperationStatus::InProgress);
+        let summary = app_session_summary(&thread, None);
+        assert_eq!(
+            summary.current_activity,
+            Some(AppTurnActivity {
+                kind: AppTurnActivityKind::ReadingCourse,
+                subject: None,
+                page_id: Some("page-1".to_string()),
+                is_running: true,
+                unit_count: 0,
+                step_count: 1,
+                course_pages_read: 1,
+                course_pages_written: 0,
+            })
+        );
+        assert_eq!(summary.last_turn_outcome, None);
+
+        thread.active_turn_id = None;
+        thread.info.status = ThreadSummaryStatus::Idle;
+        thread.last_turn_outcome = Some(crate::source::TurnOutcome::Failed {
+            message: "Model overloaded".to_string(),
+        });
+        let summary = app_session_summary(&thread, None);
+        assert_eq!(
+            summary.last_turn_outcome,
+            Some(crate::source::TurnOutcome::Failed {
+                message: "Model overloaded".to_string()
+            })
+        );
+
+        let empty = super::empty_session_summary(thread.key.clone());
+        assert_eq!(empty.current_activity, None);
+        assert_eq!(empty.last_turn_outcome, None);
+    }
+
+    #[test]
+    fn last_tool_label_unchanged_for_course_tools() {
+        // The dashboard splits this label on its first space to pick an
+        // icon; live surfaces read `current_activity` instead.
+        let summary = app_session_summary(
+            &course_thread(crate::types::AppOperationStatus::Completed),
+            None,
+        );
+        assert_eq!(
+            summary.last_tool_label.as_deref(),
+            Some("MCP native-editor-fetch")
+        );
+        assert_eq!(summary.recent_tool_log.len(), 1);
+        assert_eq!(summary.recent_tool_log[0].tool, "MCP");
+        assert_eq!(summary.recent_tool_log[0].detail, "native-editor-fetch");
+        assert_eq!(summary.recent_tool_log[0].status, "completed");
+        assert_eq!(
+            summary.current_activity.map(|activity| activity.kind),
+            Some(crate::store::AppTurnActivityKind::Thinking)
+        );
     }
 }

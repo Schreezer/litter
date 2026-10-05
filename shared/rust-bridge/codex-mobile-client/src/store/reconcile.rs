@@ -844,6 +844,7 @@ fn merge_latest_terminal_turns(
             crate::types::ThreadSummaryStatus::Idle
         };
         thread.active_turn_id = None;
+        thread.last_turn_outcome = terminal_turn_outcome(turn);
     }
     if !thread.initial_turns_loaded {
         thread.initial_turns_loaded = true;

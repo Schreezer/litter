@@ -1777,6 +1777,18 @@ impl AppStoreReducer {
                         status,
                         ThreadSummaryStatus::Idle | ThreadSummaryStatus::SystemError
                     ) {
+                        // Upstream reports a system error before the turn's
+                        // turn/completed; record a provisional failure so the
+                        // gap never reads as a clean finish. TurnCompleted
+                        // replaces it with the exact outcome.
+                        if matches!(status, ThreadSummaryStatus::SystemError)
+                            && thread.active_turn_id.is_some()
+                            && thread.last_turn_outcome.is_none()
+                        {
+                            thread.last_turn_outcome = Some(crate::source::TurnOutcome::Failed {
+                                message: String::new(),
+                            });
+                        }
                         thread.active_turn_id = None;
                         thread.active_plan_progress = None;
                         thread.info.status = status.clone();
@@ -1828,6 +1840,7 @@ impl AppStoreReducer {
                         thread.active_turn_id = Some(turn_id.clone());
                         thread.active_plan_progress = None;
                         thread.pending_plan_implementation_turn_id = None;
+                        thread.last_turn_outcome = None;
                         thread.info.status = ThreadSummaryStatus::Active;
                         if thread.info.parent_thread_id.is_some() {
                             thread.info.agent_status = Some("running".to_string());
@@ -1839,11 +1852,20 @@ impl AppStoreReducer {
                     self.emit_thread_metadata_changed(key);
                 }
             }
-            UiEvent::TurnCompleted { key, turn_id, .. } => {
+            UiEvent::TurnCompleted {
+                key,
+                turn_id,
+                error,
+                interrupted,
+            } => {
                 if self
                     .mutate_thread_with_result(key, |thread| {
                         thread.active_turn_id = None;
                         thread.active_plan_progress = None;
+                        thread.last_turn_outcome = Some(crate::source::app_server::turn_outcome(
+                            error.as_deref(),
+                            *interrupted,
+                        ));
                         thread.info.status = ThreadSummaryStatus::Idle;
                         if thread.info.parent_thread_id.is_some() {
                             thread.info.agent_status = Some("completed".to_string());
@@ -3708,6 +3730,11 @@ fn preserve_thread_runtime_state(source: &ThreadSnapshot, target: &mut ThreadSna
     if target.pending_plan_implementation_turn_id.is_none() {
         target.pending_plan_implementation_turn_id =
             source.pending_plan_implementation_turn_id.clone();
+    }
+    // A rebuilt thread cannot recover how its last turn ended; keep the
+    // recorded outcome unless the rebuilt thread is already running again.
+    if target.last_turn_outcome.is_none() && target.active_turn_id.is_none() {
+        target.last_turn_outcome = source.last_turn_outcome.clone();
     }
 }
 
@@ -6107,6 +6134,133 @@ mod tests {
         assert!(entry_b.buffer.contains("BBB"));
         assert_eq!(entry_a.item_id, "item-A");
         assert_eq!(entry_b.item_id, "item-B");
+    }
+
+    fn complete_turn(
+        reducer: &AppStoreReducer,
+        key: &ThreadKey,
+        turn_id: &str,
+        error: Option<&str>,
+        interrupted: bool,
+    ) -> Option<crate::source::TurnOutcome> {
+        reducer.apply_ui_event(&UiEvent::TurnStarted {
+            key: key.clone(),
+            turn_id: turn_id.to_string(),
+        });
+        reducer.apply_ui_event(&UiEvent::TurnCompleted {
+            key: key.clone(),
+            turn_id: turn_id.to_string(),
+            error: error.map(str::to_string),
+            interrupted,
+        });
+        reducer.snapshot().threads[key].last_turn_outcome.clone()
+    }
+
+    #[test]
+    fn turn_completed_records_last_turn_outcome() {
+        use crate::source::TurnOutcome;
+        let reducer = AppStoreReducer::new();
+        let key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        reducer
+            .upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("thread")));
+
+        assert_eq!(
+            complete_turn(&reducer, &key, "turn-1", None, false),
+            Some(TurnOutcome::Completed)
+        );
+        assert_eq!(
+            complete_turn(&reducer, &key, "turn-2", None, true),
+            Some(TurnOutcome::Interrupted)
+        );
+        assert_eq!(
+            complete_turn(&reducer, &key, "turn-3", Some("Model overloaded"), false),
+            Some(TurnOutcome::Failed {
+                message: "Model overloaded".to_string()
+            })
+        );
+        // A stop that also carries an error is still a stop.
+        assert_eq!(
+            complete_turn(&reducer, &key, "turn-4", Some("aborted"), true),
+            Some(TurnOutcome::Interrupted)
+        );
+        assert_eq!(
+            complete_turn(&reducer, &key, "turn-5", Some("   "), false),
+            Some(TurnOutcome::Completed)
+        );
+    }
+
+    #[test]
+    fn turn_started_clears_last_turn_outcome() {
+        let reducer = AppStoreReducer::new();
+        let key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        reducer
+            .upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("thread")));
+        assert!(complete_turn(&reducer, &key, "turn-1", Some("boom"), false).is_some());
+
+        reducer.apply_ui_event(&UiEvent::TurnStarted {
+            key: key.clone(),
+            turn_id: "turn-2".to_string(),
+        });
+        let snapshot = reducer.snapshot();
+        assert_eq!(snapshot.threads[&key].last_turn_outcome, None);
+        let summary = snapshot
+            .threads
+            .get(&key)
+            .map(|thread| crate::store::boundary::app_session_summary(thread, None))
+            .expect("summary");
+        assert_eq!(summary.last_turn_outcome, None);
+    }
+
+    #[test]
+    fn preserve_runtime_state_carries_outcome_only_when_idle() {
+        use crate::source::TurnOutcome;
+        let reducer = AppStoreReducer::new();
+        let key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        reducer
+            .upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("thread")));
+        let failed = TurnOutcome::Failed {
+            message: "boom".to_string(),
+        };
+        assert_eq!(
+            complete_turn(&reducer, &key, "turn-1", Some("boom"), false),
+            Some(failed.clone())
+        );
+        let recorded = reducer.snapshot().threads[&key].clone();
+
+        // An idle rebuild (reconnect, thread/read) keeps the outcome.
+        reducer
+            .upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("thread")));
+        assert_eq!(
+            reducer.snapshot().threads[&key].last_turn_outcome,
+            Some(failed.clone())
+        );
+        let mut idle = ThreadSnapshot::from_info("srv", make_thread_info("thread"));
+        crate::copy_thread_runtime_fields(&recorded, &mut idle);
+        assert_eq!(idle.last_turn_outcome, Some(failed.clone()));
+
+        // A rebuild that is already running a new turn does not.
+        let mut running = ThreadSnapshot::from_info("srv", make_thread_info("thread"));
+        running.active_turn_id = Some("turn-2".to_string());
+        let mut copied = running.clone();
+        crate::copy_thread_runtime_fields(&recorded, &mut copied);
+        assert_eq!(copied.last_turn_outcome, None);
+        reducer.upsert_thread_snapshot(running);
+        assert_eq!(reducer.snapshot().threads[&key].last_turn_outcome, None);
+
+        // An outcome the rebuild already knows wins over the recorded one.
+        let mut known = ThreadSnapshot::from_info("srv", make_thread_info("thread"));
+        known.last_turn_outcome = Some(TurnOutcome::Interrupted);
+        crate::copy_thread_runtime_fields(&recorded, &mut known);
+        assert_eq!(known.last_turn_outcome, Some(TurnOutcome::Interrupted));
     }
 }
 
