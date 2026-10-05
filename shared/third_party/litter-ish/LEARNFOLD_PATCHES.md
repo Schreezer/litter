@@ -24,6 +24,10 @@ Learnfold carries the following local security/build patches:
 - `embed/host/build.rs`: Cargo explicitly watches Meson/C source inputs, so a
   security change to `fs/`, `kernel/`, or another compiled iSH directory cannot
   be omitted from the final static library by a stale Meson archive.
+- `tools/staticdefine.sh`: quotes the script directory when including
+  `staticdefine.h`. Unquoted, a checkout or Cargo target path containing a
+  space silently produced an empty `cpu-offsets.h` and the arm64 gadgets
+  failed to assemble.
 
 Regression coverage lives in `apps/ios/Tests/LitterTests/CourseBashToolTests.swift`:
 it checks dropped-uid mount denial, final-source-symlink mount denial,
