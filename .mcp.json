@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "t3kan": {
+      "type": "http",
+      "url": "http://127.0.0.1:4132/mcp?app=litter-course"
+    }
+  }
+}
