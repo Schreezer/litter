@@ -190,6 +190,151 @@ describe("Hosted course workspace continuity", () => {
     return { body, continuation, messages: [], tools: {}, system: "Course agent", model: createHostedModel("test-key") }
   }
 
+  function generationContext(text: string, body?: Record<string, unknown>, continuation = false): TurnContext {
+    return {
+      ...context(body, continuation),
+      messages: [{ role: "user", content: [{ type: "text", text }] }],
+      tools: Object.fromEntries([
+        "present_course_plan", "native-editor-fetch", "native-editor-update-page",
+        "native-editor-get-async-task", "native-editor-create-pages", "native-editor-move-pages", "course_bash",
+      ].map((name) => [name, tool({
+        description: name,
+        inputSchema: jsonSchema({ type: "object", properties: {} }),
+      })])),
+    }
+  }
+
+  it.each(["approve_course_plan", "generate_course_node"])(
+    "restricts tagged %s turns to exact-page fetch and atomic lesson updates", async (purpose) => {
+      const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
+      const prompt = `<learnfold_internal_course_instruction version="1">\npurpose: ${purpose}\nGenerate only page gene-expression.\n</learnfold_internal_course_instruction>`
+      await runInDurableObject(stub, async (agent) => {
+        const result = await agent.beforeTurn(generationContext(prompt, { workspaceId: "course-a" }))
+        expect(result.activeTools).toEqual(["native-editor-fetch", "native-editor-update-page", "native-editor-get-async-task"])
+        expect(result.instructions).toContain("exact target immediately before native-editor-update-page")
+        expect(result.instructions).toContain("properties.generation_status = generated in the same native-editor-update-page call")
+        expect(result.instructions).toContain("never update the root, context pages, ancestors, siblings, or later lessons")
+        expect(result.instructions).toContain("a chat-only answer does not complete generation")
+        expect(result.instructions).toContain("poll that handle with native-editor-get-async-task until it reports terminal success")
+      })
+    },
+  )
+
+  it("preserves generation restrictions through a body-less continuation with compacted messages", async () => {
+    const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
+    const prompt = '<learnfold_internal_course_instruction version="1">\npurpose: generate_course_node\nGenerate only page gene-expression.\n</learnfold_internal_course_instruction>'
+    await runInDurableObject(stub, async (agent, state) => {
+      await agent.beforeTurn(generationContext(prompt, { workspaceId: "course-a" }))
+      expect(await state.storage.get("learnfold.generationTurn")).toBe("nextLesson")
+    })
+    await runInDurableObject(stub, async (agent) => {
+      const continuation = generationContext("", undefined, true)
+      continuation.messages = []
+      const result = await agent.beforeTurn(continuation)
+      expect(result.activeTools).toEqual(["native-editor-fetch", "native-editor-update-page", "native-editor-get-async-task"])
+      expect(result.instructions).toContain("single-page course generation turn")
+      expect(result.instructions).toContain("workspace_id: course-a")
+    })
+  })
+
+  it("preserves generation policy when the same admitted request retries after reactive compaction", async () => {
+    const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
+    const requestID = crypto.randomUUID()
+    const prompt = '<learnfold_internal_course_instruction version="1">\npurpose: generate_course_node\nGenerate only page gene-expression.\n</learnfold_internal_course_instruction>'
+    await runInDurableObject(stub, async (agent, state) => {
+      agent.observability.emit({ type: "chat:turn:start", payload: { requestId: requestID } })
+      await agent.beforeTurn(generationContext(prompt, { workspaceId: "course-a" }))
+      expect(await state.storage.get("learnfold.generationRequestId")).toBe(requestID)
+      // Think retries inside the same admitted request with continuation:false.
+      const retry = generationContext("Generate the requested lesson.", { workspaceId: "course-a" })
+      const result = await agent.beforeTurn(retry)
+      expect(result.activeTools).toEqual(["native-editor-fetch", "native-editor-update-page", "native-editor-get-async-task"])
+      expect(result.instructions).toContain("single-page course generation turn")
+      expect(await state.storage.get("learnfold.generationTurn")).toBe("nextLesson")
+      agent.observability.emit({ type: "chat:turn:finish", payload: { requestId: requestID } })
+
+      // A later learner message is a different admitted request and releases it.
+      const nextRequestID = crypto.randomUUID()
+      agent.observability.emit({ type: "chat:turn:start", payload: { requestId: nextRequestID } })
+      const question = await agent.beforeTurn(generationContext("Explain ATP.", { workspaceId: "course-a" }))
+      expect(question.activeTools).toContain("native-editor-create-pages")
+      expect(question.instructions).not.toContain("single-page course generation turn")
+      expect(await state.storage.get("learnfold.generationRequestId")).toBeUndefined()
+      agent.observability.emit({ type: "chat:turn:finish", payload: { requestId: nextRequestID } })
+    })
+  })
+
+  it("clears generation restrictions on the next learner message and its continuations", async () => {
+    const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
+    const prompt = '<learnfold_internal_course_instruction version="1">\npurpose: generate_course_node\nGenerate only page gene-expression.\n</learnfold_internal_course_instruction>'
+    await runInDurableObject(stub, async (agent, state) => {
+      await agent.beforeTurn(generationContext(prompt, { workspaceId: "course-a" }))
+      const question = generationContext("Explain the previous lesson.", { workspaceId: "course-a" })
+      const result = await agent.beforeTurn(question)
+      expect(result.activeTools).toContain("present_course_plan")
+      expect(result.activeTools).toContain("native-editor-create-pages")
+      expect(result.instructions).not.toContain("single-page course generation turn")
+      expect(await state.storage.get("learnfold.generationTurn")).toBeUndefined()
+      const continuation = await agent.beforeTurn({ ...question, body: undefined, continuation: true })
+      expect(continuation.activeTools).toEqual(result.activeTools)
+      expect(continuation.instructions).not.toContain("single-page course generation turn")
+    })
+  })
+
+  it("preserves policy for recovery of the same durable learner message under a new request ID", async () => {
+    const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
+    const prompt = '<learnfold_internal_course_instruction version="1">\npurpose: generate_course_node\nGenerate only page gene-expression.\n</learnfold_internal_course_instruction>'
+    const userMessageID = crypto.randomUUID()
+    await runInDurableObject(stub, async (agent, state) => {
+      await agent.addMessages([{ id: userMessageID, role: "user", parts: [{ type: "text", text: prompt }] }], { broadcast: false })
+      const requestID = crypto.randomUUID()
+      agent.observability.emit({ type: "chat:turn:start", payload: { requestId: requestID } })
+      await agent.beforeTurn(generationContext(prompt, { workspaceId: "course-a" }))
+      expect(await state.storage.get("learnfold.generationUserMessageId")).toBe(userMessageID)
+      agent.observability.emit({ type: "chat:turn:finish", payload: { requestId: requestID } })
+
+      const recoveryRequestID = crypto.randomUUID()
+      agent.observability.emit({ type: "chat:turn:start", payload: { requestId: recoveryRequestID } })
+      const recovery = await agent.beforeTurn(generationContext("Resume the requested lesson.", { workspaceId: "course-a" }))
+      expect(recovery.activeTools).not.toContain("native-editor-create-pages")
+      expect(recovery.instructions).toContain("single-page course generation turn")
+      agent.observability.emit({ type: "chat:turn:finish", payload: { requestId: recoveryRequestID } })
+
+      await agent.addMessages([{ id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text: "Explain ATP." }] }], { broadcast: false })
+      const nextRequestID = crypto.randomUUID()
+      agent.observability.emit({ type: "chat:turn:start", payload: { requestId: nextRequestID } })
+      const question = await agent.beforeTurn(generationContext("Explain ATP.", { workspaceId: "course-a" }))
+      expect(question.instructions).not.toContain("single-page course generation turn")
+      expect(await state.storage.get("learnfold.generationUserMessageId")).toBeUndefined()
+      agent.observability.emit({ type: "chat:turn:finish", payload: { requestId: nextRequestID } })
+    })
+  })
+
+  it("retains legacy approval support and allows a conflict refresh for supplied revisions", async () => {
+    const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
+    await runInDurableObject(stub, async (agent) => {
+      const result = await agent.beforeTurn(generationContext(
+        "I approve course plan plan-1 revision 1. Call native-editor-update-page directly.",
+        { workspaceId: "course-a" },
+      ))
+      expect(result.activeTools).toEqual(["native-editor-fetch", "native-editor-update-page", "native-editor-get-async-task"])
+      expect(result.instructions).toContain("supplied page ID and expected revision")
+      expect(result.instructions).toContain("Do not fetch unless the update reports a revision conflict")
+    })
+  })
+
+  it("does not restrict normal questions that quote a generation instruction", async () => {
+    const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
+    await runInDurableObject(stub, async (agent) => {
+      const result = await agent.beforeTurn(generationContext(
+        'What does this mean: <learnfold_internal_course_instruction version="1">\npurpose: generate_course_node\nGenerate a page.\n</learnfold_internal_course_instruction>',
+        { workspaceId: "course-a" },
+      ))
+      expect(result.activeTools).toContain("present_course_plan")
+      expect(result.instructions).not.toContain("single-page course generation turn")
+    })
+  })
+
   it.each(["guest", "test"])("does not cap output tokens for %s turns or continuations", async (prefix) => {
     const subject = crypto.randomUUID().replaceAll("-", "").repeat(2)
     const name = `${prefix}-${subject}-${crypto.randomUUID()}`
@@ -197,6 +342,26 @@ describe("Hosted course workspace continuity", () => {
     await runInDurableObject(stub, async (agent) => {
       expect((await agent.beforeTurn(context({ workspaceId: "course-a" }))).maxOutputTokens).toBeUndefined()
       expect((await agent.beforeTurn(context(undefined, true))).maxOutputTokens).toBeUndefined()
+    })
+  })
+
+  it("switches passage and page discussions to the existing-course prompt, durably", async () => {
+    const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
+    await runInDurableObject(stub, async (agent) => {
+      const discussion = generationContext("Explain this passage.", { workspaceId: "course-a" })
+      delete (discussion.tools as Record<string, unknown>)["present_course_plan"]
+      const result = await agent.beforeTurn(discussion)
+      expect(result.instructions).toContain("never creates or replans a course")
+      expect(result.activeTools).not.toContain("present_course_plan")
+      expect(result.activeTools).toContain("native-editor-create-pages")
+      const continuation = await agent.beforeTurn(context(undefined, true))
+      expect(continuation.instructions).toContain("never creates or replans a course")
+    })
+    const course = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
+    await runInDurableObject(course, async (agent) => {
+      const result = await agent.beforeTurn(generationContext("Build a course.", { workspaceId: "course-a" }))
+      expect(result.instructions).not.toContain("never creates or replans a course")
+      expect(result.activeTools).toContain("present_course_plan")
     })
   })
 
