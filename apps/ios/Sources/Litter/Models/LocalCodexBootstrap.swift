@@ -1,5 +1,6 @@
 #if targetEnvironment(macCatalyst)
 import Foundation
+import Observation
 import UIKit
 
 /// Bootstraps a local `codex app-server` on the host Mac when running on
@@ -7,6 +8,7 @@ import UIKit
 /// (Mac App Store) and iOS skip this entirely — they have no permission to
 /// spawn child processes.
 @MainActor
+@Observable
 final class LocalCodexBootstrap {
     static let shared = LocalCodexBootstrap()
 
@@ -18,17 +20,27 @@ final class LocalCodexBootstrap {
     /// onboarding plan also pins this for the iPhone↔Mac pairing flow.
     static let port: UInt16 = 8390
 
-    private let appClient = AppClient()
+    enum Status: Equatable {
+        case idle
+        case starting
+        case ready
+        case failed(String)
+    }
+
+    private(set) var status: Status = .idle
+
+    @ObservationIgnored private let appClient = AppClient()
 
     /// Strong reference to the spawned process handle. Kept alive for the
     /// lifetime of the app so the child is not orphaned.
-    private var processHandle: LocalServerProcessHandle?
+    @ObservationIgnored private var processHandle: LocalServerProcessHandle?
 
     /// Connected server id returned by the Rust transport layer. Empty
     /// until `attachOrSpawn()` succeeds.
     private(set) var connectedServerId: String?
 
-    private var bootstrapTask: Task<Void, Never>?
+    @ObservationIgnored private var bootstrapTask: Task<String, Error>?
+    @ObservationIgnored private var bootstrapGeneration = UUID()
 
     private init() {}
 
@@ -38,55 +50,106 @@ final class LocalCodexBootstrap {
     /// already produced a `connectedServerId`.
     func startIfNeeded(appModel: AppModel) {
         guard LitterPlatform.isDirectDistMac else { return }
-        guard connectedServerId == nil, bootstrapTask == nil else { return }
+        Task {
+            _ = try? await ensureConnected(appModel: appModel)
+        }
+    }
 
-        let id = Self.serverId
-        let port = Self.port
-
-        bootstrapTask = Task { [weak self] in
-            guard let self else { return }
-            defer { self.bootstrapTask = nil }
+    /// Coalesces startup and retry callers. A disconnected snapshot must never
+    /// be treated as ready merely because a previous launch produced an ID.
+    func ensureConnected(appModel: AppModel, forceReconnect: Bool = false) async throws -> String {
+        guard LitterPlatform.isDirectDistMac else {
+            throw NSError(domain: "Learnfold.LocalCodex", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Installed Mac Codex requires the direct-download version of Learnfold."
+            ])
+        }
+        if let bootstrapTask {
+            return try await bootstrapTask.value
+        }
+        if !forceReconnect,
+           appModel.snapshot?.serverSnapshot(for: Self.serverId)?.isConnected == true {
+            connectedServerId = Self.serverId
+            status = .ready
+            return Self.serverId
+        }
+        let generation = UUID()
+        bootstrapGeneration = generation
+        status = .starting
+        let task = Task<String, Error> { [self] in
+            let result = try await appClient.attachOrSpawnLocalServer(
+                port: Self.port,
+                codexHome: nil
+            )
             do {
-                let result = try await self.appClient.attachOrSpawnLocalServer(
-                    port: port,
-                    codexHome: nil
-                )
-                self.processHandle = result.handle
-                LLog.info(
-                    "local-codex",
-                    "attach-or-spawn succeeded",
-                    fields: [
-                        "port": Int(result.port),
-                        "attached": result.attachedToExisting,
-                        "spawnedPid": result.handle != nil ? "yes" : "no",
-                        "codexPath": result.codexPath ?? "(unknown)"
-                    ]
-                )
-
-                let displayName = Self.displayName()
-                let connectedId = try await appModel.serverBridge.connectRemoteServer(
-                    serverId: id,
-                    displayName: displayName,
+                try Task.checkCancellation()
+                let connectedID = try await appModel.serverBridge.connectHostLocalServer(
+                    serverId: Self.serverId,
+                    displayName: Self.displayName(),
                     host: result.host,
                     port: result.port
                 )
-                self.connectedServerId = connectedId
+                try Task.checkCancellation()
+                // Keep our existing owned process when this retry attached to
+                // the same healthy listener; externally owned processes are
+                // never stopped when Learnfold quits.
+                if let handle = result.handle {
+                    processHandle = handle
+                }
+                connectedServerId = connectedID
                 await appModel.refreshSnapshot()
+                LLog.info("local-codex", "installed Codex connected", fields: [
+                    "port": Int(result.port),
+                    "attached": result.attachedToExisting,
+                    "codexPath": result.codexPath ?? "(existing server)"
+                ])
+                return connectedID
             } catch {
-                LLog.error(
-                    "local-codex",
-                    "attach-or-spawn failed",
-                    error: error
-                )
+                if let handle = result.handle { await handle.stop() }
+                throw error
             }
         }
+        bootstrapTask = task
+        do {
+            let serverID = try await task.value
+            if bootstrapGeneration == generation {
+                bootstrapTask = nil
+                status = .ready
+            }
+            return serverID
+        } catch {
+            if bootstrapGeneration == generation {
+                bootstrapTask = nil
+                connectedServerId = nil
+                status = .failed(error.localizedDescription)
+            }
+            LLog.error("local-codex", "installed Codex connection failed", error: error)
+            throw error
+        }
+    }
+
+    func restart(appModel: AppModel) async throws {
+        appModel.serverBridge.disconnectServer(serverId: Self.serverId)
+        await stop()
+        // Startup can finish registering its transport while cancellation is
+        // draining. Remove that registration before opening the new one.
+        appModel.serverBridge.disconnectServer(serverId: Self.serverId)
+        await appModel.refreshSnapshot()
+        _ = try await ensureConnected(appModel: appModel, forceReconnect: true)
     }
 
     /// Stop the spawned codex child (no-op when we attached to an
     /// externally-started process).
     func stop() async {
-        bootstrapTask?.cancel()
-        bootstrapTask = nil
+        let generation = UUID()
+        bootstrapGeneration = generation
+        let runningTask = bootstrapTask
+        runningTask?.cancel()
+        connectedServerId = nil
+        status = .idle
+        if let runningTask {
+            _ = try? await runningTask.value
+        }
+        if bootstrapGeneration == generation { bootstrapTask = nil }
         if let handle = processHandle {
             processHandle = nil
             await handle.stop()
@@ -106,6 +169,7 @@ final class LocalCodexBootstrap {
         // we grab `processHandle` directly via an unchecked nonisolated
         // accessor (safe because we're on the main thread already).
         let handle = MainActor.assumeIsolated { () -> LocalServerProcessHandle? in
+            self.bootstrapGeneration = UUID()
             self.bootstrapTask?.cancel()
             self.bootstrapTask = nil
             let h = self.processHandle

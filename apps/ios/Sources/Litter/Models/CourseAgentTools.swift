@@ -74,7 +74,8 @@ enum CourseAgentTools {
     }
 
     static func mcpToolDefinitions(
-        includePresentPlan: Bool = true
+        includePresentPlan: Bool = true,
+        includeCourseBash: Bool = true
     ) throws -> [CourseMCPToolDefinition] {
         var definitions: [CourseMCPToolDefinition] = []
         if includePresentPlan {
@@ -89,18 +90,20 @@ enum CourseAgentTools {
                 openWorld: false
             ))
         }
-        definitions.append(
-            CourseMCPToolDefinition(
-                name: courseBash,
-                description: """
-                Run a shell script on this iPhone against the live course folder at /workspace. Before the learner approves the latest protected course plan, /workspace is read-only so you may inspect deterministic source material but cannot alter course files. After approval it is read-write. The shell cannot navigate to sibling courses or unrelated app files, symbolic links are unsupported, and internet/network sockets are unavailable. Use normal commands such as find, grep, sed, awk, cat, cp, mv, mkdir, and rm. Commands may partially modify files after approval even when they exit nonzero, so inspect the workspace before retrying a failed mutation.
-                """,
-                inputSchema: addingWorkspaceID(to: courseBashSchema),
-                readOnly: false,
-                destructive: true,
-                openWorld: false
+        if includeCourseBash {
+            definitions.append(
+                CourseMCPToolDefinition(
+                    name: courseBash,
+                    description: """
+                    Run a shell script on this iPhone against the live course folder at /workspace. Before the learner approves the latest protected course plan, /workspace is read-only so you may inspect deterministic source material but cannot alter course files. After approval it is read-write. The shell cannot navigate to sibling courses or unrelated app files, symbolic links are unsupported, and internet/network sockets are unavailable. Use normal commands such as find, grep, sed, awk, cat, cp, mv, mkdir, and rm. Commands may partially modify files after approval even when they exit nonzero, so inspect the workspace before retrying a failed mutation.
+                    """,
+                    inputSchema: addingWorkspaceID(to: courseBashSchema),
+                    readOnly: false,
+                    destructive: true,
+                    openWorld: false
+                )
             )
-        )
+        }
         definitions.append(contentsOf: try NativeEditorMCPToolCatalog.tools.map { tool in
             let schemaData = try JSONEncoder().encode(tool.inputSchema)
             return CourseMCPToolDefinition(

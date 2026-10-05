@@ -240,6 +240,13 @@ enum CourseChatTimelinePolicy {
         var projected: [ConversationItem] = []
         projected.reserveCapacity(items.count)
         for item in items {
+            if case .user(let data) = item.content,
+               isCourseAssessmentDiscussionInstruction(
+                   text: remoteLearnerMessage(from: data.text) ?? data.text
+               ) {
+                suppressesUnscopedInternalTurn = false
+                continue
+            }
             if isInternalCourseActionUserItem(item) {
                 // Hydration and streaming can disagree about whether later
                 // items carry turn metadata. Treat every internal learner
@@ -465,7 +472,8 @@ enum CourseChatTimelinePolicy {
                 projectedText = nil
             }
             let learnerText = projectedText ?? data.text
-            guard !CourseAgentInternalPromptPolicy.isInternalInstruction(learnerText) else {
+            guard !isCourseAssessmentDiscussionInstruction(text: learnerText),
+                  !CourseAgentInternalPromptPolicy.isInternalInstruction(learnerText) else {
                 return nil
             }
             guard let projectedText else { return item }
@@ -782,6 +790,22 @@ private extension View {
     }
 }
 
+private struct CourseChatNavigationTitleModifier: ViewModifier {
+    let title: String
+    let isEmbedded: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isEmbedded {
+            content
+        } else {
+            content
+                .navigationTitle(title)
+                .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
 struct CourseChatView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(AppState.self) private var appState
@@ -791,7 +815,10 @@ struct CourseChatView: View {
     let pageContext: CoursePageChatContext?
     let selectionDiscussionID: UUID?
     let showsDismissButton: Bool
+    let isEmbedded: Bool
+    let onDismiss: (() -> Void)?
     let onSelectionDiscussionReplaced: (CourseSelectionDiscussion) -> Void
+    let onAssistantInitiationSent: () -> Void
     @State private var inputText = ""
     @State private var sources: [CourseSource] = []
     @State private var selectedPhoto: PhotosPickerItem?
@@ -806,6 +833,9 @@ struct CourseChatView: View {
     /// A follow-up question tapped on the page waits here until the agent can
     /// take it, so the learner never has to retype it.
     @State private var pendingInitialQuestion: String?
+    @State private var pendingAssistantInitiation: String?
+    @State private var awaitingAssistantInitiationAcceptance: String?
+    @State private var hasPreparedDiscussion = false
     /// A tapped question option that arrived while the agent was still
     /// winding down its previous turn (the store's run state lags the chat
     /// phase). It is sent as soon as the agent is free.
@@ -824,6 +854,9 @@ struct CourseChatView: View {
     @State private var chatModel = ChatScreenModel(source: nil)
     @State private var chatModelKey: ThreadKey?
     @State private var chatModelHasSource = false
+    /// The intro stays above the first message sent from it, so the send
+    /// scrolls it away instead of it vanishing under the new turn.
+    @State private var keepsIntroAboveFirstMessage = false
     @FocusState private var composerFocused: Bool
 
     init(
@@ -832,18 +865,25 @@ struct CourseChatView: View {
         pageContext: CoursePageChatContext? = nil,
         selectionDiscussionID: UUID? = nil,
         showsDismissButton: Bool = false,
-        onSelectionDiscussionReplaced: @escaping (CourseSelectionDiscussion) -> Void = { _ in }
+        isEmbedded: Bool = false,
+        onDismiss: (() -> Void)? = nil,
+        onSelectionDiscussionReplaced: @escaping (CourseSelectionDiscussion) -> Void = { _ in },
+        onAssistantInitiationSent: @escaping () -> Void = {}
     ) {
         self.store = store
         self.selectionContext = selectionContext
         self.pageContext = pageContext
         self.selectionDiscussionID = selectionDiscussionID
         self.showsDismissButton = showsDismissButton
+        self.isEmbedded = isEmbedded
+        self.onDismiss = onDismiss
         self.onSelectionDiscussionReplaced = onSelectionDiscussionReplaced
+        self.onAssistantInitiationSent = onAssistantInitiationSent
         _draftWorkspaceID = State(
             initialValue: store.draftWorkspaceID(for: selectionDiscussionID)
         )
         _pendingInitialQuestion = State(initialValue: pageContext?.initialQuestion)
+        _pendingAssistantInitiation = State(initialValue: pageContext?.assistantInitiation)
         _inputText = State(initialValue: pageContext?.initialQuestion ?? "")
     }
 
@@ -1042,6 +1082,11 @@ struct CourseChatView: View {
     }
 
     private var usesCodexAPIKeyAuth: Bool {
+        #if targetEnvironment(macCatalyst)
+        if LitterPlatform.isDirectDistMac {
+            return courseServer?.account == .apiKey
+        }
+        #endif
         if appModel.prefersLocalChatGPTAuth { return false }
         if appModel.localAuthPreference == .apiKey { return true }
         return AppModel.storedLocalAuthPreference(
@@ -1079,22 +1124,75 @@ struct CourseChatView: View {
     }
 
     var body: some View {
-        courseTranscript
+        courseLifecycle
+        .toolbar {
+            if !isEmbedded { courseToolbar }
+        }
+        .fileImporter(
+            isPresented: $showsFileImporter,
+            allowedContentTypes: [.data],
+            allowsMultipleSelection: true
+        ) { result in
+            handleDocumentSourceImport(result)
+        }
+        .onChange(of: selectedPhoto) { _, item in
+            guard let item else { return }
+            importSelectedPhoto(item)
+        }
+        .courseSourceAttachmentErrorAlert(error: $attachmentError)
+        .alert("Couldn’t Resolve Discussion", isPresented: Binding(
+            get: { resolveError != nil },
+            set: { if !$0 { resolveError = nil } }
+        )) {
+            Button("OK", role: .cancel) { resolveError = nil }
+        } message: {
+            Text(resolveError ?? "The discussion is still open.")
+        }
+    }
+
+    @ViewBuilder
+    private var presentedTranscript: some View {
+        if isEmbedded {
+            VStack(spacing: 0) {
+                embeddedDiscussionHeader
+                Divider()
+                courseTranscript
+            }
+        } else {
+            courseTranscript
+        }
+    }
+
+    private var courseAppearance: some View {
+        presentedTranscript
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("course-request-lifecycle")
         .accessibilityValue(requestLifecycle?.rawValue ?? "")
+        #if targetEnvironment(macCatalyst)
+        .onReceive(NotificationCenter.default.publisher(for: .learnfoldCommandSendCourseMessage)) { notification in
+            guard notification.object as? CourseExperienceStore === store else { return }
+            _ = sendCurrentMessage()
+        }
+        #endif
         .litterFontFamily(.system)
         // Course surfaces use native Dynamic Type. The classic conversation
         // zoom is a separate preference and otherwise makes this screen's
         // messages larger than its surrounding controls and guidance.
         .environment(\.textScale, 1.0)
-        .navigationTitle(pageContext != nil ? "Ask AI" : selectionContext == nil ? (store.generatedCourseID == nil ? "New Course" : "Course Agent") : "Ask about this passage")
-        .navigationBarTitleDisplayMode(.inline)
+        .modifier(CourseChatNavigationTitleModifier(
+            title: pageContext != nil ? "Ask AI" : selectionContext == nil
+                ? (store.generatedCourseID == nil ? "New Course" : "Course Agent")
+                : "Ask about this passage",
+            isEmbedded: isEmbedded
+        ))
         .onAppear {
             syncChatModel()
             if pendingInitialQuestion == nil, let draft = store.takeDraft(for: selectionDiscussionID) {
                 inputText = draft
             }
+            hasSentPageContext = pageContext != nil && selectionDiscussionID.map {
+                store.selectionDiscussionHasSubmittedQuestion(id: $0)
+            } == true
             sendPendingInitialQuestionIfReady()
             if selectionDiscussionID == nil, selectionContext == nil, pageContext == nil {
                 store.applyCompletedCoursePlanToolCalls(appModel: appModel)
@@ -1118,9 +1216,24 @@ struct CourseChatView: View {
                 expectedWorkspaceID: draftWorkspaceID
             )
         }
+    }
+
+    private var courseReadiness: some View {
+        courseAppearance
         .onChange(of: isAgentReady) { _, _ in
             sendPendingInitialQuestionIfReady()
             sendQueuedQuestionOptionIfReady()
+        }
+        .onChange(of: store.assistantInitiationVersion) { _, _ in
+            acknowledgeAssistantInitiationIfAccepted()
+        }
+        .onChange(of: pageContext?.assistantInitiation) { _, instruction in
+            // A review can request a discussion while this page chat is
+            // already presented. Its identity stays the same, so refresh the
+            // pending opening instead of relying on a new view's initializer.
+            awaitingAssistantInitiationAcceptance = nil
+            pendingAssistantInitiation = instruction
+            sendPendingInitialQuestionIfReady()
         }
         .onChange(of: store.chatThreadKey(selectionDiscussionID: selectionDiscussionID)) { _, _ in
             syncChatModel()
@@ -1133,6 +1246,10 @@ struct CourseChatView: View {
                 appStore: appModel.store
             )
         }
+    }
+
+    private var courseLifecycle: some View {
+        courseReadiness
         .onChange(of: isAgentWorking) { _, working in
             if !working {
                 // A preview the source never staged was not sent.
@@ -1178,19 +1295,27 @@ struct CourseChatView: View {
                     store.selectionDiscussionHasSubmittedQuestion(
                         id: selectionDiscussionID
                     )
+                hasSentPageContext = pageContext != nil
+                    && store.selectionDiscussionHasSubmittedQuestion(id: selectionDiscussionID)
+                guard !Task.isCancelled else { return }
+                hasPreparedDiscussion = true
+                sendPendingInitialQuestionIfReady()
             } else {
                 await store.refreshAgentReadiness(appModel: appModel)
                 await store.hydrateCourseThread(appModel: appModel, appState: appState)
             }
         }
-        .toolbar {
+    }
+
+    @ToolbarContentBuilder
+    private var courseToolbar: some ToolbarContent {
             if showsDismissButton {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("Done") { dismiss() }
+                    Button("Done", action: dismissDiscussion)
                 }
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
-                if selectionDiscussionID != nil {
+                if selectionContext != nil, selectionDiscussionID != nil {
                     Button("Resolve") {
                         resolveDiscussion()
                     }
@@ -1250,78 +1375,55 @@ struct CourseChatView: View {
                 }
                 agentStatusControl
             }
-        }
-        .fileImporter(
-            isPresented: $showsFileImporter,
-            allowedContentTypes: [.data],
-            allowsMultipleSelection: true
-        ) { result in
-            switch result {
-            case .success(let urls):
-                Task {
-                    do {
-                        try await store.importDocumentSources(
-                            urls,
-                            selectionDiscussionID: selectionDiscussionID
-                        )
-                    } catch is CancellationError {
-                        return
-                    } catch {
-                        attachmentError = CourseSourceAttachmentErrorPresentation(
-                            error: error
-                        )
-                    }
+    }
+
+    private var embeddedDiscussionHeader: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Ask AI")
+                    .font(.system(size: 14, weight: .semibold))
+                Text(selectionContext == nil ? "About this lesson" : "About this passage")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            if selectionContext != nil, selectionDiscussionID != nil {
+                Button("Resolve", action: resolveDiscussion)
+                    .font(.system(size: 12, weight: .medium))
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(
+                        isResolvingDiscussion || isPreparingSelectionDiscussion ||
+                            isAgentWorking || blocksNewSubmissionForHermesRecovery
+                    )
+                    .accessibilityIdentifier("course-chat-resolve")
+            }
+            agentStatusControl
+            if showsDismissButton {
+                Button(action: dismissDiscussion) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 28, height: 28)
                 }
-            case .failure(let error):
-                attachmentError = CourseSourceAttachmentErrorPresentation(
-                    error: error
-                )
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Close discussion")
+                .accessibilityLabel("Close discussion")
+                .accessibilityIdentifier("course-chat-close-panel")
             }
         }
-        .onChange(of: selectedPhoto) { _, item in
-            guard let item else { return }
-            Task {
-                defer { selectedPhoto = nil }
-                let data: Data
-                do {
-                    guard let loadedData = try await item.loadTransferable(type: Data.self) else {
-                        attachmentError = CourseSourceAttachmentErrorPresentation(
-                            kind: .parse
-                        )
-                        return
-                    }
-                    data = loadedData
-                } catch is CancellationError {
-                    return
-                } catch {
-                    attachmentError = CourseSourceAttachmentErrorPresentation(
-                        error: error,
-                        fallbackKind: .parse
-                    )
-                    return
-                }
-                do {
-                    try await store.importImageSource(
-                        data: data,
-                        selectionDiscussionID: selectionDiscussionID
-                    )
-                } catch is CancellationError {
-                    return
-                } catch {
-                    attachmentError = CourseSourceAttachmentErrorPresentation(
-                        error: error
-                    )
-                }
-            }
-        }
-        .courseSourceAttachmentErrorAlert(error: $attachmentError)
-        .alert("Couldn’t Resolve Discussion", isPresented: Binding(
-            get: { resolveError != nil },
-            set: { if !$0 { resolveError = nil } }
-        )) {
-            Button("OK", role: .cancel) { resolveError = nil }
-        } message: {
-            Text(resolveError ?? "The discussion is still open.")
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Color(uiColor: .secondarySystemBackground))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-chat-panel-header")
+    }
+
+    private func dismissDiscussion() {
+        if let onDismiss {
+            onDismiss()
+        } else {
+            dismiss()
         }
     }
 
@@ -1536,7 +1638,7 @@ struct CourseChatView: View {
     /// transcripts; in the shared timeline they sit inside the newest turn.
     @ViewBuilder
     private var courseStatusCards: some View {
-        if store.showsBrief {
+        if selectionDiscussionID == nil, pageContext == nil, store.showsBrief {
             CourseBriefCard(
                 brief: store.brief,
                 agentName: displayedAgentID.displayLabel,
@@ -1738,7 +1840,7 @@ struct CourseChatView: View {
                 )
             } else if let pageContext {
                 coursePageContextCard(pageContext)
-            } else if chatModel.isEmpty {
+            } else if chatModel.isEmpty || keepsIntroAboveFirstMessage {
                 CourseChatIntro(
                     agentID: displayedAgentID,
                     supportsBinarySources: CourseAgentProvider.supportsBinarySources(
@@ -1761,6 +1863,52 @@ struct CourseChatView: View {
                 hermesRecoveryProgress
             }
             courseStatusCards
+        }
+    }
+
+    private func importSelectedPhoto(_ item: PhotosPickerItem) {
+        Task {
+            defer { selectedPhoto = nil }
+            let data: Data
+            do {
+                guard let loaded = try await item.loadTransferable(type: Data.self) else {
+                    attachmentError = CourseSourceAttachmentErrorPresentation(kind: .parse)
+                    return
+                }
+                data = loaded
+            } catch is CancellationError {
+                return
+            } catch {
+                attachmentError = CourseSourceAttachmentErrorPresentation(error: error, fallbackKind: .parse)
+                return
+            }
+            do {
+                try await store.importImageSource(data: data, selectionDiscussionID: selectionDiscussionID)
+            } catch is CancellationError {
+                return
+            } catch {
+                attachmentError = CourseSourceAttachmentErrorPresentation(error: error)
+            }
+        }
+    }
+
+    private func handleDocumentSourceImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            Task {
+                do {
+                    try await store.importDocumentSources(
+                        urls,
+                        selectionDiscussionID: selectionDiscussionID
+                    )
+                } catch is CancellationError {
+                    return
+                } catch {
+                    attachmentError = CourseSourceAttachmentErrorPresentation(error: error)
+                }
+            }
+        case .failure(let error):
+            attachmentError = CourseSourceAttachmentErrorPresentation(error: error)
         }
     }
 
@@ -2000,12 +2148,45 @@ struct CourseChatView: View {
     /// Sends the tapped follow-up question once. If the agent is not ready the
     /// question stays in the composer for the learner to send later.
     private func sendPendingInitialQuestionIfReady() {
+        acknowledgeAssistantInitiationIfAccepted()
+        guard selectionDiscussionID == nil || hasPreparedDiscussion,
+              !isPreparingSelectionDiscussion else { return }
+        if let instruction = pendingAssistantInitiation {
+            if store.assistantInitiationWasAccepted(instruction, selectionDiscussionID: selectionDiscussionID) {
+                pendingAssistantInitiation = nil
+                onAssistantInitiationSent()
+                return
+            }
+            guard isAgentReady, !isAgentWorking, !blocksNewSubmissionForHermesRecovery else { return }
+            // Its exact tagged prefix reaches the Rust transcript projection.
+            // Do not wrap it in a fabricated learner question or page envelope.
+            guard store.sendMessage(
+                instruction,
+                selectionDiscussionID: selectionDiscussionID,
+                visibility: .assistantInitiated,
+                appModel: appModel,
+                appState: appState
+            ) else { return }
+            pendingAssistantInitiation = nil
+            awaitingAssistantInitiationAcceptance = instruction
+            hasSentPageContext = true
+            acknowledgeAssistantInitiationIfAccepted()
+            return
+        }
         guard let question = pendingInitialQuestion,
               isAgentReady,
               !isAgentWorking,
               inputText == question else { return }
         pendingInitialQuestion = nil
         sendCurrentMessage()
+    }
+
+    private func acknowledgeAssistantInitiationIfAccepted() {
+        guard let instruction = awaitingAssistantInitiationAcceptance,
+              instruction == pageContext?.assistantInitiation,
+              store.assistantInitiationWasAccepted(instruction, selectionDiscussionID: selectionDiscussionID) else { return }
+        awaitingAssistantInitiationAcceptance = nil
+        onAssistantInitiationSent()
     }
 
     @discardableResult
@@ -2051,6 +2232,7 @@ struct CourseChatView: View {
         autoFollowStreaming = true
         isNearBottom = true
         if !usesClassicCourseChat {
+            if chatModel.isEmpty { keepsIntroAboveFirstMessage = true }
             // The message is shown as pending until the source stages it.
             chatModel.noteLocalSend(previewText: text)
         }
@@ -2085,7 +2267,7 @@ struct CourseChatView: View {
                     id: selectionDiscussionID,
                     appModel: appModel
                 )
-                dismiss()
+                dismissDiscussion()
             } catch {
                 resolveError = "The agent discussion could not be closed, so the passage remains highlighted. \(error.localizedDescription)"
             }
@@ -2127,6 +2309,13 @@ struct CourseChatView: View {
                 appModel: appModel,
                 appState: appState
             )
+            // A message the agent received leaves the composer, so sending
+            // can't duplicate it; one it never got stays for a resend.
+            if store.submissionStatusCheckOutcome(
+                selectionDiscussionID: selectionDiscussionID
+            )?.result == .resolved {
+                inputText = store.takeDraft(for: selectionDiscussionID) ?? ""
+            }
         }
     }
 

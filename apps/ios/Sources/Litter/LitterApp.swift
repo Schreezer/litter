@@ -209,6 +209,7 @@ enum DebugLaunchSignalAuthorityInventory {
     static let legacyPrimaryArguments: Set<String> = [
         "--ui-test-course-draft-recovery",
         "--ui-test-course-reading",
+        "--ui-test-course-submission-recovery",
         "--ui-test-starter-course",
         "--ui-test-course-generation-control",
         "--ui-test-course-learning-path",
@@ -223,6 +224,7 @@ enum DebugLaunchSignalAuthorityInventory {
     static let legacyModifierArguments: Set<String> = [
         "--ui-test-dynamic-type-default",
         "--ui-test-dynamic-type-ax3xl",
+        "--ui-test-learning-path-in-exploration",
         "--ui-test-generation-recovery-acceptance-unknown",
         "--ui-test-generation-recovery-accepted-reply-incomplete",
         "--ui-test-open-settings",
@@ -1174,7 +1176,9 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
             "OpenAIApiKeyStore.applyToEnvironment"
         )
-        OpenAIApiKeyStore.shared.applyToEnvironment()
+        if !LitterPlatform.isDirectDistMac {
+            OpenAIApiKeyStore.shared.applyToEnvironment()
+        }
         LearnfoldStrictHarnessSentinel.recordForbiddenEntry(
             "LitterPlatform.bootstrapLocalRuntime"
         )
@@ -1204,7 +1208,9 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
             queue: .main
         ) { [weak self] _ in
             LLog.info("lifecycle", "protected app data became available")
-            OpenAIApiKeyStore.shared.applyToEnvironment()
+            if !LitterPlatform.isDirectDistMac {
+                OpenAIApiKeyStore.shared.applyToEnvironment()
+            }
             Task { @MainActor [weak self] in
                 guard let appRuntime = self?.appRuntime else { return }
                 await appRuntime.restoreMissingLocalAuthStateIfNeeded()
@@ -1574,14 +1580,14 @@ struct LitterApp: App {
     var body: some Scene {
         #if targetEnvironment(macCatalyst)
         mainWindowGroup
-            .defaultSize(width: 1120, height: 760)
+            .defaultSize(width: 1280, height: 820)
             // NOTE: `.windowResizability` is a no-op on Catalyst.
             // Actual resize bounds are set from
             // `MacWindowTitleBarStyler` via
             // `UIWindowScene.sizeRestrictions`.
             .commands {
                 if let appModel {
-                    LitterCommands(appModel: appModel)
+                    LitterCommands()
                 }
             }
         #else
@@ -1672,7 +1678,9 @@ struct LitterApp: App {
                 appDelegate.appRuntime = appRuntime
                 appRuntime.appDidBecomeActive()
                 #if targetEnvironment(macCatalyst)
-                LocalCodexBootstrap.shared.startIfNeeded(appModel: appModel)
+                if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+                    LocalCodexBootstrap.shared.startIfNeeded(appModel: appModel)
+                }
                 #endif
                 // Pair host (BLE advertiser, ultrasonic emitter,
                 // Bonjour publish, WS listener) and the iPhone client
@@ -1982,6 +1990,9 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if CourseReadingUITestHarness.isEnabled {
                     CourseReadingUITestHarness()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if CourseSubmissionRecoveryUITestHarness.isEnabled {
+                    CourseSubmissionRecoveryUITestHarness()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if MarketingScreenshotHarnessView.isEnabled {
                     MarketingScreenshotHarnessView()

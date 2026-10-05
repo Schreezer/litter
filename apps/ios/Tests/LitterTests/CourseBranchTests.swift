@@ -41,7 +41,7 @@ final class CourseBranchTests: XCTestCase {
         XCTAssertEqual(
             CourseReadingOrder.lessons(in: outline.learningPages).map(\.id),
             ["lesson"],
-            "Branches are side paths, not part of the reading order."
+            "Branches are explorations, not part of the suggested route."
         )
     }
 
@@ -67,7 +67,8 @@ final class CourseBranchTests: XCTestCase {
                 in: nodes,
                 bookmark: .init(pageID: "page-branch", offset: 0, isAtEnd: false)
             )?.id,
-            "a"
+            "branch",
+            "Continue returns the learner to where they left off, even inside a branch."
         )
     }
 }

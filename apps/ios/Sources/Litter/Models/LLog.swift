@@ -9,6 +9,11 @@ enum LLog {
         guard !bootstrapped else { return }
         bootstrapped = true
 
+        #if targetEnvironment(macCatalyst)
+        // Installed Codex resolves its own home and existing credentials.
+        // The mobile runtime's private home would hide the Mac's login.
+        if LitterPlatform.isDirectDistMac { return }
+        #endif
         let codexHome = resolveCodexHome()
         setenv("CODEX_HOME", codexHome.path, 1)
     }

@@ -4,6 +4,117 @@ final class CourseReadingUITests: XCTestCase {
     override func setUp() { continueAfterFailure = false }
 
     @MainActor
+    func testPageChatKeepsSeparateDiscussionHistoryAcrossReopeningAndRelaunch() {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchEnvironment["SNAPPY_SKIP_AGENT_SETUP"] = "1"
+        app.launchEnvironment["LEARNFOLD_READING_TEST_TOKEN"] = UUID().uuidString
+        app.launchArguments = ["--ui-test-course-reading"]
+        app.launch()
+
+        let courseHistory = "Course-only discussion: the complete SNARKs learning plan."
+        let firstQuestion = "What can this proof reveal?"
+        let firstReply = "Page-one discussion: a proof reveals validity without exposing the secret."
+        let secondQuestion = "Why is the challenge random?"
+        let secondReply = "The local chat fixture received your question and the current lesson content."
+        let start = app.buttons["course-continue"]
+        XCTAssertTrue(start.waitForExistence(timeout: 25), app.debugDescription)
+
+        let courseChat = app.buttons["talk-to-course-agent-button"]
+        XCTAssertTrue(waitForHittable(courseChat))
+        courseChat.tap()
+        XCTAssertTrue(app.staticTexts[courseHistory].waitForExistence(timeout: 15), app.debugDescription)
+        capture("Existing course discussion", app)
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(waitForHittable(start))
+        start.tap()
+        XCTAssertTrue(waitForPage("article-one", in: app))
+
+        openPageChat("What a proof reveals", in: app)
+        XCTAssertFalse(app.staticTexts[courseHistory].exists, "A new page discussion must not restore course history")
+        capture("First page starts its own discussion", app)
+        sendChatQuestion(firstQuestion, in: app)
+        XCTAssertTrue(app.staticTexts[firstReply].waitForExistence(timeout: 20), app.debugDescription)
+        XCTAssertFalse(app.staticTexts[courseHistory].exists)
+        capture("First page question and answer", app)
+
+        app.navigationBars.buttons["Done"].tap()
+        XCTAssertTrue(waitForPage("article-one", in: app))
+        openPageChat("What a proof reveals", in: app)
+        XCTAssertTrue(app.staticTexts[firstReply].waitForExistence(timeout: 15), "Reopening the page must restore its linked discussion")
+        XCTAssertTrue(app.staticTexts[firstQuestion].exists)
+        XCTAssertFalse(app.staticTexts[courseHistory].exists)
+        capture("First page reopens its discussion", app)
+        app.navigationBars.buttons["Done"].tap()
+
+        let next = app.buttons["course-next-lesson"]
+        for _ in 0..<22 where !next.isHittable { app.swipeUp() }
+        app.swipeUp()
+        XCTAssertTrue(next.isHittable)
+        next.tap()
+        XCTAssertTrue(waitForPage("article-two", in: app))
+        openPageChat("A verifier's challenge", in: app)
+        XCTAssertFalse(app.staticTexts[firstReply].exists, "A different page must have a separate discussion")
+        XCTAssertFalse(app.staticTexts[firstQuestion].exists)
+        XCTAssertFalse(app.staticTexts[courseHistory].exists)
+        sendChatQuestion(secondQuestion, in: app)
+        XCTAssertTrue(app.staticTexts[secondReply].waitForExistence(timeout: 20), app.debugDescription)
+        XCTAssertFalse(app.staticTexts[firstReply].exists)
+        capture("Second page has separate history", app)
+
+        app.navigationBars.buttons["Done"].tap()
+        XCTAssertTrue(waitForPage("article-two", in: app))
+        openPageChat("A verifier's challenge", in: app)
+        XCTAssertTrue(app.staticTexts[secondReply].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts[secondQuestion].exists)
+        XCTAssertFalse(app.staticTexts[firstReply].exists)
+        capture("Second page reopens its discussion", app)
+
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(start.waitForExistence(timeout: 25), app.debugDescription)
+        XCTAssertTrue(waitForHittable(start))
+        start.tap()
+        XCTAssertTrue(waitForPage("article-two", in: app))
+        openPageChat("A verifier's challenge", in: app)
+        XCTAssertTrue(app.staticTexts[secondReply].waitForExistence(timeout: 15), "The persisted page link must survive app relaunch")
+        XCTAssertTrue(app.staticTexts[secondQuestion].exists)
+        XCTAssertFalse(app.staticTexts[firstReply].exists)
+        XCTAssertFalse(app.staticTexts[courseHistory].exists)
+        capture("Second page discussion restored after relaunch", app)
+        app.navigationBars.buttons["Done"].tap()
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(waitForHittable(courseChat))
+        courseChat.tap()
+        XCTAssertTrue(app.staticTexts[courseHistory].waitForExistence(timeout: 15))
+        XCTAssertFalse(app.staticTexts[firstReply].exists)
+        XCTAssertFalse(app.staticTexts[secondReply].exists)
+        capture("Course discussion remains separate", app)
+        app.navigationBars.buttons.firstMatch.tap()
+
+        let structure = app.segmentedControls["course-detail-section-picker"].buttons["Structure"]
+        XCTAssertTrue(waitForHittable(structure))
+        structure.tap()
+        let expandSection = app.buttons["course-page-expand-section"]
+        XCTAssertTrue(waitForHittable(expandSection))
+        if expandSection.label.hasPrefix("Expand") { expandSection.tap() }
+        let firstPage = app.descendants(matching: .any)
+            .matching(identifier: "course-page-row-article-one").firstMatch
+        for _ in 0..<4 where !firstPage.exists || !firstPage.isHittable {
+            app.swipeUp()
+        }
+        XCTAssertTrue(waitForHittable(firstPage), app.debugDescription)
+        firstPage.tap()
+        XCTAssertTrue(waitForPage("article-one", in: app))
+        openPageChat("What a proof reveals", in: app)
+        XCTAssertTrue(app.staticTexts[firstReply].waitForExistence(timeout: 15), "The first page must still restore its original discussion after relaunch")
+        XCTAssertTrue(app.staticTexts[firstQuestion].exists)
+        XCTAssertFalse(app.staticTexts[secondReply].exists)
+        XCTAssertFalse(app.staticTexts[courseHistory].exists)
+        capture("First page keeps its original discussion after relaunch", app)
+    }
+
+    @MainActor
     func testPageChatOpensWithCurrentPageAndReturnsToReading() {
         let app = XCUIApplication()
         app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
@@ -253,6 +364,39 @@ final class CourseReadingUITests: XCTestCase {
         XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "exists == true AND hittable == true"), object: element
         )], timeout: 20) == .completed
+    }
+
+    @MainActor
+    private func openPageChat(_ title: String, in app: XCUIApplication) {
+        let ask = app.buttons["course-page-ask-ai"]
+        XCTAssertTrue(waitForHittable(ask))
+        ask.tap()
+        let context = app.descendants(matching: .any)
+            .matching(identifier: "course-page-chat-context").firstMatch
+        XCTAssertTrue(context.waitForExistence(timeout: 15), app.debugDescription)
+        XCTAssertTrue(context.staticTexts[title].exists)
+    }
+
+    @MainActor
+    private func sendChatQuestion(_ question: String, in app: XCUIApplication) {
+        let composer = app.descendants(matching: .any)
+            .matching(identifier: "course-chat-composer").firstMatch
+        XCTAssertTrue(waitForHittable(composer))
+        composer.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10))
+        for character in question {
+            composer.typeText(String(character))
+        }
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", question), object: composer
+        )], timeout: 10), .completed, app.debugDescription)
+        XCTAssertEqual(composer.value as? String, question, app.debugDescription)
+        let send = app.buttons["course-chat-send"]
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true AND enabled == true"),
+            object: send
+        )], timeout: 20), .completed, app.debugDescription)
+        send.tap()
     }
 
     @MainActor

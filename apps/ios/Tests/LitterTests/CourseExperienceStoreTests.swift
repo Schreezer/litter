@@ -87,6 +87,95 @@ private actor ContinuationHermesRecoveryBarrier:
     }
 }
 
+private final class ClosedLessonChatSubscription: ChatSubscription, @unchecked Sendable {
+    init() { super.init(noHandle: ChatSubscription.NoHandle()) }
+
+    required init(unsafeFromHandle handle: UInt64) {
+        fatalError("ClosedLessonChatSubscription is test-only")
+    }
+
+    override func nextUpdate() async throws -> ChatUpdate {
+        throw NSError(domain: "ClosedLessonSubscriptionFixture", code: 1)
+    }
+
+    override func resync() {}
+}
+
+private final class ClosedLessonChatAppStore: AppStore, @unchecked Sendable {
+    init() { super.init(noHandle: AppStore.NoHandle()) }
+
+    required init(unsafeFromHandle handle: UInt64) {
+        fatalError("ClosedLessonChatAppStore is test-only")
+    }
+
+    override func subscribeChat(key: ThreadKey) -> ChatSubscription {
+        ClosedLessonChatSubscription()
+    }
+}
+
+private final class CorrelatedCourseTurnAppClient: AppClient, @unchecked Sendable {
+    private let expectedTurnID: String
+    private let readLock = NSLock()
+    private var status: AppTurnStatus?
+    private var readCount = 0
+    private let failingReadCount: Int
+    private let observedReadCount: Int
+    private let onInitialRead: @Sendable () -> Void
+
+    init(
+        expectedTurnID: String,
+        status: AppTurnStatus?,
+        failingReadCount: Int = 0,
+        observedReadCount: Int = 3,
+        onInitialRead: @escaping @Sendable () -> Void
+    ) {
+        self.expectedTurnID = expectedTurnID
+        self.status = status
+        self.failingReadCount = failingReadCount
+        self.observedReadCount = observedReadCount
+        self.onInitialRead = onInitialRead
+        super.init(noHandle: AppClient.NoHandle())
+    }
+
+    required init(unsafeFromHandle handle: UInt64) {
+        fatalError("CorrelatedCourseTurnAppClient is test-only")
+    }
+
+    override func setSavedAppsDirectory(directory: String) {}
+    override func setSlingshotCredentialsDirectory(directory: String) {}
+    override func agentMetadata(name: String) -> AppAgentMetadata? { nil }
+    override func allAgentMetadata() -> [AppAgentMetadata] { [] }
+
+    func finish(status: AppTurnStatus) {
+        readLock.withLock { self.status = status }
+    }
+
+    override func listThreadTurns(
+        serverId: String,
+        params: AppListThreadTurnsRequest
+    ) async throws -> AppListThreadTurnsResponse {
+        let (read, status) = readLock.withLock {
+            readCount += 1
+            return (readCount, self.status)
+        }
+        if read <= observedReadCount { onInitialRead() }
+        if read <= failingReadCount {
+            throw NSError(domain: "CorrelatedTurnFixture", code: 1)
+        }
+        var states = [AppTurnState(turnId: "previous-turn", status: .completed, errorMessage: nil)]
+        if let status {
+            states.append(AppTurnState(
+                turnId: expectedTurnID,
+                status: status,
+                errorMessage: status == .failed ? "The accepted lesson turn failed." : nil
+            ))
+        }
+        return AppListThreadTurnsResponse(
+            turns: [], turnStates: states, nextCursor: nil, backwardsCursor: nil
+        )
+    }
+}
+
 private final class DelayedHermesListAppClient: AppClient, @unchecked Sendable {
     let barrier: ContinuationHermesRecoveryBarrier
     let response: AppListThreadTurnsResponse
@@ -212,6 +301,53 @@ private final class HermesForwardAppClient: AppClient, @unchecked Sendable {
         serverId: String,
         params: AppInterruptTurnRequest
     ) async throws {}
+}
+
+private final class SavedDiscussionReadAppClient: AppClient, @unchecked Sendable {
+    private let readLock = NSLock()
+    private var recordedReadRequests: [AppReadThreadRequest] = []
+    private var recordedResumeRequests: [AppResumeThreadRequest] = []
+    private let onResume: @Sendable () -> Void
+
+    var readRequests: [AppReadThreadRequest] {
+        readLock.withLock { recordedReadRequests }
+    }
+
+    var resumeRequests: [AppResumeThreadRequest] {
+        readLock.withLock { recordedResumeRequests }
+    }
+
+    init(onResume: @escaping @Sendable () -> Void = {}) {
+        self.onResume = onResume
+        super.init(noHandle: AppClient.NoHandle())
+    }
+
+    required init(unsafeFromHandle handle: UInt64) {
+        fatalError("SavedDiscussionReadAppClient is test-only")
+    }
+
+    override func setSavedAppsDirectory(directory: String) {}
+    override func setSlingshotCredentialsDirectory(directory: String) {}
+    override func agentMetadata(name: String) -> AppAgentMetadata? { nil }
+    override func allAgentMetadata() -> [AppAgentMetadata] { [] }
+    override func setPlatformDynamicToolHandler(handler: PlatformDynamicToolHandler) {}
+
+    override func readThread(
+        serverId: String,
+        params: AppReadThreadRequest
+    ) async throws -> ThreadKey {
+        readLock.withLock { recordedReadRequests.append(params) }
+        return ThreadKey(serverId: serverId, threadId: params.threadId)
+    }
+
+    override func resumeThread(
+        serverId: String,
+        params: AppResumeThreadRequest
+    ) async throws -> ThreadKey {
+        readLock.withLock { recordedResumeRequests.append(params) }
+        onResume()
+        return ThreadKey(serverId: serverId, threadId: params.threadId)
+    }
 }
 
 private actor HermesInterruptRecorder {
@@ -345,6 +481,595 @@ final class CourseExperienceStoreTests: XCTestCase {
         }
         XCTAssertEqual(user.text, "Why is the challenge random?")
         XCTAssertNil(CoursePageChatContext.learnerQuestion(from: "An ordinary question"))
+    }
+
+    func testPageDiscussionReusesItsPageAfterContentAndSelectedAgentChange() throws {
+        let defaults = try makeDefaults()
+        defaults.set(CourseAgentProvider.codex, forKey: "snappy.course.selectedAgent")
+        defaults.set("page-server", forKey: "snappy.course.selectedAgentServer")
+        let course = makePageDiscussionCourse(id: "page-course")
+        let store = CourseExperienceStore(defaults: defaults, environment: [:])
+        store.courses = [course]
+        let first = try store.beginPageDiscussion(
+            for: course,
+            context: CoursePageChatContext(
+                pageID: "cellular-energetics",
+                pageTitle: "Cellular energetics",
+                content: "ATP carries energy."
+            )
+        )
+        store.saveDraft("Why is ATP useful?", for: first.id)
+        store.selectedAgentID = "hermes"
+        store.selectedAgentServerID = "another-server"
+        store.selectedModelID = "another-model"
+        let editedContext = CoursePageChatContext(
+            pageID: "cellular-energetics",
+            pageTitle: "Molecular machinery and cellular energetics",
+            content: "ATP synthase uses a proton gradient."
+        )
+
+        let reopened = try store.beginPageDiscussion(for: course, context: editedContext)
+
+        XCTAssertEqual(reopened.id, first.id)
+        XCTAssertEqual(reopened.executionTarget, first.executionTarget)
+        XCTAssertEqual(store.takeDraft(for: reopened.id), "Why is ATP useful?")
+        XCTAssertEqual(store.selectionDiscussions.count, 1)
+        store.selectedAgentID = nil
+        store.selectedAgentServerID = nil
+        XCTAssertEqual(
+            try store.beginPageDiscussion(for: course, context: editedContext).id,
+            first.id
+        )
+    }
+
+    func testPageDiscussionsKeepCourseAndOtherPagesSeparate() throws {
+        let defaults = try makeDefaults()
+        defaults.set(CourseAgentProvider.codex, forKey: "snappy.course.selectedAgent")
+        defaults.set("page-server", forKey: "snappy.course.selectedAgentServer")
+        var course = makePageDiscussionCourse(id: "biology")
+        course.agentServerID = "course-server"
+        course.agentThreadID = UUID().uuidString.lowercased()
+        course.agentRuntimeKind = CourseAgentProvider.codex
+        course.appleSessionID = UUID()
+        course.hostedSessionID = UUID()
+        let otherCourse = makePageDiscussionCourse(id: "chemistry")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "PageDiscussionIsolation-\(UUID().uuidString)", isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try writePageDiscussionCourseMetadata(course, root: root)
+        let store = CourseExperienceStore(defaults: defaults, environment: [:], coursesRootURL: root)
+        store.courses = [course, otherCourse]
+        XCTAssertTrue(store.prepareContextualCourseChat(for: course))
+        let mainThread = try XCTUnwrap(store.agentThreadKey)
+        let mainMessages = [CourseChatMessage(role: .learner, text: "Discuss the whole course.")]
+        let mainSources = [CourseSource(name: "Course notes", detail: "TEXT", kind: .document)]
+        store.messages = mainMessages
+        store.sources = mainSources
+        store.saveDraft("Course follow-up", for: nil)
+        let originalCourses = store.courses
+        let context = CoursePageChatContext(
+            pageID: "shared-page-id", pageTitle: "Energy", content: "Page content"
+        )
+
+        let page = try store.beginPageDiscussion(for: course, context: context)
+        let chapter = try store.beginPageDiscussion(
+            for: course,
+            context: CoursePageChatContext(
+                pageID: "chapter-id", pageTitle: "Chapter", content: "Chapter overview"
+            )
+        )
+        let otherCoursePage = try store.beginPageDiscussion(for: otherCourse, context: context)
+        store.saveDraft("Page follow-up", for: page.id)
+        store.saveDraft("Chapter follow-up", for: chapter.id)
+
+        XCTAssertEqual(Set([page.id, chapter.id, otherCoursePage.id]).count, 3)
+        XCTAssertEqual(store.courses, originalCourses)
+        XCTAssertEqual(store.agentThreadKey, mainThread)
+        XCTAssertEqual(store.chatThreadKey(selectionDiscussionID: nil), mainThread)
+        XCTAssertEqual(store.messages, mainMessages)
+        XCTAssertEqual(store.sources, mainSources)
+        XCTAssertEqual(store.takeDraft(for: nil), "Course follow-up")
+        XCTAssertEqual(store.takeDraft(for: page.id), "Page follow-up")
+        XCTAssertEqual(store.takeDraft(for: chapter.id), "Chapter follow-up")
+        XCTAssertNil(store.takeDraft(for: otherCoursePage.id))
+        XCTAssertTrue(store.localMessages(for: page.id).isEmpty)
+        XCTAssertTrue(store.localMessages(for: chapter.id).isEmpty)
+        XCTAssertNil(store.chatThreadKey(selectionDiscussionID: page.id))
+        XCTAssertNil(store.chatThreadKey(selectionDiscussionID: chapter.id))
+    }
+
+    func testPageDiscussionDoesNotMatchOrAnnotateAPassageOnThatPage() throws {
+        let defaults = try makeDefaults()
+        defaults.set(CourseAgentProvider.codex, forKey: "snappy.course.selectedAgent")
+        defaults.set("page-server", forKey: "snappy.course.selectedAgentServer")
+        let course = makePageDiscussionCourse(id: "biology")
+        let store = CourseExperienceStore(defaults: defaults, environment: [:])
+        store.courses = [course]
+        let page = try store.beginPageDiscussion(
+            for: course,
+            context: CoursePageChatContext(
+                pageID: "energy", pageTitle: "Energy", content: "ATP carries energy."
+            )
+        )
+        let reference = try XCTUnwrap(CourseTextReference(
+            courseID: course.id,
+            pageID: page.pageID,
+            pageTitle: page.pageTitle,
+            selectedText: "ATP carries energy."
+        ))
+        guard case .open(let passage) = try store.beginSelectionDiscussion(
+            for: course, reference: reference
+        ) else {
+            return XCTFail("The passage should start its own discussion")
+        }
+
+        XCTAssertTrue(page.isPageDiscussion)
+        XCTAssertEqual(page.scope, .page)
+        XCTAssertNil(page.reference)
+        XCTAssertFalse(page.matches(reference))
+        XCTAssertFalse(passage.isPageDiscussion)
+        XCTAssertTrue(passage.matches(reference))
+        XCTAssertNotEqual(page.id, passage.id)
+        XCTAssertEqual(
+            store.unresolvedSelectionDiscussions(courseID: course.id, pageID: page.pageID).map(\.id),
+            [passage.id]
+        )
+        XCTAssertEqual(
+            try store.beginPageDiscussion(
+                for: course,
+                context: CoursePageChatContext(
+                    pageID: page.pageID, pageTitle: page.pageTitle, content: "Updated page"
+                )
+            ).id,
+            page.id
+        )
+    }
+
+    func testPageDiscussionRoundTripsItsScopeAndLinkedThread() throws {
+        let target = CourseAgentExecutionTarget(
+            runtimeID: CourseAgentProvider.codex,
+            serverID: "page-server",
+            modelID: "page-model"
+        )
+        var page = CourseSelectionDiscussion(
+            courseID: "biology",
+            pageID: "energy",
+            pageTitle: "Cellular energetics",
+            target: target
+        )
+        page.threadID = UUID().uuidString.lowercased()
+        page.hasSubmittedQuestion = true
+
+        let data = try JSONEncoder().encode(page)
+        let decoded = try JSONDecoder().decode(CourseSelectionDiscussion.self, from: data)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(decoded, page)
+        XCTAssertEqual(json["scope"] as? String, "page")
+        XCTAssertEqual(decoded.executionTarget, target)
+        XCTAssertTrue(decoded.isPageDiscussion)
+        XCTAssertNil(decoded.reference)
+    }
+
+    func testLegacyPassageWithoutScopeRetainsItsAnchorBesideAPageDiscussion() throws {
+        let defaults = try makeDefaults()
+        let reference = try XCTUnwrap(CourseTextReference(
+            courseID: "biology", pageID: "energy", pageTitle: "Energy",
+            blockID: "atp-block", pathIndices: [2], rangeLocation: 4,
+            selectedText: "ATP carries energy."
+        ))
+        let passage = CourseSelectionDiscussion(reference: reference)
+        let page = CourseSelectionDiscussion(
+            courseID: reference.courseID,
+            pageID: reference.pageID,
+            pageTitle: reference.pageTitle
+        )
+        var legacyJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(passage)) as? [String: Any]
+        )
+        legacyJSON.removeValue(forKey: "scope")
+        let pageJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(page))
+        defaults.set(
+            try JSONSerialization.data(withJSONObject: [legacyJSON, pageJSON]),
+            forKey: "snappy.course.selectionDiscussions"
+        )
+
+        let store = CourseExperienceStore(defaults: defaults, environment: [:])
+        let restoredPassage = try XCTUnwrap(store.selectionDiscussion(id: passage.id))
+        let restoredPage = try XCTUnwrap(store.selectionDiscussion(id: page.id))
+
+        XCTAssertEqual(store.selectionDiscussions.count, 2)
+        XCTAssertNil(restoredPassage.scope)
+        XCTAssertFalse(restoredPassage.isPageDiscussion)
+        XCTAssertEqual(restoredPassage.reference, reference)
+        XCTAssertTrue(restoredPassage.matches(reference))
+        XCTAssertEqual(restoredPage.scope, .page)
+        XCTAssertNil(restoredPage.reference)
+        XCTAssertEqual(
+            store.unresolvedSelectionDiscussions(
+                courseID: reference.courseID, pageID: reference.pageID
+            ).map(\.id),
+            [passage.id]
+        )
+    }
+
+    func testNewPageDiscussionRequiresWorkspaceAndSelectedAgentTarget() throws {
+        let defaults = try makeDefaults()
+        let store = CourseExperienceStore(defaults: defaults, environment: [:])
+        var course = makePageDiscussionCourse(id: "biology")
+        let context = CoursePageChatContext(pageID: "energy", pageTitle: "Energy", content: "")
+        course.workspaceID = nil
+        XCTAssertThrowsError(try store.beginPageDiscussion(for: course, context: context)) {
+            XCTAssertEqual($0 as? CourseSelectionDiscussionOpenError, .workspaceUnavailable)
+        }
+        course.workspaceID = "biology-workspace"
+        store.selectedAgentID = nil
+        XCTAssertThrowsError(try store.beginPageDiscussion(for: course, context: context)) {
+            XCTAssertEqual($0 as? CourseSelectionDiscussionOpenError, .agentNotSelected)
+        }
+        store.selectedAgentID = CourseAgentProvider.codex
+        store.selectedAgentServerID = nil
+        XCTAssertThrowsError(try store.beginPageDiscussion(for: course, context: context)) {
+            XCTAssertEqual($0 as? CourseSelectionDiscussionOpenError, .agentSetupRequired)
+        }
+        XCTAssertTrue(store.selectionDiscussions.isEmpty)
+    }
+
+    func testHostedPageDiscussionDispatchesAndRestoresItsOwnSession() async throws {
+        let defaults = try makeDefaults()
+        defaults.set(CourseAgentProvider.hosted, forKey: "snappy.course.selectedAgent")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "PageDiscussion-\(UUID().uuidString)", isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        var course = makePageDiscussionCourse(id: "biology")
+        let mainSessionID = UUID()
+        course.agentRuntimeKind = CourseAgentProvider.hosted
+        course.hostedSessionID = mainSessionID
+        defaults.set(try JSONEncoder().encode([course]), forKey: "snappy.course.savedCourses")
+        _ = try writePageDiscussionCourseMetadata(course, root: root)
+        let runtime = SuspendingHostedCourseRuntime()
+        runtime.finishRestore()
+        runtime.finishSend()
+        let store = CourseExperienceStore(
+            defaults: defaults, environment: [:], hostedRuntime: runtime, coursesRootURL: root
+        )
+        let appModel = AppModel()
+        let appState = AppState()
+        XCTAssertTrue(store.prepareContextualCourseChat(for: course))
+        let mainMessages = [CourseChatMessage(role: .learner, text: "The course discussion")]
+        store.messages = mainMessages
+        let context = CoursePageChatContext(
+            pageID: "energy", pageTitle: "Energy", content: "ATP synthase uses a proton gradient."
+        )
+        let page = try store.beginPageDiscussion(for: course, context: context)
+        await store.prepareSelectionDiscussionThread(id: page.id, appModel: appModel, appState: appState)
+        let pageSessionID = try XCTUnwrap(store.selectionDiscussion(id: page.id)?.hostedSessionID)
+
+        XCTAssertNotEqual(pageSessionID, mainSessionID)
+        XCTAssertEqual(runtime.lastRestoredSessionID, pageSessionID)
+        XCTAssertEqual(
+            store.chatThreadKey(selectionDiscussionID: page.id),
+            CourseExperienceStore.hostedChatKey(sessionID: pageSessionID)
+        )
+        XCTAssertTrue(store.sendMessage(
+            "Why is ATP useful?", pageContext: context, selectionDiscussionID: page.id,
+            appModel: appModel, appState: appState
+        ))
+        await runtime.waitForSend()
+        for _ in 0..<200 where store.isAgentRequestPending(for: page.id) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(store.isAgentRequestPending(for: page.id))
+        XCTAssertEqual(runtime.lastSessionID, pageSessionID)
+        XCTAssertTrue(try XCTUnwrap(runtime.lastPrompt).contains("page_id=\"energy\""))
+        XCTAssertEqual(store.localMessages(for: page.id).first?.text, "Why is ATP useful?")
+        XCTAssertEqual(store.localMessages(for: page.id).last?.text, "Let's start with percentages.")
+        XCTAssertEqual(store.messages, mainMessages)
+        XCTAssertEqual(store.course(withID: course.id)?.hostedSessionID, mainSessionID)
+        XCTAssertEqual(
+            store.chatThreadKey(selectionDiscussionID: nil),
+            CourseExperienceStore.hostedChatKey(sessionID: mainSessionID)
+        )
+        store.saveDraft("Another ATP question", for: page.id)
+
+        let restoredRuntime = SuspendingHostedCourseRuntime()
+        restoredRuntime.restored = [.init(role: .learner, text: "Why is ATP useful?")]
+        restoredRuntime.finishRestore()
+        let relaunched = CourseExperienceStore(
+            defaults: defaults, environment: [:], hostedRuntime: restoredRuntime, coursesRootURL: root
+        )
+        let restoredCourse = try XCTUnwrap(relaunched.course(withID: course.id))
+        relaunched.selectedAgentID = nil
+        let reopened = try relaunched.beginPageDiscussion(for: restoredCourse, context: context)
+        await relaunched.prepareSelectionDiscussionThread(
+            id: reopened.id, appModel: appModel, appState: appState
+        )
+
+        XCTAssertEqual(reopened.id, page.id)
+        XCTAssertEqual(reopened.hostedSessionID, pageSessionID)
+        XCTAssertEqual(restoredRuntime.lastRestoredSessionID, pageSessionID)
+        XCTAssertEqual(relaunched.selectionDiscussions.count, 1)
+        XCTAssertEqual(relaunched.takeDraft(for: page.id), "Another ATP question")
+        XCTAssertEqual(relaunched.localMessages(for: page.id).map(\.text), ["Why is ATP useful?"])
+        XCTAssertEqual(restoredCourse.hostedSessionID, mainSessionID)
+    }
+
+    func testHostedPageDiscussionCannotPresentAPlanIntoAnotherCourse() async throws {
+        let defaults = try makeDefaults()
+        defaults.set(CourseAgentProvider.hosted, forKey: "snappy.course.selectedAgent")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "PageDiscussionPlanIsolation-\(UUID().uuidString)", isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        var pageCourse = makePageDiscussionCourse(id: "biology")
+        var mainCourse = makePageDiscussionCourse(id: "chemistry")
+        pageCourse.agentRuntimeKind = CourseAgentProvider.hosted
+        mainCourse.agentRuntimeKind = CourseAgentProvider.hosted
+        mainCourse.hostedSessionID = UUID()
+        let pagePlan = try writePageDiscussionCourseMetadata(pageCourse, root: root)
+        let mainPlan = try writePageDiscussionCourseMetadata(mainCourse, root: root)
+        defaults.set(
+            try JSONEncoder().encode([pageCourse, mainCourse]),
+            forKey: "snappy.course.savedCourses"
+        )
+        let pageDirectory = root.appendingPathComponent(try XCTUnwrap(pageCourse.workspaceID))
+        let mainDirectory = root.appendingPathComponent(try XCTUnwrap(mainCourse.workspaceID))
+        let pageMetadataURL = pageDirectory.appendingPathComponent("course.json")
+        let mainMetadataURL = mainDirectory.appendingPathComponent("course.json")
+        let originalPageMetadata = try Data(contentsOf: pageMetadataURL)
+        let originalMainMetadata = try Data(contentsOf: mainMetadataURL)
+        let runtime = SuspendingHostedCourseRuntime()
+        runtime.finishRestore()
+        runtime.finishSend()
+        runtime.emittedCoursePlan = makeApprovalReadyTypedBrief(from: makeTypedHierarchyBrief())
+        XCTAssertNil(AppleCoursePlanValidator.issue(in: try XCTUnwrap(runtime.emittedCoursePlan)))
+        let store = CourseExperienceStore(
+            defaults: defaults, environment: [:], hostedRuntime: runtime, coursesRootURL: root
+        )
+        XCTAssertTrue(store.prepareContextualCourseChat(for: mainCourse))
+        let mainMessages = [CourseChatMessage(role: .learner, text: "The chemistry course discussion")]
+        store.messages = mainMessages
+        let page = try store.beginPageDiscussion(
+            for: pageCourse,
+            context: CoursePageChatContext(
+                pageID: "energy", pageTitle: "Energy", content: "ATP carries energy."
+            )
+        )
+        let appModel = AppModel()
+        let appState = AppState()
+        await store.prepareSelectionDiscussionThread(id: page.id, appModel: appModel, appState: appState)
+
+        XCTAssertTrue(store.sendMessage(
+            "Explain ATP", selectionDiscussionID: page.id, appModel: appModel, appState: appState
+        ))
+        await runtime.waitForSend()
+        for _ in 0..<200 where store.isAgentRequestPending(for: page.id) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertFalse(store.isAgentRequestPending(for: page.id))
+        XCTAssertNotNil(store.selectionDiscussionErrors[page.id])
+        XCTAssertEqual(store.brief, mainPlan)
+        XCTAssertFalse(store.showsBrief)
+        XCTAssertEqual(store.messages, mainMessages)
+        XCTAssertEqual(store.courseBrief(for: pageCourse), pagePlan)
+        XCTAssertEqual(store.courseBrief(for: mainCourse), mainPlan)
+        XCTAssertEqual(try Data(contentsOf: pageMetadataURL), originalPageMetadata)
+        XCTAssertEqual(try Data(contentsOf: mainMetadataURL), originalMainMetadata)
+        XCTAssertNil(AppleCourseApprovalPolicy.presentedPlan(courseDirectory: pageDirectory))
+        XCTAssertNil(AppleCourseApprovalPolicy.presentedPlan(courseDirectory: mainDirectory))
+    }
+
+    func testHostedPassageDiscussionRunsAsADiscussionAndCannotPresentAPlan() async throws {
+        let defaults = try makeDefaults()
+        defaults.set(CourseAgentProvider.hosted, forKey: "snappy.course.selectedAgent")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "PassageDiscussionPlanIsolation-\(UUID().uuidString)", isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        var course = makePageDiscussionCourse(id: "biology")
+        course.agentRuntimeKind = CourseAgentProvider.hosted
+        course.hostedSessionID = UUID()
+        let plan = try writePageDiscussionCourseMetadata(course, root: root)
+        defaults.set(try JSONEncoder().encode([course]), forKey: "snappy.course.savedCourses")
+        let directory = root.appendingPathComponent(try XCTUnwrap(course.workspaceID))
+        let runtime = SuspendingHostedCourseRuntime()
+        runtime.finishRestore()
+        runtime.finishSend()
+        runtime.emittedCoursePlan = makeApprovalReadyTypedBrief(from: makeTypedHierarchyBrief())
+        let store = CourseExperienceStore(
+            defaults: defaults, environment: [:], hostedRuntime: runtime, coursesRootURL: root
+        )
+        XCTAssertTrue(store.prepareContextualCourseChat(for: course))
+        let reference = try XCTUnwrap(CourseTextReference(
+            courseID: course.id, pageID: "energy", pageTitle: "Energy",
+            selectedText: "ATP carries energy."
+        ))
+        guard case .open(let passage) = try store.beginSelectionDiscussion(
+            for: course, reference: reference
+        ) else {
+            return XCTFail("The passage should start its own discussion")
+        }
+        let appModel = AppModel()
+        let appState = AppState()
+        await store.prepareSelectionDiscussionThread(id: passage.id, appModel: appModel, appState: appState)
+
+        XCTAssertTrue(store.sendMessage(
+            "Explain ATP", selectionDiscussionID: passage.id, appModel: appModel, appState: appState
+        ))
+        await runtime.waitForSend()
+        for _ in 0..<200 where store.isAgentRequestPending(for: passage.id) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(runtime.lastRole, .discussion)
+        XCTAssertNotNil(store.selectionDiscussionErrors[passage.id])
+        XCTAssertEqual(store.courseBrief(for: course), plan)
+        XCTAssertFalse(store.showsBrief)
+        XCTAssertNil(AppleCoursePlanValidator.issue(in: try XCTUnwrap(runtime.emittedCoursePlan)))
+        XCTAssertNil(AppleCourseApprovalPolicy.presentedPlan(courseDirectory: directory))
+        XCTAssertTrue(store.chatViewOptions(selectionDiscussionID: passage.id).hidesPlanRows)
+        XCTAssertFalse(store.chatViewOptions(selectionDiscussionID: nil).hidesPlanRows)
+    }
+
+    func testApplePageDiscussionOnRootWithoutApprovedPlanUsesExactReadOnlyTarget() async throws {
+        guard #available(iOS 26.0, *) else {
+            throw XCTSkip("Apple course discussion dispatch requires iOS 26 or later.")
+        }
+        let defaults = try makeDefaults()
+        defaults.set(CourseAgentProvider.appleOnDevice, forKey: "snappy.course.selectedAgent")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ApplePageDiscussionReadOnly-\(UUID().uuidString)", isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        var pageCourse = makePageDiscussionCourse(id: "biology")
+        var mainCourse = makePageDiscussionCourse(id: "chemistry")
+        pageCourse.agentRuntimeKind = CourseAgentProvider.appleOnDevice
+        mainCourse.agentRuntimeKind = CourseAgentProvider.appleOnDevice
+        let mainSessionID = UUID()
+        mainCourse.appleSessionID = mainSessionID
+        _ = try writePageDiscussionCourseMetadata(pageCourse, root: root)
+        let mainPlan = try writePageDiscussionCourseMetadata(mainCourse, root: root)
+        let runtime = TestAppleCourseAgentRuntime()
+        let store = CourseExperienceStore(
+            defaults: defaults, environment: [:], appleRuntime: runtime, coursesRootURL: root
+        )
+        store.courses = [pageCourse, mainCourse]
+        let workspaceID = try XCTUnwrap(pageCourse.workspaceID)
+        let repository = try await CourseDocumentRegistry.shared.repository(
+            workspaceID: workspaceID,
+            databaseURL: store.courseDatabaseURL(workspaceID: workspaceID),
+            rootTitle: pageCourse.title
+        )
+        let rootPage = try await repository.rootPageSnapshot()
+        let targetURL = store.courseDatabaseURL(workspaceID: workspaceID)
+            .deletingLastPathComponent()
+            .appendingPathComponent(AppleCourseApprovalPolicy.lessonTargetFilename)
+        let unrelatedTarget = PreparedCourseLessonTarget(
+            nodeID: "another-lesson", pageID: "another-page", revision: 99, courseRole: "lesson"
+        )
+        let persistedTargetData = try JSONEncoder().encode(unrelatedTarget)
+        try persistedTargetData.write(to: targetURL)
+        XCTAssertNil(AppleCourseApprovalPolicy.approvedPlan(
+            courseDirectory: root.appendingPathComponent(workspaceID)
+        ))
+        XCTAssertTrue(store.prepareContextualCourseChat(for: mainCourse))
+        let mainMessages = [CourseChatMessage(role: .learner, text: "The chemistry course discussion")]
+        store.messages = mainMessages
+        let context = CoursePageChatContext(
+            pageID: rootPage.id, pageTitle: pageCourse.title, content: "The biology course overview"
+        )
+        let page = try store.beginPageDiscussion(for: pageCourse, context: context)
+        let appModel = AppModel()
+        let appState = AppState()
+        await store.prepareSelectionDiscussionThread(id: page.id, appModel: appModel, appState: appState)
+
+        XCTAssertTrue(store.sendMessage(
+            "What does this overview mean?", pageContext: context, selectionDiscussionID: page.id,
+            appModel: appModel, appState: appState
+        ))
+        for _ in 0..<200 where store.isAgentRequestPending(for: page.id) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let target = try XCTUnwrap(runtime.lastLessonTarget)
+        let pageSessionID = try XCTUnwrap(store.selectionDiscussion(id: page.id)?.appleSessionID)
+        let afterRoot = try await repository.rootPageSnapshot()
+
+        XCTAssertFalse(store.isAgentRequestPending(for: page.id))
+        XCTAssertNil(store.selectionDiscussionErrors[page.id])
+        XCTAssertEqual(target.pageID, rootPage.id)
+        XCTAssertEqual(target.revision, rootPage.revision)
+        XCTAssertEqual(target.isReadOnly, true)
+        XCTAssertNotEqual(target.pageID, unrelatedTarget.pageID)
+        XCTAssertNotEqual(pageSessionID, mainSessionID)
+        XCTAssertEqual(runtime.lastSessionID, pageSessionID)
+        XCTAssertTrue(try XCTUnwrap(runtime.lastPrompt).contains("page_id=\"\(rootPage.id)\""))
+        XCTAssertEqual(store.localMessages(for: page.id).last?.text, "A streamed Apple response.")
+        XCTAssertEqual(store.messages, mainMessages)
+        XCTAssertEqual(store.brief, mainPlan)
+        XCTAssertFalse(store.showsBrief)
+        XCTAssertEqual(
+            store.chatThreadKey(selectionDiscussionID: nil),
+            CourseExperienceStore.appleChatKey(sessionID: mainSessionID)
+        )
+        XCTAssertEqual(afterRoot.revision, rootPage.revision)
+        XCTAssertEqual(
+            AppFlowyMarkdownCodec().encode(afterRoot.document),
+            AppFlowyMarkdownCodec().encode(rootPage.document)
+        )
+        XCTAssertEqual(afterRoot.document.root.data, rootPage.document.root.data)
+        XCTAssertEqual(afterRoot.document.root.stableBlockID, rootPage.document.root.stableBlockID)
+        XCTAssertEqual(try Data(contentsOf: targetURL), persistedTargetData)
+    }
+
+    func testReadOnlyApplePageTargetExposesNoPlanningOrMutationTools() throws {
+        let target = PreparedCourseLessonTarget(
+            nodeID: "root", pageID: "root-page", revision: 1, isReadOnly: true
+        )
+        for provider in [CourseAgentProvider.appleOnDevice, CourseAgentProvider.applePrivateCloud] {
+            for hasApprovedPlan in [false, true] {
+                XCTAssertEqual(
+                    AppleCourseToolMode.forTurn(
+                        providerID: provider,
+                        hasApprovedPlan: hasApprovedPlan,
+                        learnerPrompt: "Edit this page and revise the course plan.",
+                        lessonTarget: target
+                    ),
+                    .discussion
+                )
+            }
+        }
+        XCTAssertFalse(AppleCourseToolMode.discussion.exposesPlanningTool)
+        guard #available(iOS 26.0, *) else {
+            throw XCTSkip("Foundation Models tool construction requires iOS 26 or later.")
+        }
+        let tools = try AppleCourseToolFactory.tools(
+            providerID: CourseAgentProvider.appleOnDevice,
+            workspaceID: "readonly-page-discussion",
+            mode: .discussion,
+            lessonTarget: target,
+            lessonValidationRetryGate: AppleCourseLessonValidationRetryGate(),
+            onCoursePlan: { _ in XCTFail("Read-only page discussions expose no course plan tool") }
+        )
+        XCTAssertTrue(tools.isEmpty)
+    }
+
+    func testAppleLessonTargetDecodesLegacyAbsenceOfReadOnlyFlag() throws {
+        let legacy = Data(#"{"nodeID":"lesson","pageID":"lesson-page","revision":4,"courseRole":"lesson"}"#.utf8)
+        let decoded = try JSONDecoder().decode(PreparedCourseLessonTarget.self, from: legacy)
+        XCTAssertNil(decoded.isReadOnly)
+        XCTAssertEqual(decoded.pageID, "lesson-page")
+        let readOnly = PreparedCourseLessonTarget(
+            nodeID: decoded.nodeID, pageID: decoded.pageID,
+            revision: decoded.revision, courseRole: decoded.courseRole, isReadOnly: true
+        )
+        XCTAssertEqual(
+            try JSONDecoder().decode(PreparedCourseLessonTarget.self, from: JSONEncoder().encode(readOnly)),
+            readOnly
+        )
+    }
+
+    private func makePageDiscussionCourse(id: String) -> LearningCourse {
+        LearningCourse(
+            id: id, title: id, subtitle: "Page discussion tests", accentHex: "00FF9C",
+            progress: 0, lessonCount: 2, duration: "10 minutes", status: .ready,
+            workspaceID: "\(id)-workspace"
+        )
+    }
+
+    private func writePageDiscussionCourseMetadata(
+        _ course: LearningCourse,
+        root: URL
+    ) throws -> CourseBrief {
+        let directory = root.appendingPathComponent(try XCTUnwrap(course.workspaceID), isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var brief = CourseBrief()
+        brief.planID = "\(course.id)-plan"
+        brief.title = course.title
+        try JSONEncoder().encode(brief).write(to: directory.appendingPathComponent("course.json"))
+        return brief
     }
 
     private struct HermesAbandonmentFixture {
@@ -1080,7 +1805,7 @@ final class CourseExperienceStoreTests: XCTestCase {
         await store.recoverReadyCourses(in: coursesRoot)
 
         XCTAssertEqual(store.courses.count, 1)
-        XCTAssertEqual(store.courses.first?.id, "recovered-swift")
+        XCTAssertEqual(store.courses.first?.id, "course-\(workspaceID)")
         XCTAssertEqual(store.courses.first?.workspaceID, workspaceID)
         XCTAssertNotNil(defaults.data(forKey: "snappy.course.savedCourses"))
     }
@@ -4805,7 +5530,11 @@ final class CourseExperienceStoreTests: XCTestCase {
         }
     }
 
-    func testLiveCodexReadinessFailsClosedWhenProviderConfigurationCannotBeRead() async {
+    func testLiveCodexReadinessFailsClosedWhenProviderConfigurationCannotBeRead() async throws {
+        try XCTSkipIf(
+            CourseRuntimePaths.currentFileSystem == .nativeMac,
+            "Installed Mac Codex owns its configuration and does not read the iPhone provider Keychain."
+        )
         let probe = LiveCourseAgentReadinessProbe(
             configurationLoader: ThrowingCourseCodexProviderConfigurationLoader()
         )
@@ -5495,7 +6224,8 @@ final class CourseExperienceStoreTests: XCTestCase {
             forKey: "learnfold.course.activeDraftSources"
         )
         let fakeStore = QueuedTurnAppStore(serverID: serverID)
-        let appModel = AppModel(store: fakeStore)
+        let fakeClient = SavedDiscussionReadAppClient()
+        let appModel = AppModel(store: fakeStore, client: fakeClient)
         await appModel.refreshSnapshot()
         let store = CourseExperienceStore(
             defaults: defaults,
@@ -5512,6 +6242,8 @@ final class CourseExperienceStoreTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
 
+        XCTAssertEqual(fakeClient.resumeRequests.map(\.threadId), [threadID])
+        XCTAssertEqual(fakeClient.resumeRequests.map(\.model), [nil])
         XCTAssertEqual(fakeStore.startTurnCount, 1)
         XCTAssertFalse(store.isAgentRequestPending)
         XCTAssertEqual(store.mainSubmissionRecoveryState, .acceptanceUnknown)
@@ -7842,12 +8574,19 @@ final class CourseExperienceStoreTests: XCTestCase {
 
         // Codex proposes plans as `learnfold-plan` reply blocks.
         XCTAssertFalse(names.contains(CourseAgentTools.presentPlan))
-        XCTAssertTrue(names.contains(CourseAgentTools.courseBash))
+        XCTAssertEqual(
+            names.contains(CourseAgentTools.courseBash),
+            CourseRuntimePaths.currentFileSystem != .nativeMac
+        )
         XCTAssertTrue(names.contains("native-editor-fetch"))
         XCTAssertTrue(names.contains("native-editor-update-page"))
     }
 
     func testCourseMCPExecutesCourseBashAgainstLiveWorkspace() async throws {
+        try XCTSkipIf(
+            CourseRuntimePaths.currentFileSystem == .nativeMac,
+            "Mac Codex uses its native shell; course_bash is an iPhone tool."
+        )
         let workspaceID = "mcp-bash-\(UUID().uuidString)"
         let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Apps/Courses/\(workspaceID)", isDirectory: true)
@@ -9142,6 +9881,51 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
     }
 
+    func testBoundSelectionDiscussionPreservesModelWhenThreadModelIsUnknown() throws {
+        for authoritativeModelID in [nil, "", " \t\n "] as [String?] {
+            XCTAssertEqual(
+                try CourseExperienceStore.reconciledDiscussionModelID(
+                    boundModelID: "  gpt-5.6-sol\n",
+                    authoritativeModelID: authoritativeModelID
+                ),
+                "gpt-5.6-sol"
+            )
+        }
+    }
+
+    func testBoundSelectionDiscussionAcceptsNormalizedAuthoritativeModelMatch() throws {
+        XCTAssertEqual(
+            try CourseExperienceStore.reconciledDiscussionModelID(
+                boundModelID: "  gpt-5.6-sol\n",
+                authoritativeModelID: "\tgpt-5.6-sol "
+            ),
+            "gpt-5.6-sol"
+        )
+    }
+
+    func testUnboundSelectionDiscussionAdoptsNormalizedAuthoritativeModel() throws {
+        for boundModelID in [nil, "", " \t\n "] as [String?] {
+            XCTAssertEqual(
+                try CourseExperienceStore.reconciledDiscussionModelID(
+                    boundModelID: boundModelID,
+                    authoritativeModelID: "  gpt-5.6-sol\n"
+                ),
+                "gpt-5.6-sol"
+            )
+        }
+    }
+
+    func testUnboundSelectionDiscussionKeepsUnknownModelUnset() throws {
+        for boundModelID in [nil, "", " \t\n "] as [String?] {
+            for authoritativeModelID in [nil, "", " \t\n "] as [String?] {
+                XCTAssertNil(try CourseExperienceStore.reconciledDiscussionModelID(
+                    boundModelID: boundModelID,
+                    authoritativeModelID: authoritativeModelID
+                ))
+            }
+        }
+    }
+
     func testBoundSelectionDiscussionRejectsAuthoritativeModelMismatch() {
         XCTAssertThrowsError(
             try CourseExperienceStore.reconciledDiscussionModelID(
@@ -9154,6 +9938,268 @@ final class CourseExperienceStoreTests: XCTestCase {
                 .modelMismatch(bound: "gpt-5.6", authoritative: "gpt-5.7")
             )
         }
+    }
+
+    func testColdLaunchReopensBoundCodexDiscussionWithoutThreadModel() async throws {
+        let fixture = try makeSavedCodexDiscussionFixture(authoritativeModelID: nil)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let key = try XCTUnwrap(fixture.store.selectionDiscussionThreadKey(id: fixture.discussion.id))
+        XCTAssertEqual(fixture.store.selectionDiscussion(id: fixture.discussion.id), fixture.discussion)
+        XCTAssertNil(fixture.appModel.snapshot)
+
+        await fixture.store.prepareSelectionDiscussionThread(
+            id: fixture.discussion.id,
+            appModel: fixture.appModel,
+            appState: AppState()
+        )
+
+        XCTAssertEqual(fixture.client.readRequests.map(\.threadId), [key.threadId])
+        XCTAssertEqual(fixture.client.readRequests.map(\.includeTurns), [true])
+        XCTAssertEqual(fixture.store.selectionDiscussion(id: fixture.discussion.id), fixture.discussion)
+        XCTAssertEqual(fixture.store.selectionDiscussionThreadKey(id: fixture.discussion.id), key)
+        XCTAssertEqual(fixture.store.connectionState(for: fixture.discussion.id), .connected)
+        XCTAssertNil(fixture.store.selectionDiscussionErrors[fixture.discussion.id])
+        let restoredThread = try XCTUnwrap(fixture.appModel.threadSnapshot(for: key))
+        XCTAssertNil(restoredThread.model)
+        XCTAssertNil(restoredThread.info.model)
+        XCTAssertEqual(restoredThread.hydratedConversationItems, fixture.thread.hydratedConversationItems)
+        XCTAssertNil(fixture.appModel.snapshot?.activeThread)
+
+        let relaunched = CourseExperienceStore(
+            defaults: fixture.defaults, environment: [:], coursesRootURL: fixture.root
+        )
+        XCTAssertEqual(relaunched.selectionDiscussion(id: fixture.discussion.id), fixture.discussion)
+    }
+
+    func testBoundCodexDiscussionShowsConfirmedModelMismatchWithoutReplacingBinding() async throws {
+        let fixture = try makeSavedCodexDiscussionFixture(authoritativeModelID: "gpt-6.1-sol")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let key = try XCTUnwrap(fixture.store.selectionDiscussionThreadKey(id: fixture.discussion.id))
+        let expectedError = CourseSelectionDiscussionTargetError.modelMismatch(
+            bound: "gpt-5.6-sol", authoritative: "gpt-6.1-sol"
+        ).localizedDescription
+
+        await fixture.store.prepareSelectionDiscussionThread(
+            id: fixture.discussion.id,
+            appModel: fixture.appModel,
+            appState: AppState()
+        )
+
+        XCTAssertEqual(fixture.store.selectionDiscussionErrors[fixture.discussion.id], expectedError)
+        XCTAssertEqual(fixture.store.connectionState(for: fixture.discussion.id), .failed(expectedError))
+        XCTAssertEqual(fixture.store.selectionDiscussion(id: fixture.discussion.id), fixture.discussion)
+        XCTAssertEqual(fixture.store.selectionDiscussionThreadKey(id: fixture.discussion.id), key)
+        XCTAssertEqual(fixture.client.readRequests.map(\.threadId), [key.threadId])
+        XCTAssertEqual(
+            fixture.appModel.threadSnapshot(for: key)?.hydratedConversationItems,
+            fixture.thread.hydratedConversationItems
+        )
+        XCTAssertFalse(fixture.store.selectionDiscussionHasMissingBoundThread(id: fixture.discussion.id))
+    }
+
+    func testResumedCodexDiscussionRejectsModelMismatchBeforeDispatchAndKeepsDraft() async throws {
+        let fixture = try makeSavedCodexDiscussionFixture(
+            authoritativeModelID: nil, resumedModelID: "gpt-6.1-sol"
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let discussionID = fixture.discussion.id
+        let key = try XCTUnwrap(fixture.store.selectionDiscussionThreadKey(id: discussionID))
+        await fixture.store.prepareSelectionDiscussionThread(
+            id: discussionID, appModel: fixture.appModel, appState: AppState()
+        )
+        XCTAssertEqual(fixture.store.connectionState(for: discussionID), .connected)
+        XCTAssertNil(fixture.appModel.threadSnapshot(for: key)?.model)
+        let question = "Which genes are switched on?"
+        fixture.store.saveDraft(question, for: discussionID)
+
+        XCTAssertTrue(fixture.store.sendMessage(
+            question, selectionDiscussionID: discussionID,
+            appModel: fixture.appModel, appState: AppState()
+        ))
+        for _ in 0..<300 where fixture.store.isAgentRequestPending(for: discussionID) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        let expectedError = CourseSelectionDiscussionTargetError.modelMismatch(
+            bound: "gpt-5.6-sol", authoritative: "gpt-6.1-sol"
+        ).localizedDescription
+        XCTAssertFalse(fixture.store.isAgentRequestPending(for: discussionID))
+        XCTAssertEqual(fixture.client.resumeRequests.map(\.threadId), [key.threadId])
+        XCTAssertEqual(fixture.client.resumeRequests.map(\.model), [nil])
+        XCTAssertEqual(fixture.appStore.startTurnCount, 0)
+        XCTAssertEqual(fixture.store.selectionDiscussionErrors[discussionID], expectedError)
+        XCTAssertEqual(fixture.store.submissionRecoveryState(for: discussionID), .knownNotAccepted)
+        XCTAssertEqual(fixture.store.selectionDiscussionDrafts[discussionID], question)
+        XCTAssertTrue(fixture.store.localMessages(for: discussionID).isEmpty)
+        XCTAssertEqual(fixture.store.selectionDiscussion(id: discussionID), fixture.discussion)
+        XCTAssertEqual(fixture.store.selectionDiscussionThreadKey(id: discussionID), key)
+        let authoritativeThread = try await fixture.appStore.threadSnapshot(key: key)
+        XCTAssertEqual(authoritativeThread?.model, "gpt-6.1-sol")
+        XCTAssertEqual(authoritativeThread?.hydratedConversationItems, fixture.thread.hydratedConversationItems)
+
+        let relaunched = CourseExperienceStore(
+            defaults: fixture.defaults, environment: [:], coursesRootURL: fixture.root
+        )
+        XCTAssertEqual(relaunched.selectionDiscussion(id: discussionID), fixture.discussion)
+        XCTAssertEqual(relaunched.selectionDiscussionDrafts[discussionID], question)
+        XCTAssertEqual(relaunched.submissionRecoveryState(for: discussionID), .knownNotAccepted)
+    }
+
+    func testResumedCodexDiscussionWithMatchingModelDispatchesWithoutModelOverride() async throws {
+        let fixture = try makeSavedCodexDiscussionFixture(
+            authoritativeModelID: nil, resumedModelID: "gpt-5.6-sol"
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let discussionID = fixture.discussion.id
+        let key = try XCTUnwrap(fixture.store.selectionDiscussionThreadKey(id: discussionID))
+        await fixture.store.prepareSelectionDiscussionThread(
+            id: discussionID, appModel: fixture.appModel, appState: AppState()
+        )
+
+        XCTAssertTrue(fixture.store.sendMessage(
+            "Which genes are switched on?", selectionDiscussionID: discussionID,
+            appModel: fixture.appModel, appState: AppState()
+        ))
+        for _ in 0..<300 where fixture.store.isAgentRequestPending(for: discussionID) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertFalse(fixture.store.isAgentRequestPending(for: discussionID))
+        XCTAssertEqual(fixture.client.resumeRequests.map(\.threadId), [key.threadId])
+        XCTAssertEqual(fixture.client.resumeRequests.map(\.model), [nil])
+        XCTAssertEqual(fixture.appStore.startTurnCount, 1)
+        XCTAssertEqual(fixture.appStore.startTurnRequests.map(\.model), [nil])
+        XCTAssertEqual(fixture.store.selectionDiscussion(id: discussionID), fixture.discussion)
+        XCTAssertEqual(fixture.store.selectionDiscussionThreadKey(id: discussionID), key)
+        // The queued fake receipt ends the test after dispatch, before response
+        // hydration; its existing unknown-delivery policy stays unchanged.
+        XCTAssertEqual(fixture.store.submissionRecoveryState(for: discussionID), .acceptanceUnknown)
+    }
+
+    private func makeSavedCodexDiscussionFixture(
+        authoritativeModelID: String?,
+        resumedModelID: String? = nil
+    ) throws -> (
+        store: CourseExperienceStore,
+        defaults: UserDefaults,
+        root: URL,
+        discussion: CourseSelectionDiscussion,
+        appModel: AppModel,
+        appStore: QueuedTurnAppStore,
+        client: SavedDiscussionReadAppClient,
+        thread: AppThreadSnapshot
+    ) {
+        let defaults = try makeDefaults()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "SavedCodexDiscussion-\(UUID().uuidString)", isDirectory: true
+        )
+        let serverID = "saved-codex-server-\(UUID().uuidString)"
+        let key = ThreadKey(serverId: serverID, threadId: UUID().uuidString)
+        var course = makePageDiscussionCourse(id: "saved-codex-course-\(UUID().uuidString)")
+        course.agentRuntimeKind = CourseAgentProvider.codex
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent(try XCTUnwrap(course.workspaceID), isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let reference = try XCTUnwrap(CourseTextReference(
+            courseID: course.id,
+            pageID: "cells",
+            pageTitle: "Cells",
+            selectedText: "Nearly all cells contain the same genes."
+        ))
+        var discussion = CourseSelectionDiscussion(
+            reference: reference,
+            target: CourseAgentExecutionTarget(
+                runtimeID: CourseAgentProvider.codex,
+                serverID: serverID,
+                modelID: "gpt-5.6-sol"
+            )
+        )
+        discussion.threadID = key.threadId
+        defaults.set(try JSONEncoder().encode([course]), forKey: "snappy.course.savedCourses")
+        defaults.set(
+            try JSONEncoder().encode([discussion]), forKey: "snappy.course.selectionDiscussions"
+        )
+        let transcript = [
+            HydratedConversationItem(
+                id: "saved-question",
+                content: .user(HydratedUserMessageData(text: "Are the genes different?", imageDataUris: [])),
+                sourceTurnId: "saved-turn",
+                sourceTurnIndex: 0,
+                timestamp: nil,
+                isFromUserTurnBoundary: true
+            ),
+            HydratedConversationItem(
+                id: "saved-answer",
+                content: .assistant(HydratedAssistantMessageData(
+                    text: "Usually, the genes are not different.",
+                    agentNickname: nil,
+                    agentRole: nil,
+                    phase: nil
+                )),
+                sourceTurnId: "saved-turn",
+                sourceTurnIndex: 0,
+                timestamp: nil,
+                isFromUserTurnBoundary: false
+            ),
+        ]
+        let thread = AppThreadSnapshot(
+            key: key,
+            info: ThreadInfo(
+                id: key.threadId,
+                title: "Cells discussion",
+                model: nil,
+                status: .idle,
+                preview: "Are the genes different?",
+                cwd: "/tmp",
+                path: nil,
+                modelProvider: nil,
+                agentNickname: nil,
+                agentRole: nil,
+                parentThreadId: nil,
+                forkedFromId: nil,
+                agentStatus: nil,
+                createdAt: nil,
+                updatedAt: nil
+            ),
+            agentRuntimeKind: CourseAgentProvider.codex,
+            collaborationMode: .default,
+            model: authoritativeModelID,
+            reasoningEffort: nil,
+            effectiveApprovalPolicy: .never,
+            effectiveSandboxPolicy: .dangerFullAccess,
+            hydratedConversationItems: transcript,
+            queuedFollowUps: [],
+            activeTurnId: nil,
+            activePlanProgress: nil,
+            pendingPlanImplementationPrompt: nil,
+            contextTokensUsed: nil,
+            modelContextWindow: nil,
+            rateLimits: nil,
+            realtimeSessionId: nil,
+            goal: nil,
+            stats: nil,
+            tokenUsage: nil,
+            olderTurnsCursor: nil,
+            initialTurnsLoaded: true
+        )
+        let appStore = QueuedTurnAppStore(serverID: serverID, threads: [thread])
+        var resumedThread = thread
+        resumedThread.model = resumedModelID
+        let snapshotAfterResume = resumedThread
+        let client = SavedDiscussionReadAppClient(onResume: {
+            appStore.replaceThreadSnapshot(snapshotAfterResume)
+        })
+        return (
+            CourseExperienceStore(defaults: defaults, environment: [:], coursesRootURL: root),
+            defaults,
+            root,
+            discussion,
+            AppModel(store: appStore, client: client),
+            appStore,
+            client,
+            thread
+        )
     }
 
     func testRemovingSelectionSourceDeletesFromDiscussionWorkspace() throws {
@@ -9632,6 +10678,170 @@ final class CourseExperienceStoreTests: XCTestCase {
             summaryHasActiveTurn: false,
             threadHasActiveTurn: false
         ))
+    }
+
+    func testAcceptedLessonHydrationIgnoresInitialIdleUntilExactTurnCompletes() async throws {
+        let store = CourseExperienceStore(defaults: try makeDefaults(), environment: [:])
+        let reads = expectation(description: "Accepted turn reconciled while still in progress")
+        reads.expectedFulfillmentCount = 3
+        let client = CorrelatedCourseTurnAppClient(
+            expectedTurnID: "accepted-lesson", status: .inProgress,
+            onInitialRead: { reads.fulfill() }
+        )
+        let appModel = AppModel(client: client)
+        let key = ThreadKey(serverId: "correlation-fixture", threadId: UUID().uuidString)
+        appModel.store.ingestSourceEvents(key: key, source: .hosted, events: [
+            .turnAccepted(clientMsgId: nil, turnId: "previous-turn"),
+            .turnStarted(turnId: "previous-turn"),
+            .turnSettled(outcome: .completed),
+        ])
+        let initialChat = appModel.store.subscribeChat(key: key)
+        guard case .snapshot(_, let initialPhase, _, _, _, _) = try await initialChat.nextUpdate() else {
+            return XCTFail("Expected an initial resting chat snapshot")
+        }
+        XCTAssertFalse(initialPhase.isActive)
+        initialChat.resync()
+        var finished = false
+        let hydration = Task { @MainActor in
+            defer { finished = true }
+            try await store.hydrateAgentResponseForTesting(
+                key: key, expectedTurnID: "accepted-lesson", appModel: appModel
+            )
+        }
+        defer { hydration.cancel() }
+
+        await fulfillment(of: [reads], timeout: 3)
+        XCTAssertFalse(finished, "An old idle snapshot must not finish the accepted lesson turn")
+        XCTAssertTrue(store.messages.isEmpty)
+        client.finish(status: .completed)
+        // No new chat event: periodic reconciliation must also recover a
+        // completion notification lost during a reconnect.
+        try await hydration.value
+        XCTAssertTrue(finished)
+        XCTAssertNil(store.agentError)
+    }
+
+    func testAcceptedLessonHydrationKeepsUnknownTurnOwnedAcrossFailedAndMissingReads() async throws {
+        let store = CourseExperienceStore(defaults: try makeDefaults(), environment: [:])
+        let reads = expectation(description: "Failed reads and a missing accepted turn reconciled")
+        reads.expectedFulfillmentCount = 3
+        let client = CorrelatedCourseTurnAppClient(
+            expectedTurnID: "accepted-unknown", status: nil, failingReadCount: 2,
+            onInitialRead: { reads.fulfill() }
+        )
+        let appModel = AppModel(client: client)
+        let key = ThreadKey(serverId: "correlation-fixture", threadId: UUID().uuidString)
+        appModel.store.ingestSourceEvents(key: key, source: .hosted, events: [
+            .turnAccepted(clientMsgId: nil, turnId: "previous-turn"),
+            .turnStarted(turnId: "previous-turn"),
+            .turnSettled(outcome: .completed),
+        ])
+        var finished = false
+        let hydration = Task { @MainActor in
+            defer { finished = true }
+            try await store.hydrateAgentResponseForTesting(
+                key: key, expectedTurnID: "accepted-unknown", appModel: appModel
+            )
+        }
+        defer { hydration.cancel() }
+
+        await fulfillment(of: [reads], timeout: 3)
+        XCTAssertFalse(finished, "An unknown accepted turn must keep waiting, without enabling a duplicate retry")
+        XCTAssertNil(store.agentError)
+        client.finish(status: .completed)
+        try await hydration.value
+        XCTAssertTrue(finished)
+    }
+
+    func testAcceptedLessonHydrationPropagatesExactTerminalFailure() async throws {
+        let store = CourseExperienceStore(defaults: try makeDefaults(), environment: [:])
+        let reads = expectation(description: "Exact accepted turn checked")
+        let client = CorrelatedCourseTurnAppClient(
+            expectedTurnID: "accepted-failed", status: .failed, observedReadCount: 1,
+            onInitialRead: { reads.fulfill() }
+        )
+        let appModel = AppModel(client: client)
+        do {
+            try await store.hydrateAgentResponseForTesting(
+                key: ThreadKey(serverId: "correlation-fixture", threadId: UUID().uuidString),
+                expectedTurnID: "accepted-failed", appModel: appModel
+            )
+            XCTFail("A failed accepted turn must not report successful completion")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "The accepted lesson turn failed.")
+        }
+        await fulfillment(of: [reads], timeout: 3)
+    }
+
+    func testAcceptedLessonHydrationSurvivesClosedChatSubscription() async throws {
+        let store = CourseExperienceStore(defaults: try makeDefaults(), environment: [:])
+        let reads = expectation(description: "Authoritative reconciliation survives a closed event subscription")
+        reads.expectedFulfillmentCount = 3
+        let client = CorrelatedCourseTurnAppClient(
+            expectedTurnID: "accepted-disconnected", status: nil,
+            onInitialRead: { reads.fulfill() }
+        )
+        let appModel = AppModel(store: ClosedLessonChatAppStore(), client: client)
+        var finished = false
+        let hydration = Task { @MainActor in
+            defer { finished = true }
+            try await store.hydrateAgentResponseForTesting(
+                key: ThreadKey(serverId: "correlation-fixture", threadId: UUID().uuidString),
+                expectedTurnID: "accepted-disconnected", appModel: appModel
+            )
+        }
+        defer { hydration.cancel() }
+
+        await fulfillment(of: [reads], timeout: 3)
+        XCTAssertFalse(finished, "A closed event subscription cannot release an unknown accepted turn")
+        client.finish(status: .completed)
+        try await hydration.value
+        XCTAssertTrue(finished)
+    }
+
+    func testCorrelatedLessonTerminalStateRejectsOldCompletedAndExpectedRunningTurns() {
+        let previous = AppTurnState(turnId: "previous-turn", status: .completed, errorMessage: nil)
+        let running = AppTurnState(turnId: "accepted-turn", status: .inProgress, errorMessage: nil)
+        XCTAssertNil(CourseAgentHydrationPolicy.correlatedTerminalTurn(
+            expectedTurnID: "accepted-turn", authoritativeTurns: [previous]
+        ))
+        XCTAssertNil(CourseAgentHydrationPolicy.correlatedTerminalTurn(
+            expectedTurnID: "accepted-turn", authoritativeTurns: [previous, running]
+        ))
+        let completed = AppTurnState(turnId: "accepted-turn", status: .completed, errorMessage: nil)
+        XCTAssertEqual(CourseAgentHydrationPolicy.correlatedTerminalTurn(
+            expectedTurnID: "accepted-turn", authoritativeTurns: [previous, completed]
+        ), completed)
+    }
+
+    func testGeneratedLessonReadinessRequiresSavedContentAndCompletedStatus() throws {
+        func snapshot(status: String, blocks: [BlockNode]) throws -> NativeEditorPageSnapshot {
+            var workspace = PageWorkspace(rootTitle: "Lesson readiness")
+            var document = BlockDocument(root: BlockNode(type: "page", children: blocks))
+            document.root.data["course_generation_status"] = .string(status)
+            let page = try workspace.createPage(
+                title: "Next lesson", parentID: workspace.rootPageID, document: document
+            )
+            return NativeEditorPageSnapshot(page: page, revision: 1)
+        }
+        XCTAssertFalse(CourseExperienceStore.generatedLessonIsReady(try snapshot(
+            status: "pending_generation", blocks: [.paragraph("Saved draft content")]
+        )))
+        XCTAssertFalse(CourseExperienceStore.generatedLessonIsReady(try snapshot(
+            status: "generated", blocks: []
+        )))
+        XCTAssertFalse(CourseExperienceStore.generatedLessonIsReady(try snapshot(
+            status: "generated", blocks: [.paragraph(" \n "), .code("", language: "swift")]
+        )))
+        XCTAssertFalse(CourseExperienceStore.generatedLessonIsReady(try snapshot(
+            status: "generated", blocks: [.childPage(pageID: "branch", title: "Branch title")]
+        )))
+        XCTAssertTrue(CourseExperienceStore.generatedLessonIsReady(try snapshot(
+            status: "generated", blocks: [.paragraph("The saved lesson explanation.")]
+        )))
+        XCTAssertTrue(CourseExperienceStore.generatedLessonIsReady(try snapshot(
+            status: "generated", blocks: [.html("<p>A complete interactive lesson.</p>")]
+        )))
     }
 
     func testRemoteHermesIdlePolicyUsesAuthoritativeTurnsWhenSnapshotIsMissingOrStale() {
@@ -10441,7 +11651,9 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertTrue(instructions.contains("A selected-passage question"))
         XCTAssertTrue(instructions.contains("Answer only in chat"))
         XCTAssertTrue(instructions.contains("Add or revise a focused section"))
-        XCTAssertTrue(instructions.contains("Create an `explainer` child page"))
+        XCTAssertTrue(instructions.contains("Fork an exploration"))
+        XCTAssertTrue(instructions.contains("set properties `course_role` to `explainer`"))
+        XCTAssertTrue(instructions.contains("The approved plan is only a suggested route"))
         XCTAssertTrue(instructions.contains("Do not edit merely because editing tools are available"))
         XCTAssertTrue(instructions.contains("expected_revision"))
         XCTAssertTrue(instructions.contains("Never create Markdown lesson files"))
@@ -10940,7 +12152,7 @@ final class CourseExperienceStoreTests: XCTestCase {
     }
 
     @MainActor
-    func testGenerationControlResolvesAppleFolderToLeafRegistryAndOverlay() throws {
+    func testGenerationControlResolvesEveryRuntimeFolderToLeafRegistryAndOverlay() throws {
         let pendingLesson = CourseLearningNode(
             id: "lesson-2",
             title: "1.2 · Guided exercise",
@@ -11003,11 +12215,11 @@ final class CourseExperienceStoreTests: XCTestCase {
             of: stalePendingChapter,
             runtimeID: CourseAgentProvider.appleOnDevice
         ))
-        XCTAssertTrue(CourseExperienceStore.allowsDirectGeneration(
+        XCTAssertFalse(CourseExperienceStore.allowsDirectGeneration(
             of: legacyEmptyChapter,
             runtimeID: CourseAgentProvider.codex
         ))
-        XCTAssertTrue(CourseExperienceStore.allowsDirectGeneration(
+        XCTAssertFalse(CourseExperienceStore.allowsDirectGeneration(
             of: legacyEmptyChapter,
             runtimeID: "hermes"
         ))
@@ -11023,7 +12235,7 @@ final class CourseExperienceStoreTests: XCTestCase {
                 for: pendingChapter,
                 runtimeID: CourseAgentProvider.codex
             ),
-            pendingChapter
+            pendingLesson
         )
         XCTAssertNil(
             CourseExperienceStore.directGenerationTarget(
@@ -11049,6 +12261,23 @@ final class CourseExperienceStoreTests: XCTestCase {
             "Generate next in Chapter Foundations: Lesson 1.2 · Guided exercise"
         )
         XCTAssertTrue(request.accessibilityHint.contains("first pending page"))
+
+        for runtimeID in [CourseAgentProvider.codex, CourseAgentProvider.hosted, "hermes"] {
+            let request = try XCTUnwrap(CourseExperienceStore.directGenerationRequest(
+                for: pendingChapter, runtimeID: runtimeID
+            ))
+            XCTAssertEqual(request.target, pendingLesson)
+            XCTAssertEqual(request.controlTitle, "Generate next")
+            XCTAssertFalse(CourseExperienceStore.allowsDirectGeneration(
+                of: stalePendingChapter, runtimeID: runtimeID
+            ))
+        }
+        var partiallyGeneratedChapter = pendingChapter
+        partiallyGeneratedChapter.status = .partiallyGenerated
+        partiallyGeneratedChapter.children = [generatedLesson, pendingLesson]
+        XCTAssertEqual(CourseExperienceStore.directGenerationTarget(
+            for: partiallyGeneratedChapter, runtimeID: CourseAgentProvider.codex
+        ), pendingLesson)
 
         var registry = CourseBackgroundGenerationRegistry()
         let entry = try XCTUnwrap(registry.begin(
@@ -11366,6 +12595,11 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertTrue(prompt.contains("work autonomously without asking for confirmation"))
         XCTAssertTrue(prompt.contains("complete approved hierarchy"))
         XCTAssertTrue(prompt.contains("mark and update only that existing page"))
+        XCTAssertTrue(prompt.contains("properties.generation_status=generated together in the same native-editor-update-page call"))
+        XCTAssertTrue(prompt.contains("Fetch the exact page again and verify both the lesson content"))
+        XCTAssertTrue(prompt.contains("poll native-editor-get-async-task until the mutation completes"))
+        XCTAssertTrue(prompt.contains("learnfold_generate_lesson"))
+        XCTAssertTrue(prompt.contains("Never report success from a chat reply alone"))
         XCTAssertTrue(prompt.contains("Never create, recreate, reorder, or extend the hierarchy"))
         XCTAssertTrue(prompt.contains("Never create a missing planned page yourself"))
         XCTAssertTrue(prompt.contains("stop and report that the course shell must be repaired"))
@@ -18518,6 +19752,7 @@ private struct PersistedWorkspaceComposerDraftProbe: Decodable {
 
 @MainActor
 private final class TestAppleCourseAgentRuntime: AppleCourseAgentRuntime {
+    private(set) var lastSessionID: UUID?
     var lastProviderID: String?
     var lastPrompt: String?
     var lastLessonTarget: PreparedCourseLessonTarget?
@@ -18559,6 +19794,7 @@ private final class TestAppleCourseAgentRuntime: AppleCourseAgentRuntime {
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws {
+        lastSessionID = sessionID
         lastProviderID = providerID
         lastPrompt = prompt
         lastLessonTarget = lessonTarget
@@ -18708,15 +19944,30 @@ private final class HermesSnapshotAppStore: AppStore, @unchecked Sendable {
 }
 
 private final class QueuedTurnAppStore: AppStore, @unchecked Sendable {
-    private let snapshotRecord: AppSnapshotRecord
+    private var snapshotRecord: AppSnapshotRecord
     private let countLock = NSLock()
     private var recordedStartTurnCount = 0
+    private var recordedStartTurnRequests: [AppStartTurnRequest] = []
 
     var startTurnCount: Int {
         countLock.withLock { recordedStartTurnCount }
     }
 
-    init(serverID: String) {
+    var startTurnRequests: [AppStartTurnRequest] {
+        countLock.withLock { recordedStartTurnRequests }
+    }
+
+    func replaceThreadSnapshot(_ thread: AppThreadSnapshot) {
+        countLock.withLock {
+            if let index = snapshotRecord.threads.firstIndex(where: { $0.key == thread.key }) {
+                snapshotRecord.threads[index] = thread
+            } else {
+                snapshotRecord.threads.append(thread)
+            }
+        }
+    }
+
+    init(serverID: String, threads: [AppThreadSnapshot] = []) {
         let server = AppServerSnapshot(
             serverId: serverID,
             displayName: "Remote Codex",
@@ -18752,7 +20003,7 @@ private final class QueuedTurnAppStore: AppStore, @unchecked Sendable {
         )
         snapshotRecord = AppSnapshotRecord(
             servers: [server],
-            threads: [],
+            threads: threads,
             sessionSummaries: [],
             agentDirectoryVersion: 0,
             activeThread: nil,
@@ -18790,7 +20041,11 @@ private final class QueuedTurnAppStore: AppStore, @unchecked Sendable {
     }
 
     override func snapshot() async throws -> AppSnapshotRecord {
-        snapshotRecord
+        countLock.withLock { snapshotRecord }
+    }
+
+    override func threadSnapshot(key: ThreadKey) async throws -> AppThreadSnapshot? {
+        countLock.withLock { snapshotRecord.threads.first(where: { $0.key == key }) }
     }
 
     override func startTurn(
@@ -18799,6 +20054,7 @@ private final class QueuedTurnAppStore: AppStore, @unchecked Sendable {
     ) async throws -> AppTurnSubmissionReceipt {
         countLock.withLock {
             recordedStartTurnCount += 1
+            recordedStartTurnRequests.append(params)
         }
         return AppTurnSubmissionReceipt(kind: .queued, turnId: nil)
     }
@@ -19871,9 +21127,14 @@ private final class SuspendingHostedCourseRuntime: HostedCourseAgentRuntime {
     var restoreError: Error?
     var sendError: Error?
     var finalResponse: String? = "Let's start with percentages."
+    var emittedCoursePlan: CourseBrief?
     private(set) var restoreCount = 0
+    private(set) var lastRestoredSessionID: UUID?
+    private(set) var lastSessionID: UUID?
+    private(set) var lastPrompt: String?
     private(set) var lastCourseDirectory: URL?
     private(set) var lastMessageID: UUID?
+    private(set) var lastRole: CourseAgentThreadRole?
     private var restoreContinuation: CheckedContinuation<Void, Never>?
     private var sendContinuation: CheckedContinuation<Void, Never>?
     private var restoreWaiter: CheckedContinuation<Void, Never>?
@@ -19890,6 +21151,7 @@ private final class SuspendingHostedCourseRuntime: HostedCourseAgentRuntime {
 
     func restoredMessages(sessionID: UUID) async throws -> [HostedCourseAgentStoredMessage] {
         restoreCount += 1
+        lastRestoredSessionID = sessionID
         restoreWaiter?.resume()
         restoreWaiter = nil
         let snapshot = restored
@@ -19904,12 +21166,16 @@ private final class SuspendingHostedCourseRuntime: HostedCourseAgentRuntime {
         courseDirectory: URL,
         prompt: String,
         messageID: UUID?,
+        role: CourseAgentThreadRole,
         onRecoveringChanged: @escaping @MainActor (Bool) -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws {
+        lastSessionID = sessionID
+        lastPrompt = prompt
         lastCourseDirectory = courseDirectory
         lastMessageID = messageID
+        lastRole = role
         recoveryChanged = onRecoveringChanged
         partialResponse = onPartialResponse
         defer { partialResponse = nil }
@@ -19917,6 +21183,7 @@ private final class SuspendingHostedCourseRuntime: HostedCourseAgentRuntime {
         sendWaiter?.resume()
         sendWaiter = nil
         if !sendReleased { await withCheckedContinuation { sendContinuation = $0 } }
+        if let emittedCoursePlan { try await onCoursePlan(emittedCoursePlan) }
         if let finalResponse { onPartialResponse(finalResponse) }
         if let sendError { throw sendError }
     }
@@ -19946,4 +21213,261 @@ private final class SuspendingHostedCourseRuntime: HostedCourseAgentRuntime {
     }
 
     func cancel(sessionID: UUID) { finishSend() }
+}
+
+/// Check Status settles an interrupted submission from the refreshed
+/// transcript instead of reporting it as unconfirmed forever.
+@MainActor
+final class CourseSubmissionTranscriptEvidenceTests: XCTestCase {
+    private let answer = "The telomeres keep getting shorter until cells stop dividing"
+
+    func testAppServerThreadEndingWithTheSubmissionProvesAcceptance() {
+        let items = [
+            user("Comfortable with cells, DNA, proteins, and basic physiology"),
+            assistant("Explain why you think humans age."),
+            user(answer),
+        ]
+        XCTAssertEqual(
+            CourseExperienceStore.appServerSubmissionEvidence(promptText: answer, in: items),
+            .accepted
+        )
+        // Source-ingestion receipts are appended to the prompt the agent sees.
+        let withReceipts = items.dropLast() + [
+            user(answer + "\n\n<learnfold_source_ingestion>\nmanifest\n</learnfold_source_ingestion>"),
+        ]
+        XCTAssertEqual(
+            CourseExperienceStore.appServerSubmissionEvidence(
+                promptText: answer,
+                in: Array(withReceipts)
+            ),
+            .accepted
+        )
+    }
+
+    func testAppServerThreadWithoutTheSubmissionProvesItWasNotAccepted() {
+        let items = [
+            user("Comfortable with cells, DNA, proteins, and basic physiology"),
+            assistant("Explain why you think humans age."),
+        ]
+        XCTAssertEqual(
+            CourseExperienceStore.appServerSubmissionEvidence(promptText: answer, in: items),
+            .notAccepted
+        )
+        // An earlier identical question is not this submission's turn.
+        XCTAssertEqual(
+            CourseExperienceStore.appServerSubmissionEvidence(
+                promptText: answer,
+                in: [user(answer), assistant("Reply"), user("A later question")]
+            ),
+            .notAccepted
+        )
+    }
+
+    func testHostedTranscriptProvesAcceptanceByTheOptimisticMessageID() {
+        let messageID = UUID()
+        let transcript = [
+            HostedCourseAgentStoredMessage(id: "seed", role: .learner, text: "Earlier"),
+            HostedCourseAgentStoredMessage(
+                id: messageID.uuidString.lowercased(),
+                role: .learner,
+                text: answer
+            ),
+        ]
+        XCTAssertEqual(
+            CourseExperienceStore.hostedSubmissionEvidence(
+                optimisticMessageID: messageID,
+                promptText: answer,
+                in: transcript
+            ),
+            .accepted
+        )
+        XCTAssertEqual(
+            CourseExperienceStore.hostedSubmissionEvidence(
+                optimisticMessageID: UUID(),
+                promptText: answer,
+                in: Array(transcript.prefix(1))
+            ),
+            .notAccepted
+        )
+    }
+
+    private func user(_ text: String) -> HydratedConversationItem {
+        HydratedConversationItem(
+            id: UUID().uuidString,
+            content: .user(HydratedUserMessageData(text: text, imageDataUris: [])),
+            sourceTurnId: nil,
+            sourceTurnIndex: nil,
+            timestamp: nil,
+            isFromUserTurnBoundary: false
+        )
+    }
+
+    private func assistant(_ text: String) -> HydratedConversationItem {
+        HydratedConversationItem(
+            id: UUID().uuidString,
+            content: .assistant(HydratedAssistantMessageData(
+                text: text,
+                agentNickname: nil,
+                agentRole: nil,
+                phase: nil
+            )),
+            sourceTurnId: nil,
+            sourceTurnIndex: nil,
+            timestamp: nil,
+            isFromUserTurnBoundary: false
+        )
+    }
+}
+
+/// A Codex course thread outlives the in-process app-server: after a relaunch
+/// the server has no loaded threads, so `turn/start` fails with "thread not
+/// found" until the course reloads the thread with its original launch config.
+@MainActor
+final class CourseCodexThreadReloadTests: XCTestCase {
+    func testReloadKeepsTheCourseMCPServerAndInstructions() throws {
+        let endpoint = try XCTUnwrap(URL(string: "http://127.0.0.1:54321/mcp"))
+        let launch = try CourseExperienceStore.courseThreadLaunchConfig(
+            runtimeID: .codex,
+            workspaceID: "course-1",
+            modelID: nil,
+            courseMCPURL: endpoint
+        )
+        let request = launch.threadResumeRequest(threadId: "thread-1", cwdOverride: nil)
+
+        XCTAssertEqual(request.threadId, "thread-1")
+        XCTAssertEqual(request.configJson, try CourseExperienceStore.courseMCPConfigJSON(endpoint: endpoint))
+        XCTAssertEqual(request.sandbox, .workspaceWrite)
+        XCTAssertEqual(request.approvalPolicy, .never)
+        XCTAssertTrue(request.developerInstructions?.hasPrefix(CourseExperienceStore.courseAgentInstructions) == true)
+        XCTAssertTrue(request.developerInstructions?.contains("`\(CourseAgentTools.workspaceIDArgument)`: `course-1`") == true)
+    }
+
+    func testRemoteCodexReloadCarriesNoLocalMCPConfig() throws {
+        let launch = try CourseExperienceStore.courseThreadLaunchConfig(
+            runtimeID: .codex,
+            workspaceID: "course-1",
+            modelID: nil,
+            courseMCPURL: nil
+        )
+        let request = launch.threadResumeRequest(threadId: "thread-1", cwdOverride: nil)
+
+        XCTAssertNil(request.configJson)
+        XCTAssertEqual(request.developerInstructions, CourseExperienceStore.courseAgentInstructions)
+    }
+
+    func testMissingThreadAtTurnStartProvesTheMessageWasNotAccepted() {
+        let error = NSError(
+            domain: "codex",
+            code: -32600,
+            userInfo: [NSLocalizedDescriptionKey: "RPC: invalid request: thread not found: 01a0fd39-4998-77b1-8e87-b5c9dd214ea5"]
+        )
+        XCTAssertTrue(CourseExperienceStore.isMissingBoundThreadError(error))
+    }
+}
+
+/// The device keeps its own copy of every Codex course conversation, so a
+/// thread whose rollout is gone can be rebuilt from what the learner saw.
+@MainActor
+final class CodexCourseTranscriptStoreTests: XCTestCase {
+    private var rootURL: URL!
+    private var transcripts: CodexCourseTranscriptStore!
+
+    override func setUpWithError() throws {
+        rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexTranscripts-\(UUID().uuidString)", isDirectory: true)
+        transcripts = CodexCourseTranscriptStore(rootURL: rootURL)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: rootURL)
+    }
+
+    func testRecordsTheVisibleConversationWithoutSourceReceipts() {
+        transcripts.record(threadID: "thread-1", items: [
+            user("Hey there"),
+            reasoning(),
+            assistant("What would you like to learn?"),
+            user("Biology\n\n<learnfold_source_ingestion>receipt</learnfold_source_ingestion>"),
+        ])
+
+        XCTAssertEqual(transcripts.transcript(threadID: "thread-1")?.messages, [
+            .init(role: .learner, text: "Hey there"),
+            .init(role: .agent, text: "What would you like to learn?"),
+            .init(role: .learner, text: "Biology"),
+        ])
+    }
+
+    func testAShorterOrEmptyReloadNeverErasesTheSavedConversation() {
+        transcripts.record(threadID: "thread-1", items: [user("Hey there"), assistant("Hi!")])
+        transcripts.record(threadID: "thread-1", items: [])
+        transcripts.record(threadID: "thread-1", items: [user("Hey there")])
+
+        XCTAssertEqual(transcripts.transcript(threadID: "thread-1")?.messages.count, 2)
+    }
+
+    func testARebuiltThreadKeepsItsCarriedOverHistoryAheadOfItsOwnTurns() throws {
+        let earlier: [CodexCourseTranscriptMessage] = [
+            .init(role: .learner, text: "Hey there"),
+            .init(role: .agent, text: "Why do humans age?"),
+        ]
+        try transcripts.seed(threadID: "rebuilt", carriedOver: earlier)
+        // The rebuilt thread's own transcript holds only the new turn.
+        transcripts.record(threadID: "rebuilt", items: [user("Telomeres"), assistant("Good start")])
+
+        let saved = try XCTUnwrap(transcripts.transcript(threadID: "rebuilt"))
+        XCTAssertEqual(saved.carriedOver, earlier)
+        XCTAssertEqual(saved.messages, earlier + [
+            .init(role: .learner, text: "Telomeres"),
+            .init(role: .agent, text: "Good start"),
+        ])
+    }
+
+    func testOnlyAMissingThreadOrRolloutCountsAsLostHistory() {
+        func error(_ message: String) -> NSError {
+            NSError(domain: "codex", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        XCTAssertTrue(CourseExperienceStore.isLostCodexThreadError(
+            error("RPC: no rollout found for thread id 01a0fd39-4998-77b1-8e87-b5c9dd214ea5")
+        ))
+        XCTAssertTrue(CourseExperienceStore.isLostCodexThreadError(error("thread not found: abc")))
+        XCTAssertFalse(CourseExperienceStore.isLostCodexThreadError(error("The network connection was lost.")))
+    }
+
+    private func user(_ text: String) -> HydratedConversationItem {
+        HydratedConversationItem(
+            id: UUID().uuidString,
+            content: .user(HydratedUserMessageData(text: text, imageDataUris: [])),
+            sourceTurnId: nil,
+            sourceTurnIndex: nil,
+            timestamp: nil,
+            isFromUserTurnBoundary: false
+        )
+    }
+
+    private func assistant(_ text: String) -> HydratedConversationItem {
+        HydratedConversationItem(
+            id: UUID().uuidString,
+            content: .assistant(HydratedAssistantMessageData(
+                text: text,
+                agentNickname: nil,
+                agentRole: nil,
+                phase: nil
+            )),
+            sourceTurnId: nil,
+            sourceTurnIndex: nil,
+            timestamp: nil,
+            isFromUserTurnBoundary: false
+        )
+    }
+
+    private func reasoning() -> HydratedConversationItem {
+        HydratedConversationItem(
+            id: UUID().uuidString,
+            content: .reasoning(HydratedReasoningData(summary: ["thinking"], content: [])),
+            sourceTurnId: nil,
+            sourceTurnIndex: nil,
+            timestamp: nil,
+            isFromUserTurnBoundary: false
+        )
+    }
 }

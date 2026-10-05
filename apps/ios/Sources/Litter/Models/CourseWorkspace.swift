@@ -290,26 +290,33 @@ enum CourseLearningPathResolver {
         in nodes: [CourseLearningNode],
         targetNodeID: String?
     ) -> [CourseLearningNode] {
-        guard let targetNodeID else { return nodes }
-        return nodes.map { overlayGeneratingStatus(in: $0, targetNodeID: targetNodeID).node }
+        overlayGeneratingStatus(in: nodes, targetNodeIDs: targetNodeID.map { [$0] } ?? [])
+    }
+
+    /// Several pages can be written at once: the course agent's page plus
+    /// any explorations their own agents are writing.
+    static func overlayGeneratingStatus(
+        in nodes: [CourseLearningNode],
+        targetNodeIDs: Set<String>
+    ) -> [CourseLearningNode] {
+        guard !targetNodeIDs.isEmpty else { return nodes }
+        return nodes.map { overlayGeneratingStatus(in: $0, targetNodeIDs: targetNodeIDs).node }
     }
 
     private static func overlayGeneratingStatus(
         in node: CourseLearningNode,
-        targetNodeID: String
+        targetNodeIDs: Set<String>
     ) -> (node: CourseLearningNode, containsTarget: Bool) {
-        if node.id == targetNodeID {
-            var result = node
-            result.status = .generating
-            return (result, true)
-        }
-
         var result = node
         var containsTarget = false
         result.children = node.children.map { child in
-            let overlaid = overlayGeneratingStatus(in: child, targetNodeID: targetNodeID)
+            let overlaid = overlayGeneratingStatus(in: child, targetNodeIDs: targetNodeIDs)
             containsTarget = containsTarget || overlaid.containsTarget
             return overlaid.node
+        }
+        if targetNodeIDs.contains(node.id) {
+            result.status = .generating
+            return (result, true)
         }
         if containsTarget, result.kind == .folder, result.status != .generating {
             result.status = .partiallyGenerated
