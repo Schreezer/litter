@@ -89,16 +89,26 @@ public struct NativeBlockEditorSelection: Hashable, Sendable {
 /// document. Hosts can therefore use them for discussion anchors and other
 /// transient projections without mutating learner-authored content.
 public struct NativeBlockEditorTextAnnotation: Hashable, Identifiable, Sendable {
+    /// How the annotated range is drawn.
+    public enum Style: String, Hashable, Sendable {
+        /// A highlighted range the learner is discussing.
+        case discussion
+        /// A lighter dotted underline where a branch page starts.
+        case branch
+    }
+
     public var id: String
     public var blockID: String?
     public var path: BlockPath
     public var range: NSRange
+    public var style: Style
 
-    public init(id: String, blockID: String?, path: BlockPath, range: NSRange) {
+    public init(id: String, blockID: String?, path: BlockPath, range: NSRange, style: Style = .discussion) {
         self.id = id
         self.blockID = blockID
         self.path = path
         self.range = range
+        self.style = style
     }
 }
 

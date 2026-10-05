@@ -918,6 +918,7 @@ public actor NativeEditorMCPService {
             ("generation_status", "course_generation_status"),
             ("bootstrap_status", "course_bootstrap_status"),
             ("origin_question", "course_origin_question"),
+            ("origin_anchor", "course_origin_anchor"),
         ]
         var changed = false
         for (property, dataKey) in mappings {
@@ -941,6 +942,7 @@ public actor NativeEditorMCPService {
             "course_generation_status",
             "course_bootstrap_status",
             "course_origin_question",
+            "course_origin_anchor",
         ] where updatedDocument.root.data[key] == nil {
             updatedDocument.root.data[key] = previousDocument.root.data[key]
         }

@@ -33,6 +33,8 @@ private struct ReadingScrollModifier: ViewModifier {
     @State private var position = ScrollPosition()
     @State private var restored = false
     @State private var userHasScrolled = false
+    /// Latest viewport, held outside view state so scrolling never re-renders.
+    @State private var latest = LatestGeometry()
 
     func body(content: Content) -> some View {
         content
@@ -40,6 +42,8 @@ private struct ReadingScrollModifier: ViewModifier {
             .onScrollPhaseChange { _, phase in
                 if phase == .interacting || phase == .decelerating {
                     userHasScrolled = true
+                } else if phase == .idle {
+                    report()
                 }
             }
             .onScrollGeometryChange(for: ReadingGeometry.self) { geometry in
@@ -51,6 +55,7 @@ private struct ReadingScrollModifier: ViewModifier {
                 )
             } action: { _, geometry in
                 guard geometry.height > 0 else { return }
+                latest.value = geometry
                 if !restored {
                     restored = true
                     if let initialPosition {
@@ -60,19 +65,29 @@ private struct ReadingScrollModifier: ViewModifier {
                             position.scrollTo(y: min(initialPosition.offset, geometry.extent))
                         }
                     }
-                } else if userHasScrolled {
-                    onChange(NativeBlockEditorReadingPosition(
-                        offset: geometry.offset,
-                        isAtEnd: geometry.offset >= geometry.extent - 24
-                    ))
                 }
             }
+            .onDisappear { report() }
+    }
+
+    /// Hosts persist the position, so it is reported once a scroll settles
+    /// (or the reader leaves) rather than on every frame of the gesture.
+    private func report() {
+        guard userHasScrolled, let geometry = latest.value else { return }
+        onChange(NativeBlockEditorReadingPosition(
+            offset: geometry.offset,
+            isAtEnd: geometry.offset >= geometry.extent - 24
+        ))
     }
 
     private struct ReadingGeometry: Equatable {
         let offset: Double
         let extent: Double
         let height: Double
+    }
+
+    private final class LatestGeometry {
+        var value: ReadingGeometry?
     }
 }
 #endif

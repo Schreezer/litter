@@ -524,7 +524,7 @@ struct RichTextBlockEditor: UIViewRepresentable {
     private var annotationSignature: String {
         annotations
             .sorted { $0.id < $1.id }
-            .map { "\($0.id):\($0.range.location):\($0.range.length)" }
+            .map { "\($0.id):\($0.range.location):\($0.range.length):\($0.style.rawValue)" }
             .joined(separator: "|")
     }
 
@@ -543,15 +543,23 @@ struct RichTextBlockEditor: UIViewRepresentable {
             guard annotation.range.location >= 0,
                   annotation.range.length > 0,
                   NSMaxRange(annotation.range) <= output.length else { continue }
-            output.addAttributes(
+            let attributes: [NSAttributedString.Key: Any] = switch annotation.style {
+            case .discussion:
                 [
                     RichTextCodec.annotationIDKey: annotation.id,
                     .backgroundColor: UIColor.systemBlue.withAlphaComponent(0.20),
                     .underlineColor: UIColor.systemBlue.withAlphaComponent(0.65),
                     .underlineStyle: NSUnderlineStyle.single.rawValue,
-                ],
-                range: annotation.range
-            )
+                ]
+            case .branch:
+                [
+                    RichTextCodec.annotationIDKey: annotation.id,
+                    .backgroundColor: UIColor.systemPurple.withAlphaComponent(0.08),
+                    .underlineColor: UIColor.systemPurple.withAlphaComponent(0.75),
+                    .underlineStyle: NSUnderlineStyle.single.rawValue | NSUnderlineStyle.patternDot.rawValue,
+                ]
+            }
+            output.addAttributes(attributes, range: annotation.range)
         }
         return output
     }
