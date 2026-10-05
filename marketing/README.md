@@ -16,6 +16,10 @@ For agent-specific navigation, see [AGENTS.md](AGENTS.md). The files below provi
 - [Account strategy](account-strategy.md): the main curiosity account plus Plot & Footnotes for adult romance readers and Better Questions Club for dating stories as narrower experiments. Includes suggested names, bios, creator categories, captions, follow-up posts and a launch experiment.
 - [Saved for Someday](saved-for-someday.md): an optional campaign about postponed curiosity and adult hobbies, retained under the broader curiosity direction. Includes search terms, positioning, hooks and a new eight-slide draft.
 
+## Website copy experiment
+
+[Landing page A/B test](../services/website/EXPERIMENT.md): live 50/50 comparison of the existing curiosity copy and a scrolling-to-learning message, with preview links, real-event reporting, and stop instructions. No invented ratings, reviews, testimonials, or user counts.
+
 ## Carousel scripts
 
 [Browse the 12 original carousel scripts](tiktok-carousels/README.md). Each has eight slides, alternate hooks, visual notes, caption copy and a course prompt.
