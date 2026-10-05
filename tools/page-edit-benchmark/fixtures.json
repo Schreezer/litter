@@ -1,0 +1,22 @@
+[
+  {
+    "id": "precise-correction",
+    "title": "Interest calculations",
+    "request": "Correct Example A only: its annual interest rate should be 8%, and its one-year total for a 1,000 principal should be 1,080. Keep the calculation consistent. Leave Example B, my learner note, and every other section unchanged.",
+    "markdown": "# Interest calculations\n\nInterest is money earned on a saved principal. In these examples there are no fees, deposits, or withdrawals.\n\n## Example A\n\nThe rate is 5%.\n\nPrincipal: 1,000. After one year: 1,000 × 1.05 = 1,050.\n\n## Example B\n\nThe rate is 5%.\n\nPrincipal: 500. After one year: 500 × 1.05 = 525.\n\n## My learner note\n\nDo not change my shortcut: convert the percentage to a decimal first.\n\n## Practice\n\nTry calculating one year of interest on a principal of 200 at 4%."
+  },
+  {
+    "id": "rewrite-with-native-blocks",
+    "title": "HTTP caching",
+    "opaque": true,
+    "request": "Rewrite only the Introduction in plain language for a beginner. Add two worked examples immediately before the Practice section: one showing an ETag conditional request with If-None-Match and a 304 response, and one showing a fingerprinted CSS asset cached with Cache-Control: public, max-age=31536000, immutable. Explain why each avoids unnecessary downloads. Preserve the existing Request lifecycle and Reference sections, my learner note, the interactive visualization, the opaque quiz block, and the Practice section exactly. Keep the original title and existing section order.",
+    "markdown": "# HTTP caching\n\n## Introduction\n\nCaching is the operational retention of previously retrieved representations governed by freshness and validation semantics. A user agent may reuse stored response entities subject to cache directive constraints and conditional revalidation.\n\n## Request lifecycle\n\n1. A browser asks for a resource at a URL.\n2. The server responds with a body and headers.\n3. The browser may store the response.\n4. On a later visit, freshness rules determine whether it can reuse that response immediately.\n5. A stale response may be validated with the origin before reuse.\n\nA fresh cached response can avoid a network request entirely. A validated response can avoid transferring the resource body while still requiring a network round trip.\n\n## Reference\n\n- A cache key distinguishes stored responses.\n- Vary tells a cache which request headers influence the response selection.\n- no-store prevents storing the response.\n- no-cache permits storage but requires validation before reuse.\n- private permits storage by a private cache but excludes shared caches.\n- A 304 response has no replacement representation body.\n\n## Interactive visualization\n\n```learnfold-visualization\n<div id=\"cache-demo\"><label>Visits <input type=\"range\" min=\"1\" max=\"10\" value=\"1\" aria-label=\"Visits\"></label><output aria-live=\"polite\">1 download</output><script>document.querySelector('#cache-demo input').addEventListener('input',function(){document.querySelector('#cache-demo output').textContent='1 download across '+this.value+' visits';});</script></div>\n```\n\n## My learner note\n\nMy production stylesheet is app.a91f.css. Keep this filename in my notes; do not replace it with an example filename.\n\n## Practice\n\nExplain the difference between avoiding a request and avoiding a response body."
+  },
+  {
+    "id": "concurrent-learner-edit",
+    "title": "Spaced review",
+    "inject_concurrent_edit": true,
+    "request": "Change only the review interval in Review schedule from 7 days to 3 days, and replace the exercise with: 'Close the lesson and write down three ideas from memory.' Preserve the rest of the lesson and all learner notes, including any learner edits that arrive while you work. If a save conflicts, reread the latest page and reapply only my requested changes.",
+    "markdown": "# Spaced review\n\n## Why review\n\nRetrieving an idea from memory helps you discover which parts you can explain without looking.\n\n## Review schedule\n\nReview this lesson again after 7 days. Keep each review session short.\n\n## Exercise\n\nRead the lesson twice and highlight the key sentences.\n\n## My learner note\n\nI prefer to review after breakfast. Keep this preference."
+  }
+]
