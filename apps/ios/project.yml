@@ -20,6 +20,7 @@ configs:
   Debug: debug
   Release: release
   DeveloperID: release
+  MacDevelopment: debug
 
 settings:
   base:
@@ -193,22 +194,6 @@ targets:
     platform: auto
     supportedDestinations:
       - macCatalyst
-    entitlements:
-      path: Sources/Litter/Litter-Catalyst.entitlements
-      properties:
-        # iCloud KVS sync (Feature C). Re-add after creating the
-        # `iCloud.com.chirag.learnfold` container in the Apple Developer Portal
-        # AND regenerating the Mac App Store profile with the iCloud capability.
-        # Direct-dist (DeveloperID entitlements) keeps the key because Developer
-        # ID apps validate iCloud at runtime, not via profile.
-        # com.apple.developer.ubiquity-kvstore-identifier: $(TeamIdentifierPrefix)iCloud.com.chirag.learnfold
-        com.apple.security.application-groups:
-          - group.com.chirag.learnfold
-        com.apple.security.app-sandbox: true
-        com.apple.security.device.bluetooth: true
-        com.apple.security.files.user-selected.read-write: true
-        com.apple.security.network.client: true
-        com.apple.security.network.server: true
     sources:
       - path: Sources/Litter
         excludes:
@@ -217,6 +202,7 @@ targets:
           - Litter.entitlements
           - Litter-Catalyst.entitlements
           - Litter-Catalyst-DeveloperID.entitlements
+          - Litter-Catalyst-Development.entitlements
           - Models/AppLifecycleController.swift
           - Models/AppRuntimeController.swift
           - Models/CodexTurnAttributes.swift
@@ -260,6 +246,8 @@ targets:
       - sdk: SystemConfiguration.framework
       - sdk: Network.framework
       - sdk: PDFKit.framework
+      - package: PostHog
+        product: PostHog
       - package: Hairball
         product: HairballUI
       - package: NativeBlockEditor
@@ -278,6 +266,11 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.chirag.learnfold
         DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
         INFOPLIST_FILE: Sources/Litter/Info-Catalyst.plist
+        LEARNFOLD_HOSTED_AGENT_URL: "https://learnfold-hosted-agent.chiragmgg.workers.dev"
+        LEARNFOLD_HOSTED_ACCESS_TOKEN: ""
+        # XcodeGen's target.entitlements overrides every configuration, so
+        # select the checked-in entitlement files through build settings.
+        CODE_SIGN_ENTITLEMENTS: Sources/Litter/Litter-Catalyst.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIconMac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Litter/Bridge/codex_bridge_objc.h
         SUPPORTS_MACCATALYST: YES
@@ -314,6 +307,11 @@ targets:
           OTHER_LDFLAGS: "$(inherited) -lc++ -lz -lresolv -lcodex_mobile_client -lghostty"
           ENABLE_HARDENED_RUNTIME: YES
           CODE_SIGN_ENTITLEMENTS: Sources/Litter/Litter-Catalyst-DeveloperID.entitlements
+        MacDevelopment:
+          CODE_SIGN_STYLE: Automatic
+          CODE_SIGN_IDENTITY: Apple Development
+          CODE_SIGN_ENTITLEMENTS: Sources/Litter/Litter-Catalyst-Development.entitlements
+          OTHER_LDFLAGS: "$(inherited) -lc++ -lz -lresolv -lcodex_mobile_client -lghostty"
   LitterLiveActivity:
     type: app-extension
     platform: iOS
@@ -453,6 +451,38 @@ targets:
         GENERATE_INFOPLIST_FILE: true
         CODE_SIGNING_ALLOWED: false
         CODE_SIGNING_REQUIRED: false
+  LitterMacTests:
+    type: bundle.unit-test
+    platform: auto
+    supportedDestinations:
+      - macCatalyst
+    sources:
+      - path: Tests/LitterTests
+        includes:
+          - CourseAgentPlatformPolicyTests.swift
+          - CourseMacRuntimeIntegrationTests.swift
+          - LearnfoldStarterCourseAdoptionTests.swift
+          - CourseCloudSyncModelsTests.swift
+          - CourseCloudSyncRepositoryTests.swift
+          - CourseCloudSyncStateStoreTests.swift
+          - CourseContinuationSyncTests.swift
+          - CourseContinuationStoreIntegrationTests.swift
+          - HostedCourseContinuationTests.swift
+          - CourseAssessmentAttemptStoreTests.swift
+    dependencies:
+      - target: LitterMac
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+        SWIFT_OBJC_BRIDGING_HEADER: ""
+        "LIBRARY_SEARCH_PATHS[sdk=macosx*]": "$(inherited) $(PROJECT_DIR)/GeneratedRust/ios-macabi"
+        SUPPORTS_MACCATALYST: YES
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+        PRODUCT_BUNDLE_IDENTIFIER: com.chirag.learnfold.mac-tests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Litter.app/Contents/MacOS/Litter"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
   PCCDeviceTests:
     type: bundle.unit-test
     platform: iOS
@@ -540,7 +570,11 @@ schemes:
       targets:
         LitterMac: all
     run:
-      config: Debug
+      config: MacDevelopment
+    test:
+      config: MacDevelopment
+      targets:
+        - LitterMacTests
     profile:
       config: Release
     analyze:

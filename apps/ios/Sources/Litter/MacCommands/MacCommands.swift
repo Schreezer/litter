@@ -3,6 +3,15 @@ import SwiftUI
 import UIKit
 
 extension Notification.Name {
+    static let learnfoldCommandNewCourse = Notification.Name("com.learnfold.command.newCourse")
+    static let learnfoldCommandShowLibrary = Notification.Name("com.learnfold.command.showLibrary")
+    static let learnfoldCommandShowAppSettings = Notification.Name("com.learnfold.command.showAppSettings")
+    static let learnfoldCommandSendCourseMessage = Notification.Name("com.learnfold.command.sendCourseMessage")
+    static let learnfoldCommandNavigateBack = Notification.Name("com.learnfold.command.navigateBack")
+    static let learnfoldCommandNavigateForward = Notification.Name("com.learnfold.command.navigateForward")
+    /// Posted with userInfo `["index": Int]` in the visible course library order.
+    static let learnfoldCommandSelectCourse = Notification.Name("com.learnfold.command.selectCourse")
+
     static let litterCommandNewSession = Notification.Name("com.litter.command.newSession")
     static let litterCommandSendComposer = Notification.Name("com.litter.command.sendComposer")
     static let litterCommandNavigateBack = Notification.Name("com.litter.command.navigateBack")
@@ -12,15 +21,27 @@ extension Notification.Name {
     static let litterCommandShowSettings = Notification.Name("com.litter.command.showSettings")
 }
 
+private struct LearnfoldCourseStoreFocusedKey: FocusedValueKey {
+    typealias Value = CourseExperienceStore
+}
+
+extension FocusedValues {
+    var learnfoldCourseStore: CourseExperienceStore? {
+        get { self[LearnfoldCourseStoreFocusedKey.self] }
+        set { self[LearnfoldCourseStoreFocusedKey.self] = newValue }
+    }
+}
+
 struct LitterCommands: Commands {
-    let appModel: AppModel
+    @FocusedValue(\.learnfoldCourseStore) private var courseStore
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
-            Button("New Session") {
-                NotificationCenter.default.post(name: .litterCommandNewSession, object: nil)
+            Button("New Course") {
+                NotificationCenter.default.post(name: .learnfoldCommandNewCourse, object: courseStore)
             }
             .keyboardShortcut("n", modifiers: [.command])
+            .disabled(courseStore?.setupComplete != true)
 
             Button("New Window") {
                 openNewWindow()
@@ -28,55 +49,62 @@ struct LitterCommands: Commands {
             .keyboardShortcut("n", modifiers: [.command, .shift])
         }
 
-        SidebarCommands()
+        CommandGroup(replacing: .appSettings) {
+            Button("Settings…") {
+                NotificationCenter.default.post(name: .learnfoldCommandShowAppSettings, object: courseStore)
+            }
+            .keyboardShortcut(",", modifiers: [.command])
+            .disabled(courseStore == nil)
+        }
 
-        CommandMenu("Session") {
-            Button("Send") {
-                NotificationCenter.default.post(name: .litterCommandSendComposer, object: nil)
+        CommandMenu("Course") {
+            Button("Course Library") {
+                NotificationCenter.default.post(name: .learnfoldCommandShowLibrary, object: courseStore)
+            }
+            .keyboardShortcut("l", modifiers: [.command, .shift])
+            .disabled(courseStore?.setupComplete != true)
+
+            Button("Send Message") {
+                NotificationCenter.default.post(name: .learnfoldCommandSendCourseMessage, object: courseStore)
             }
             .keyboardShortcut(.return, modifiers: [.command])
+            .disabled(courseStore?.setupComplete != true)
 
             Button("Back") {
-                NotificationCenter.default.post(name: .litterCommandNavigateBack, object: nil)
+                NotificationCenter.default.post(name: .learnfoldCommandNavigateBack, object: courseStore)
             }
             .keyboardShortcut("[", modifiers: [.command])
 
             Button("Forward") {
-                NotificationCenter.default.post(name: .litterCommandNavigateForward, object: nil)
+                NotificationCenter.default.post(name: .learnfoldCommandNavigateForward, object: courseStore)
             }
             .keyboardShortcut("]", modifiers: [.command])
 
             Divider()
 
-            SessionShortcutsMenu(appModel: appModel)
+            CourseShortcutsMenu(courseStore: courseStore)
         }
     }
 }
 
-private struct SessionShortcutsMenu: View {
-    let appModel: AppModel
+private struct CourseShortcutsMenu: View {
+    let courseStore: CourseExperienceStore?
 
     var body: some View {
-        let summaries = appModel.snapshot?.sessionSummaries ?? []
+        let courses = courseStore?.courses ?? []
         ForEach(0..<9, id: \.self) { index in
             let shortcutKey = KeyEquivalent(Character("\(index + 1)"))
-            let summary: AppSessionSummary? = summaries.indices.contains(index) ? summaries[index] : nil
-            Button(label(for: summary, index: index)) {
-                guard summary != nil else { return }
+            let course = courses.indices.contains(index) ? courses[index] : nil
+            Button(course.map { "Course \(index + 1): \($0.title)" } ?? "Course \(index + 1)") {
                 NotificationCenter.default.post(
-                    name: .litterCommandSelectSession,
-                    object: nil,
+                    name: .learnfoldCommandSelectCourse,
+                    object: courseStore,
                     userInfo: ["index": index]
                 )
             }
             .keyboardShortcut(shortcutKey, modifiers: [.command])
-            .disabled(summary == nil)
+            .disabled(course == nil || courseStore?.setupComplete != true)
         }
-    }
-
-    private func label(for summary: AppSessionSummary?, index: Int) -> String {
-        guard let summary else { return "Session \(index + 1)" }
-        return "Session \(index + 1): \(summary.displayTitle)"
     }
 }
 

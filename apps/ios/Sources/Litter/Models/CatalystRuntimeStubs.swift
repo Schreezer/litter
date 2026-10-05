@@ -80,10 +80,18 @@ final class AppRuntimeController {
         await appModel.restoreMissingLocalAuthStateIfNeeded()
         await appModel.refreshSnapshot()
         persistAlleycatSecretKeyIfNeeded()
+        if LitterPlatform.isDirectDistMac,
+           ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+            LocalCodexBootstrap.shared.startIfNeeded(appModel: appModel)
+        }
     }
 
     func reconnectServer(serverId: String) async {
         guard let appModel else { return }
+        if LitterPlatform.isDirectDistMac, serverId == LocalCodexBootstrap.serverId {
+            _ = try? await LocalCodexBootstrap.shared.ensureConnected(appModel: appModel)
+            return
+        }
         let servers = SavedServerStore.reconnectRecords(
             localDisplayName: appModel.resolvedLocalServerDisplayName()
         )

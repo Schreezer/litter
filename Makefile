@@ -206,7 +206,7 @@ ANDROID_RUST_SOURCES := $(shell find $(RUST_DIR) \
 
 $(shell mkdir -p $(STAMPS))
 
-.PHONY: all ios ios-sim ios-sim-fast ios-sim-run ios-device ios-device-fast ios-device-run ios-device-stop ios-run verify-ios-project course-exec check-course-exec catalyst catalyst-run catalyst-fast catalyst-fast-run mac-direct mac-direct-run mac-direct-fast mac-direct-fast-run \
+.PHONY: all ios ios-sim ios-sim-fast ios-sim-run ios-device ios-device-fast ios-device-run ios-device-stop ios-run verify-ios-project course-exec check-course-exec catalyst catalyst-run catalyst-fast catalyst-fast-run mac-direct mac-direct-run mac-direct-fast mac-direct-fast-run mac-development-fast test-mac \
 	android android-fast android-tools android-emulator-fast android-emulator-run android-device-run android-release android-debug android-install android-emulator-install \
 	rust-ios rust-ios-package rust-ios-device-release rust-mac-release rust-ios-device-fast rust-ios-sim-fast rust-ios-macabi-fast rust-android rust-check rust-test rust-host-dev \
 	android-alpine-fs proot-android \
@@ -330,6 +330,32 @@ mac-direct-fast-run: mac-direct-fast
 	@pkill -9 -f "DeveloperID-maccatalyst/Litter.app" 2>/dev/null; true
 	@/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister -f $(MAC_DIRECT_DERIVED)/Build/Products/DeveloperID-maccatalyst/Litter.app
 	@open $(MAC_DIRECT_DERIVED)/Build/Products/DeveloperID-maccatalyst/Litter.app
+
+# A signed, unsandboxed development build can use installed Codex and the
+# existing Learnfold CloudKit container. Ad-hoc Mac builds cannot verify iCloud.
+MAC_DEVELOPMENT_DERIVED ?= $(IOS_DIR)/build/mac-development
+mac-development-fast: rust-ios-macabi-fast alpine-fs xcgen
+	@cd $(IOS_DIR) && xcodebuild \
+		-project Litter.xcodeproj \
+		-scheme LitterMac \
+		-configuration MacDevelopment \
+		-destination 'platform=macOS,variant=Mac Catalyst' \
+		-derivedDataPath "$(MAC_DEVELOPMENT_DERIVED)" \
+		-allowProvisioningUpdates \
+		ONLY_ACTIVE_ARCH=YES \
+		build
+
+test-mac: rust-ios-macabi-fast alpine-fs xcgen
+	@cd $(IOS_DIR) && xcodebuild \
+		-project Litter.xcodeproj \
+		-scheme LitterMac \
+		-configuration MacDevelopment \
+		-destination 'platform=macOS,variant=Mac Catalyst' \
+		-derivedDataPath "$(MAC_DEVELOPMENT_DERIVED)" \
+		-allowProvisioningUpdates \
+		ONLY_ACTIVE_ARCH=YES \
+		test
+
 loop-sim:
 	@$(ROOT)/tools/scripts/loop-ios.sh sim
 
