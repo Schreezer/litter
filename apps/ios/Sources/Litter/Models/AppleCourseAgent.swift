@@ -4794,6 +4794,7 @@ private extension SystemAppleCourseAgentRuntime {
             AppleCoursePlanningProfile.selectionOrder,
         onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
     ) async throws -> AppleCoursePlanningProfile {
+#if LEARNFOLD_EXACT_CONTEXT_SDK
         guard #available(iOS 26.4, *) else {
             throw AppleCourseAgentError.toolFailed(
                 "Apple On-Device planning requires iOS 26.4 or later for exact context budgeting."
@@ -4905,6 +4906,11 @@ private extension SystemAppleCourseAgentRuntime {
                 """
             )
         }
+#else
+        throw AppleCourseAgentError.unavailable(
+            "This Learnfold build does not include exact Apple On-Device context budgeting."
+        )
+#endif
     }
 
     func validateInitialTurnFits(
@@ -4915,6 +4921,7 @@ private extension SystemAppleCourseAgentRuntime {
         toolMode: AppleCourseToolMode,
         onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
     ) async throws {
+#if LEARNFOLD_EXACT_CONTEXT_SDK
         guard
             providerID == CourseAgentProvider.appleOnDevice,
             toolMode != .planning,
@@ -4991,6 +4998,7 @@ private extension SystemAppleCourseAgentRuntime {
             // Token counting can become unavailable while Apple Intelligence
             // changes state. Generation still owns the final error boundary.
         }
+#endif
     }
 
     func compactedSummary(
@@ -5074,9 +5082,14 @@ private extension SystemAppleCourseAgentRuntime {
             contextSize = 32_768
 #endif
         } else {
+#if LEARNFOLD_EXACT_CONTEXT_SDK
             contextSize = SystemLanguageModel.default.contextSize
+#else
+            contextSize = 4_096
+#endif
         }
 
+#if LEARNFOLD_EXACT_CONTEXT_SDK
         if providerID == CourseAgentProvider.appleOnDevice,
            #available(iOS 26.4, *) {
             do {
@@ -5120,6 +5133,8 @@ private extension SystemAppleCourseAgentRuntime {
                 // error path still provides a final recovery boundary.
             }
         }
+
+#endif
 
         return budget.shouldCompact(
             currentContext: transcriptText(transcript),
