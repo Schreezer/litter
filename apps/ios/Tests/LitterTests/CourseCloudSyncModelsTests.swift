@@ -4,9 +4,18 @@ import XCTest
 @testable import Litter
 
 final class CourseCloudSyncModelsTests: XCTestCase {
-    func testCourseCloudRuntimeCapabilityMatchesBuildTarget() {
+    func testCourseCloudRuntimeCapabilityMatchesBuildTarget() async throws {
         #if targetEnvironment(simulator)
         XCTAssertFalse(CourseCloudEntitlement.isRuntimeCloudKitAvailable)
+        #elseif targetEnvironment(macCatalyst)
+        // Catalyst capability comes from the running executable's signature;
+        // an ad-hoc local app must stop before CKContainer raises an exception.
+        if !CourseCloudEntitlement.isRuntimeCloudKitAvailable {
+            let engine = CourseCloudSyncEngine()
+            await engine.startIfAvailable()
+            let availability = await engine.availability
+            XCTAssertEqual(availability, .missingEntitlement)
+        }
         #else
         XCTAssertTrue(CourseCloudEntitlement.isRuntimeCloudKitAvailable)
         #endif

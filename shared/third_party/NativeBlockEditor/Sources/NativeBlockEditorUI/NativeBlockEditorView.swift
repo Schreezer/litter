@@ -89,16 +89,81 @@ public struct NativeBlockEditorSelection: Hashable, Sendable {
 /// document. Hosts can therefore use them for discussion anchors and other
 /// transient projections without mutating learner-authored content.
 public struct NativeBlockEditorTextAnnotation: Hashable, Identifiable, Sendable {
+    /// How the annotated range is drawn.
+    public enum Style: String, Hashable, Sendable {
+        /// A highlighted range the learner is discussing.
+        case discussion
+        /// Where a written branch page starts, once the learner has opened it.
+        case branch
+        /// Where a written branch page starts that the learner has not opened.
+        case branchNew
+        /// Where a branch page starts that is not written yet: a dashed line.
+        case branchPending
+
+        public var isBranch: Bool { self != .discussion }
+    }
+
     public var id: String
     public var blockID: String?
     public var path: BlockPath
     public var range: NSRange
+    public var style: Style
 
-    public init(id: String, blockID: String?, path: BlockPath, range: NSRange) {
+    public init(id: String, blockID: String?, path: BlockPath, range: NSRange, style: Style = .discussion) {
         self.id = id
         self.blockID = blockID
         self.path = path
         self.range = range
+        self.style = style
+    }
+}
+
+/// Every annotation under one tap. Highlights can overlap, so a host gets all
+/// of them instead of only the one drawn on top.
+public struct NativeBlockEditorAnnotationHit: Identifiable, Sendable {
+    public let id: UUID
+    /// Every annotation whose range contains the tapped character, in host order.
+    public var annotations: [NativeBlockEditorTextAnnotation]
+    /// The shortest covering annotation: the most specific passage.
+    public var primary: NativeBlockEditorTextAnnotation
+    public var blockID: String?
+    public var path: BlockPath
+    /// The tapped block's plain text, for quoting a covered passage.
+    public var blockText: String
+    /// Where the tapped part of the primary passage is drawn, in window coordinates.
+    public var anchorRectInWindow: CGRect
+    /// A ⌘-click on Mac or with a hardware keyboard.
+    public var isCommandClick: Bool
+
+    public init(
+        annotations: [NativeBlockEditorTextAnnotation],
+        primary: NativeBlockEditorTextAnnotation,
+        blockID: String?,
+        path: BlockPath,
+        blockText: String,
+        anchorRectInWindow: CGRect,
+        isCommandClick: Bool = false
+    ) {
+        id = UUID()
+        self.annotations = annotations
+        self.primary = primary
+        self.blockID = blockID
+        self.path = path
+        self.blockText = blockText
+        self.anchorRectInWindow = anchorRectInWindow
+        self.isCommandClick = isCommandClick
+    }
+
+    /// The passage an annotation covers, as a selection of its block.
+    public func selection(for annotation: NativeBlockEditorTextAnnotation) -> NativeBlockEditorSelection {
+        let text = blockText as NSString
+        let range = NSIntersectionRange(annotation.range, NSRange(location: 0, length: text.length))
+        return NativeBlockEditorSelection(
+            blockID: blockID,
+            path: path,
+            range: range,
+            text: text.substring(with: range)
+        )
     }
 }
 
@@ -164,6 +229,8 @@ public struct NativeBlockEditorView: View {
     private let onAskAboutSelection: ((NativeBlockEditorSelection) -> Void)?
     private let textAnnotations: [NativeBlockEditorTextAnnotation]
     private let onOpenTextAnnotation: ((NativeBlockEditorTextAnnotation) -> Void)?
+    private let onTapTextAnnotations: ((NativeBlockEditorAnnotationHit) -> Void)?
+    private let textAnnotationActionName: (([NativeBlockEditorTextAnnotation], String) -> String)?
     @Binding private var wrapsCodeLines: Bool
 
     @State private var engine: BlockDocumentEngine
@@ -189,6 +256,8 @@ public struct NativeBlockEditorView: View {
         onSelectionChange: ((NativeBlockEditorSelection) -> Void)? = nil,
         textAnnotations: [NativeBlockEditorTextAnnotation] = [],
         onOpenTextAnnotation: ((NativeBlockEditorTextAnnotation) -> Void)? = nil,
+        onTapTextAnnotations: ((NativeBlockEditorAnnotationHit) -> Void)? = nil,
+        textAnnotationActionName: (([NativeBlockEditorTextAnnotation], String) -> String)? = nil,
         wrapsCodeLines: Binding<Bool> = .constant(false),
         initialReadingPosition: NativeBlockEditorReadingPosition? = nil,
         onReadingPositionChange: ((NativeBlockEditorReadingPosition) -> Void)? = nil
@@ -208,6 +277,8 @@ public struct NativeBlockEditorView: View {
         self.onAskAboutSelection = onAskAboutSelection
         self.textAnnotations = textAnnotations
         self.onOpenTextAnnotation = onOpenTextAnnotation
+        self.onTapTextAnnotations = onTapTextAnnotations
+        self.textAnnotationActionName = textAnnotationActionName
         _wrapsCodeLines = wrapsCodeLines
         _engine = State(initialValue: BlockDocumentEngine(document: Self.anchored(document.wrappedValue)))
     }
@@ -744,9 +815,14 @@ public struct NativeBlockEditorView: View {
                 }
                 return annotation.path == block.path
             },
-            onOpenAnnotation: { annotation in
-                onOpenTextAnnotation?(annotation)
+            onTapAnnotations: { hit in
+                if let onTapTextAnnotations {
+                    onTapTextAnnotations(hit)
+                } else {
+                    onOpenTextAnnotation?(hit.primary)
+                }
             },
+            annotationActionName: textAnnotationActionName,
             onSelectionChange: { range in
                 try? engine.setSelection(Selection(path: block.path, startOffset: range.location, endOffset: NSMaxRange(range)))
                 let text = (block.node.delta?.plainText ?? "") as NSString

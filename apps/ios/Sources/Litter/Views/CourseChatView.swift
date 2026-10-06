@@ -240,6 +240,13 @@ enum CourseChatTimelinePolicy {
         var projected: [ConversationItem] = []
         projected.reserveCapacity(items.count)
         for item in items {
+            if case .user(let data) = item.content,
+               isCourseAssessmentDiscussionInstruction(
+                   text: remoteLearnerMessage(from: data.text) ?? data.text
+               ) {
+                suppressesUnscopedInternalTurn = false
+                continue
+            }
             if isInternalCourseActionUserItem(item) {
                 // Hydration and streaming can disagree about whether later
                 // items carry turn metadata. Treat every internal learner
@@ -526,7 +533,8 @@ enum CourseChatTimelinePolicy {
                 projectedText = nil
             }
             let learnerText = projectedText ?? data.text
-            guard !CourseAgentInternalPromptPolicy.isInternalInstruction(learnerText) else {
+            guard !isCourseAssessmentDiscussionInstruction(text: learnerText),
+                  !CourseAgentInternalPromptPolicy.isInternalInstruction(learnerText) else {
                 return nil
             }
             guard let projectedText else { return item }
@@ -843,6 +851,22 @@ private extension View {
     }
 }
 
+private struct CourseChatNavigationTitleModifier: ViewModifier {
+    let title: String
+    let isEmbedded: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isEmbedded {
+            content
+        } else {
+            content
+                .navigationTitle(title)
+                .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
 struct CourseChatView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(AppState.self) private var appState
@@ -852,7 +876,10 @@ struct CourseChatView: View {
     let pageContext: CoursePageChatContext?
     let selectionDiscussionID: UUID?
     let showsDismissButton: Bool
+    let isEmbedded: Bool
+    let onDismiss: (() -> Void)?
     let onSelectionDiscussionReplaced: (CourseSelectionDiscussion) -> Void
+    let onAssistantInitiationSent: () -> Void
     @State private var inputText = ""
     @State private var sources: [CourseSource] = []
     @State private var selectedPhoto: PhotosPickerItem?
@@ -867,6 +894,13 @@ struct CourseChatView: View {
     /// A follow-up question tapped on the page waits here until the agent can
     /// take it, so the learner never has to retype it.
     @State private var pendingInitialQuestion: String?
+    @State private var pendingAssistantInitiation: String?
+    @State private var awaitingAssistantInitiationAcceptance: String?
+    @State private var hasPreparedDiscussion = false
+    /// A tapped question option that arrived while the agent was still
+    /// winding down its previous turn (the store's run state lags the chat
+    /// phase). It is sent as soon as the agent is free.
+    @State private var queuedQuestionOption: String?
     @State private var isNearBottom = true
     @State private var autoFollowStreaming = true
     @State private var userIsDraggingScroll = false
@@ -876,6 +910,14 @@ struct CourseChatView: View {
     @State private var isReconnectingAgent = false
     @State private var signInTask: Task<Void, Never>?
     @State private var draftWorkspaceID: String?
+    /// The shared chat timeline for this scope. Starts without a source and
+    /// is replaced once the scope's Rust chat thread is known.
+    @State private var chatModel = ChatScreenModel(source: nil)
+    @State private var chatModelKey: ThreadKey?
+    @State private var chatModelHasSource = false
+    /// The intro stays above the first message sent from it, so the send
+    /// scrolls it away instead of it vanishing under the new turn.
+    @State private var keepsIntroAboveFirstMessage = false
     @FocusState private var composerFocused: Bool
 
     init(
@@ -884,18 +926,25 @@ struct CourseChatView: View {
         pageContext: CoursePageChatContext? = nil,
         selectionDiscussionID: UUID? = nil,
         showsDismissButton: Bool = false,
-        onSelectionDiscussionReplaced: @escaping (CourseSelectionDiscussion) -> Void = { _ in }
+        isEmbedded: Bool = false,
+        onDismiss: (() -> Void)? = nil,
+        onSelectionDiscussionReplaced: @escaping (CourseSelectionDiscussion) -> Void = { _ in },
+        onAssistantInitiationSent: @escaping () -> Void = {}
     ) {
         self.store = store
         self.selectionContext = selectionContext
         self.pageContext = pageContext
         self.selectionDiscussionID = selectionDiscussionID
         self.showsDismissButton = showsDismissButton
+        self.isEmbedded = isEmbedded
+        self.onDismiss = onDismiss
         self.onSelectionDiscussionReplaced = onSelectionDiscussionReplaced
+        self.onAssistantInitiationSent = onAssistantInitiationSent
         _draftWorkspaceID = State(
             initialValue: store.draftWorkspaceID(for: selectionDiscussionID)
         )
         _pendingInitialQuestion = State(initialValue: pageContext?.initialQuestion)
+        _pendingAssistantInitiation = State(initialValue: pageContext?.assistantInitiation)
         _inputText = State(initialValue: pageContext?.initialQuestion ?? "")
     }
 
@@ -1106,6 +1155,11 @@ struct CourseChatView: View {
     }
 
     private var usesCodexAPIKeyAuth: Bool {
+        #if targetEnvironment(macCatalyst)
+        if LitterPlatform.isDirectDistMac {
+            return courseServer?.account == .apiKey
+        }
+        #endif
         if appModel.prefersLocalChatGPTAuth { return false }
         if appModel.localAuthPreference == .apiKey { return true }
         return AppModel.storedLocalAuthPreference(
@@ -1136,7 +1190,341 @@ struct CourseChatView: View {
         )
     }
 
+    /// The one switch between the shared Rust chat timeline and the classic
+    /// course transcript (Settings → Experimental → Classic course chat).
+    private var usesClassicCourseChat: Bool {
+        ExperimentalFeatures.shared.isEnabled(.classicCourseChat)
+    }
+
     var body: some View {
+        courseLifecycle
+        .toolbar {
+            if !isEmbedded { courseToolbar }
+        }
+        .fileImporter(
+            isPresented: $showsFileImporter,
+            allowedContentTypes: [.data],
+            allowsMultipleSelection: true
+        ) { result in
+            handleDocumentSourceImport(result)
+        }
+        .onChange(of: selectedPhoto) { _, item in
+            guard let item else { return }
+            importSelectedPhoto(item)
+        }
+        .courseSourceAttachmentErrorAlert(error: $attachmentError)
+        .alert("Couldn’t Resolve Discussion", isPresented: Binding(
+            get: { resolveError != nil },
+            set: { if !$0 { resolveError = nil } }
+        )) {
+            Button("OK", role: .cancel) { resolveError = nil }
+        } message: {
+            Text(resolveError ?? "The discussion is still open.")
+        }
+    }
+
+    @ViewBuilder
+    private var presentedTranscript: some View {
+        if isEmbedded {
+            VStack(spacing: 0) {
+                embeddedDiscussionHeader
+                Divider()
+                courseTranscript
+            }
+        } else {
+            courseTranscript
+        }
+    }
+
+    private var courseAppearance: some View {
+        presentedTranscript
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-request-lifecycle")
+        .accessibilityValue(requestLifecycle?.rawValue ?? "")
+        #if targetEnvironment(macCatalyst)
+        .onReceive(NotificationCenter.default.publisher(for: .learnfoldCommandSendCourseMessage)) { notification in
+            guard notification.object as? CourseExperienceStore === store else { return }
+            _ = sendCurrentMessage()
+        }
+        #endif
+        .litterFontFamily(.system)
+        // Course surfaces use native Dynamic Type. The classic conversation
+        // zoom is a separate preference and otherwise makes this screen's
+        // messages larger than its surrounding controls and guidance.
+        .environment(\.textScale, 1.0)
+        .modifier(CourseChatNavigationTitleModifier(
+            title: pageContext != nil ? "Ask AI" : selectionContext == nil
+                ? (store.generatedCourseID == nil ? "New Course" : "Course Agent")
+                : "Ask about this passage",
+            isEmbedded: isEmbedded
+        ))
+        .onAppear {
+            syncChatModel()
+            if pendingInitialQuestion == nil, let draft = store.takeDraft(for: selectionDiscussionID) {
+                inputText = draft
+            }
+            hasSentPageContext = pageContext != nil && selectionDiscussionID.map {
+                store.selectionDiscussionHasSubmittedQuestion(id: $0)
+            } == true
+            sendPendingInitialQuestionIfReady()
+            if selectionDiscussionID == nil, selectionContext == nil, pageContext == nil {
+                store.applyCompletedCoursePlanToolCalls(appModel: appModel)
+            }
+            hasSentSelectionContext =
+                selectionDiscussionID.map {
+                    store.selectionDiscussionHasSubmittedQuestion(id: $0)
+                } ?? false
+        }
+        .onDisappear {
+            signInTask?.cancel()
+            signInTask = nil
+            if let queuedQuestionOption {
+                // Never sent; keep it as the draft rather than lose it.
+                self.queuedQuestionOption = nil
+                inputText = queuedQuestionOption
+            }
+            store.saveDraft(
+                inputText,
+                for: selectionDiscussionID,
+                expectedWorkspaceID: draftWorkspaceID
+            )
+        }
+    }
+
+    private var courseReadiness: some View {
+        courseAppearance
+        .onChange(of: isAgentReady) { _, _ in
+            sendPendingInitialQuestionIfReady()
+            sendQueuedQuestionOptionIfReady()
+        }
+        .onChange(of: store.assistantInitiationVersion) { _, _ in
+            acknowledgeAssistantInitiationIfAccepted()
+        }
+        .onChange(of: pageContext?.assistantInitiation) { _, instruction in
+            // A review can request a discussion while this page chat is
+            // already presented. Its identity stays the same, so refresh the
+            // pending opening instead of relying on a new view's initializer.
+            awaitingAssistantInitiationAcceptance = nil
+            pendingAssistantInitiation = instruction
+            sendPendingInitialQuestionIfReady()
+        }
+        .onChange(of: store.chatThreadKey(selectionDiscussionID: selectionDiscussionID)) { _, _ in
+            syncChatModel()
+        }
+        .onChange(of: store.localMessages(for: selectionDiscussionID).count) { _, _ in
+            // A restored Apple transcript reaches an empty timeline.
+            guard !usesClassicCourseChat, !isAgentWorking, chatModel.isEmpty else { return }
+            store.syncPlatformChatTranscript(
+                selectionDiscussionID: selectionDiscussionID,
+                appStore: appModel.store
+            )
+        }
+    }
+
+    private var courseLifecycle: some View {
+        courseReadiness
+        .onChange(of: isAgentWorking) { _, working in
+            if !working {
+                // A preview the source never staged was not sent.
+                chatModel.setLocalPreview(nil)
+            }
+            sendPendingInitialQuestionIfReady()
+            sendQueuedQuestionOptionIfReady()
+            if !working, selectionDiscussionID == nil, selectionContext == nil, pageContext == nil {
+                store.applyCompletedCoursePlanToolCalls(appModel: appModel)
+            }
+        }
+        .onChange(of: store.lastAcceptedSelectionContextID) { _, acceptedID in
+            if acceptedID == selectionContext?.id {
+                hasSentSelectionContext = true
+            }
+        }
+        .onChange(of: restoredDraftText) { _, restoredDraft in
+            guard pendingInitialQuestion == nil,
+                  let restoredDraft,
+                  !restoredDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  restoredDraft != inputText else { return }
+            inputText = restoredDraft
+        }
+        .onChange(of: inputText) { _, draft in
+            store.saveDraft(
+                draft,
+                for: selectionDiscussionID,
+                expectedWorkspaceID: draftWorkspaceID
+            )
+        }
+        .task {
+            if let selectionDiscussionID {
+                await store.refreshSelectionDiscussionReadiness(
+                    id: selectionDiscussionID,
+                    appModel: appModel
+                )
+                await store.prepareSelectionDiscussionThread(
+                    id: selectionDiscussionID,
+                    appModel: appModel,
+                    appState: appState
+                )
+                hasSentSelectionContext =
+                    store.selectionDiscussionHasSubmittedQuestion(
+                        id: selectionDiscussionID
+                    )
+                hasSentPageContext = pageContext != nil
+                    && store.selectionDiscussionHasSubmittedQuestion(id: selectionDiscussionID)
+                guard !Task.isCancelled else { return }
+                hasPreparedDiscussion = true
+                sendPendingInitialQuestionIfReady()
+            } else {
+                await store.refreshAgentReadiness(appModel: appModel)
+                await store.hydrateCourseThread(appModel: appModel, appState: appState)
+            }
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var courseToolbar: some ToolbarContent {
+            if showsDismissButton {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Done", action: dismissDiscussion)
+                }
+            }
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if selectionContext != nil, selectionDiscussionID != nil {
+                    Button("Resolve") {
+                        resolveDiscussion()
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .disabled(
+                        isResolvingDiscussion ||
+                            isPreparingSelectionDiscussion ||
+                            isAgentWorking ||
+                            blocksNewSubmissionForHermesRecovery
+                    )
+                    .accessibilityIdentifier("course-chat-resolve")
+                }
+                if selectionDiscussionID == nil,
+                   CourseAgentProvider.isApple(displayedAgentID) {
+                    Menu {
+                        Button {
+                            store.switchCurrentAppleProvider(
+                                to: CourseAgentProvider.applePrivateCloud
+                            )
+                        } label: {
+                            Label(
+                                "Private Cloud Compute",
+                                systemImage: displayedAgentID == CourseAgentProvider.applePrivateCloud
+                                    ? "checkmark.circle.fill"
+                                    : "cloud"
+                            )
+                        }
+                        .disabled(
+                            !store.canSwitchCurrentThread(
+                                to: CourseAgentProvider.applePrivateCloud
+                            )
+                        )
+
+                        Button {
+                            store.switchCurrentAppleProvider(
+                                to: CourseAgentProvider.appleOnDevice
+                            )
+                        } label: {
+                            Label(
+                                "On‑Device",
+                                systemImage: displayedAgentID == CourseAgentProvider.appleOnDevice
+                                    ? "checkmark.circle.fill"
+                                    : "iphone"
+                            )
+                        }
+                        .disabled(
+                            !store.canSwitchCurrentThread(
+                                to: CourseAgentProvider.appleOnDevice
+                            )
+                        )
+                    } label: {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                    .disabled(isAgentWorking)
+                    .accessibilityLabel("Switch Apple model")
+                    .accessibilityIdentifier("course-chat-apple-provider-switch")
+                }
+                agentStatusControl
+            }
+    }
+
+    private var embeddedDiscussionHeader: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Ask AI")
+                    .font(.system(size: 14, weight: .semibold))
+                Text(selectionContext == nil ? "About this lesson" : "About this passage")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            if selectionContext != nil, selectionDiscussionID != nil {
+                Button("Resolve", action: resolveDiscussion)
+                    .font(.system(size: 12, weight: .medium))
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(
+                        isResolvingDiscussion || isPreparingSelectionDiscussion ||
+                            isAgentWorking || blocksNewSubmissionForHermesRecovery
+                    )
+                    .accessibilityIdentifier("course-chat-resolve")
+            }
+            agentStatusControl
+            if showsDismissButton {
+                Button(action: dismissDiscussion) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Close discussion")
+                .accessibilityLabel("Close discussion")
+                .accessibilityIdentifier("course-chat-close-panel")
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Color(uiColor: .secondarySystemBackground))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-chat-panel-header")
+    }
+
+    private func dismissDiscussion() {
+        if let onDismiss {
+            onDismiss()
+        } else {
+            dismiss()
+        }
+    }
+
+    @ViewBuilder
+    private var courseTranscript: some View {
+        if usesClassicCourseChat {
+            classicTranscript
+                .courseBottomBar {
+                    courseChatComposerInset
+                }
+        } else {
+            ChatScreen(
+                model: chatModel,
+                header: AnyView(courseChatHeader),
+                trailing: AnyView(courseChatTrailing),
+                composer: AnyView(courseChatComposerInset),
+                // The course error card already shows the failure.
+                hidesNewestTurnErrors: displayedAgentError != nil,
+                sendOption: { option in sendQuestionOption(option) },
+                optionsEnabled: canTakeQuestionOption
+            )
+        }
+    }
+
+    /// The classic transcript: local messages for hosted and Apple agents,
+    /// `ConversationTurnTimeline` for app-server agents. Kept only behind the
+    /// classic course chat switch.
+    private var classicTranscript: some View {
         ZStack {
             Color(uiColor: .systemGroupedBackground).ignoresSafeArea()
 
@@ -1239,179 +1627,18 @@ struct CourseChatView: View {
                             CourseChatQuestionOptionsView(
                                 question: pendingQuestion,
                                 isEnabled: canSendQuestionOption,
-                                onSelect: sendQuestionOption
+                                onSelect: { sendQuestionOption($0) }
                             )
                             .padding(.top, 2)
                             .id("course-chat-question")
                         }
 
                         if isAgentWorking && displayedAgentError == nil {
-                            Group {
-                                if let recoveryPresentation = displayedHermesRecoveryPresentation,
-                                   let progressState =
-                                       CourseHermesRecoveryProgressPolicy.progressState(
-                                           for: recoveryPresentation.provenance.journalState
-                                       ),
-                                   CourseHermesRecoveryProgressPolicy.shouldShow(
-                                       progressState: progressState,
-                                       hasDisplayedError: false,
-                                       isStopping: isStoppingAgent
-                                   ) {
-                                    CourseHermesRecoveryProgressView(
-                                        agentID: displayedAgentID,
-                                        provenance: recoveryPresentation.provenance,
-                                        progressState: progressState,
-                                        allowsWorkspaceDeletion:
-                                            store.canDeletePendingHermesDraft(
-                                                selectionDiscussionID:
-                                                    selectionDiscussionID
-                                            ),
-                                        onStopRecovery: stopHermesRecovery
-                                    )
-                                } else {
-                                    HStack(alignment: .center, spacing: 8) {
-                                        AgentIconView(kind: displayedAgentID, size: 27)
-                                        if isStoppingAgent {
-                                            ProgressView()
-                                                .controlSize(.small)
-                                            Text("Stopping…")
-                                                .font(.subheadline)
-                                                .foregroundStyle(.secondary)
-                                        } else if displayedAgentID == CourseAgentProvider.hosted,
-                                                  let progress = store.hostedReplyProgress[
-                                                    CourseChatScope(selectionDiscussionID: selectionDiscussionID)
-                                                  ] {
-                                            HostedReplyProgressView(progress: progress)
-                                        } else {
-                                            TypingIndicator()
-                                        }
-                                        Spacer()
-                                    }
-                                    .accessibilityElement(children: .combine)
-                                }
-                            }
-                            .id("course-agent-working")
+                            classicWorkingIndicator
+                                .id("course-agent-working")
                         }
 
-                        if store.showsBrief {
-                            CourseBriefCard(
-                                brief: store.brief,
-                                agentName: displayedAgentID.displayLabel,
-                                isAgentWorking: isAgentWorking,
-                                isApprovalEnabled: displayedSubmissionRecoveryState == nil
-                                    && !blocksNewSubmissionForHermesRecovery,
-                                buildAction: {
-                                    store.approveCoursePlan(appModel: appModel, appState: appState)
-                                }
-                            )
-                                .id("course-brief")
-                        }
-
-                        if selectionDiscussionID == nil,
-                           selectionContext == nil,
-                           pageContext == nil,
-                           !isAgentWorking,
-                           let planIssue = store.coursePlanIssue {
-                            CoursePlanIssueCard(message: planIssue) {
-                                store.requestCoursePlanCorrection(
-                                    appModel: appModel,
-                                    appState: appState
-                                )
-                            }
-                            .id("course-plan-issue")
-                        }
-
-                        if let agentError = displayedAgentError {
-                            let recoveryPresentation =
-                                store.hermesRecoveryPresentation(
-                                    selectionDiscussionID: selectionDiscussionID
-                                )
-                            let recoveryActions = recoveryPresentation.map {
-                                CourseHermesRecoveryProgressPolicy.availableActions(
-                                    for: $0.provenance.journalState
-                                )
-                            } ?? []
-                            let blockingAction = CourseAgentErrorActionPolicy.blockingAction(
-                                recoveryActions: recoveryActions,
-                                hasMissingBoundThread:
-                                    store.selectionDiscussionHasMissingBoundThread(
-                                        id: selectionDiscussionID
-                                    ),
-                                abandonMode: recoveryPresentation?.abandonMode
-                                    ?? .chooseWorkspaceDisposition
-                            )
-                            CourseAgentErrorCard(
-                                agentName: displayedAgentID.displayLabel,
-                                message: agentError,
-                                needsAuthentication: codexNeedsSignIn,
-                                isConnecting: displayedConnectionState == .connecting || isReconnectingAgent,
-                                showsReconnectAction: CourseAgentErrorActionPolicy.showsReconnect(
-                                    agentID: displayedAgentID,
-                                    hasOwnedReadinessError: store.isDisplayingOwnedReadinessError(
-                                        for: selectionDiscussionID
-                                    ),
-                                    needsAuthentication: codexNeedsSignIn
-                                ),
-                                blockingAction: blockingAction,
-                                abandonMode: recoveryPresentation?.abandonMode
-                                    ?? .chooseWorkspaceDisposition,
-                                allowsWorkspaceDeletion: store.canDeletePendingHermesDraft(
-                                    selectionDiscussionID: selectionDiscussionID
-                                ),
-                                allowsUnknownSubmissionAbandon: store.canAbandonUnconfirmedSubmission(
-                                    selectionDiscussionID: selectionDiscussionID
-                                ),
-                                submissionRecoveryState: displayedSubmissionRecoveryState,
-                                hermesRecoveryProvenance: recoveryPresentation?.provenance,
-                                isCheckingStatus: store.isCheckingSubmissionStatus(
-                                    selectionDiscussionID: selectionDiscussionID
-                                ),
-                                statusCheckOutcome: store.submissionStatusCheckOutcome(
-                                    selectionDiscussionID: selectionDiscussionID
-                                ),
-                                onReconnect: reconnectAgent,
-                                onRetrySubmission: retryCurrentSubmission,
-                                onCheckStatus: checkSubmissionStatus,
-                                onDiscardSubmission: discardRecoveredSubmission,
-                                onAbandonUnknownSubmission: abandonUnconfirmedSubmission,
-                                onRetryRecovery: {
-                                    Task {
-                                        await store.retryPendingHermesRecovery(
-                                            selectionDiscussionID: selectionDiscussionID,
-                                            appModel: appModel,
-                                            appState: appState
-                                        )
-                                    }
-                                },
-                                onAbandonRecovery: stopHermesRecovery,
-                                onStartNewDiscussion: {
-                                    guard let selectionDiscussionID else { return }
-                                    store.saveDraft(
-                                        inputText,
-                                        for: selectionDiscussionID,
-                                        expectedWorkspaceID: draftWorkspaceID
-                                    )
-                                    Task {
-                                        do {
-                                            let replacement = try await store.replaceMissingSelectionDiscussion(
-                                                id: selectionDiscussionID,
-                                                appModel: appModel
-                                            )
-                                            onSelectionDiscussionReplaced(replacement)
-                                        } catch {
-                                            let replacementErrorMessage = error.localizedDescription
-                                            store.selectionDiscussionErrors[selectionDiscussionID] =
-                                                replacementErrorMessage
-                                        }
-                                    }
-                                },
-                                onDismiss: dismissDisplayedError,
-                                allowsDismissal:
-                                    CourseHermesRecoveryProgressPolicy.allowsErrorDismissal(
-                                        hasRecoveryPresentation: recoveryPresentation != nil
-                                    )
-                            )
-                        }
+                        courseStatusCards
 
                         Color.clear
                             .frame(height: 1)
@@ -1485,229 +1712,378 @@ struct CourseChatView: View {
                 }
             }
         }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("course-request-lifecycle")
-        .accessibilityValue(requestLifecycle?.rawValue ?? "")
-        .courseBottomBar {
-            courseChatComposerInset
-        }
-        .litterFontFamily(.system)
-        // Course surfaces use native Dynamic Type. The classic conversation
-        // zoom is a separate preference and otherwise makes this screen's
-        // messages larger than its surrounding controls and guidance.
-        .environment(\.textScale, 1.0)
-        .navigationTitle(pageContext != nil ? "Ask AI" : selectionContext == nil ? (store.generatedCourseID == nil ? "New Course" : "Course Agent") : "Ask about this passage")
-        .navigationBarTitleDisplayMode(.inline)
-        .onAppear {
-            if pendingInitialQuestion == nil, let draft = store.takeDraft(for: selectionDiscussionID) {
-                inputText = draft
-            }
-            sendPendingInitialQuestionIfReady()
-            if selectionDiscussionID == nil, selectionContext == nil, pageContext == nil {
-                store.applyCompletedCoursePlanToolCalls(appModel: appModel)
-            }
-            hasSentSelectionContext =
-                selectionDiscussionID.map {
-                    store.selectionDiscussionHasSubmittedQuestion(id: $0)
-                } ?? false
-        }
-        .onDisappear {
-            signInTask?.cancel()
-            signInTask = nil
-            store.saveDraft(
-                inputText,
-                for: selectionDiscussionID,
-                expectedWorkspaceID: draftWorkspaceID
+    }
+
+    /// Plan approval, plan-issue and agent-error cards. Shared by both
+    /// transcripts; in the shared timeline they sit inside the newest turn.
+    @ViewBuilder
+    private var courseStatusCards: some View {
+        if selectionDiscussionID == nil, pageContext == nil, store.showsBrief {
+            CourseBriefCard(
+                brief: store.brief,
+                agentName: displayedAgentID.displayLabel,
+                isAgentWorking: isAgentWorking,
+                isApprovalEnabled: displayedSubmissionRecoveryState == nil
+                    && !blocksNewSubmissionForHermesRecovery,
+                buildAction: {
+                    store.approveCoursePlan(appModel: appModel, appState: appState)
+                }
             )
+                .id("course-brief")
         }
-        .onChange(of: isAgentReady) { _, _ in
-            sendPendingInitialQuestionIfReady()
-        }
-        .onChange(of: isAgentWorking) { _, working in
-            sendPendingInitialQuestionIfReady()
-            if !working, selectionDiscussionID == nil, selectionContext == nil, pageContext == nil {
-                store.applyCompletedCoursePlanToolCalls(appModel: appModel)
-            }
-        }
-        .onChange(of: store.lastAcceptedSelectionContextID) { _, acceptedID in
-            if acceptedID == selectionContext?.id {
-                hasSentSelectionContext = true
-            }
-        }
-        .onChange(of: restoredDraftText) { _, restoredDraft in
-            guard pendingInitialQuestion == nil,
-                  let restoredDraft,
-                  !restoredDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  restoredDraft != inputText else { return }
-            inputText = restoredDraft
-        }
-        .onChange(of: inputText) { _, draft in
-            store.saveDraft(
-                draft,
-                for: selectionDiscussionID,
-                expectedWorkspaceID: draftWorkspaceID
-            )
-        }
-        .task {
-            if let selectionDiscussionID {
-                await store.refreshSelectionDiscussionReadiness(
-                    id: selectionDiscussionID,
-                    appModel: appModel
-                )
-                await store.prepareSelectionDiscussionThread(
-                    id: selectionDiscussionID,
+
+        if selectionDiscussionID == nil,
+           selectionContext == nil,
+           pageContext == nil,
+           !isAgentWorking,
+           let planIssue = store.coursePlanIssue {
+            CoursePlanIssueCard(message: planIssue) {
+                store.requestCoursePlanCorrection(
                     appModel: appModel,
                     appState: appState
                 )
-                hasSentSelectionContext =
-                    store.selectionDiscussionHasSubmittedQuestion(
-                        id: selectionDiscussionID
-                    )
-            } else {
-                await store.refreshAgentReadiness(appModel: appModel)
-                await store.hydrateCourseThread(appModel: appModel, appState: appState)
             }
+            .id("course-plan-issue")
         }
-        .toolbar {
-            if showsDismissButton {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Done") { dismiss() }
-                }
-            }
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                if selectionDiscussionID != nil {
-                    Button("Resolve") {
-                        resolveDiscussion()
-                    }
-                    .font(.subheadline.weight(.semibold))
-                    .disabled(
-                        isResolvingDiscussion ||
-                            isPreparingSelectionDiscussion ||
-                            isAgentWorking ||
-                            blocksNewSubmissionForHermesRecovery
-                    )
-                    .accessibilityIdentifier("course-chat-resolve")
-                }
-                if selectionDiscussionID == nil,
-                   CourseAgentProvider.isApple(displayedAgentID) {
-                    Menu {
-                        Button {
-                            store.switchCurrentAppleProvider(
-                                to: CourseAgentProvider.applePrivateCloud
-                            )
-                        } label: {
-                            Label(
-                                "Private Cloud Compute",
-                                systemImage: displayedAgentID == CourseAgentProvider.applePrivateCloud
-                                    ? "checkmark.circle.fill"
-                                    : "cloud"
-                            )
-                        }
-                        .disabled(
-                            !store.canSwitchCurrentThread(
-                                to: CourseAgentProvider.applePrivateCloud
-                            )
-                        )
 
-                        Button {
-                            store.switchCurrentAppleProvider(
-                                to: CourseAgentProvider.appleOnDevice
+        if let agentError = displayedAgentError {
+            let recoveryPresentation =
+                store.hermesRecoveryPresentation(
+                    selectionDiscussionID: selectionDiscussionID
+                )
+            let recoveryActions = recoveryPresentation.map {
+                CourseHermesRecoveryProgressPolicy.availableActions(
+                    for: $0.provenance.journalState
+                )
+            } ?? []
+            let blockingAction = CourseAgentErrorActionPolicy.blockingAction(
+                recoveryActions: recoveryActions,
+                hasMissingBoundThread:
+                    store.selectionDiscussionHasMissingBoundThread(
+                        id: selectionDiscussionID
+                    ),
+                abandonMode: recoveryPresentation?.abandonMode
+                    ?? .chooseWorkspaceDisposition
+            )
+            CourseAgentErrorCard(
+                agentName: displayedAgentID.displayLabel,
+                message: agentError,
+                needsAuthentication: codexNeedsSignIn,
+                isConnecting: displayedConnectionState == .connecting || isReconnectingAgent,
+                showsReconnectAction: CourseAgentErrorActionPolicy.showsReconnect(
+                    agentID: displayedAgentID,
+                    hasOwnedReadinessError: store.isDisplayingOwnedReadinessError(
+                        for: selectionDiscussionID
+                    ),
+                    needsAuthentication: codexNeedsSignIn
+                ),
+                blockingAction: blockingAction,
+                abandonMode: recoveryPresentation?.abandonMode
+                    ?? .chooseWorkspaceDisposition,
+                allowsWorkspaceDeletion: store.canDeletePendingHermesDraft(
+                    selectionDiscussionID: selectionDiscussionID
+                ),
+                allowsUnknownSubmissionAbandon: store.canAbandonUnconfirmedSubmission(
+                    selectionDiscussionID: selectionDiscussionID
+                ),
+                submissionRecoveryState: displayedSubmissionRecoveryState,
+                hermesRecoveryProvenance: recoveryPresentation?.provenance,
+                isCheckingStatus: store.isCheckingSubmissionStatus(
+                    selectionDiscussionID: selectionDiscussionID
+                ),
+                statusCheckOutcome: store.submissionStatusCheckOutcome(
+                    selectionDiscussionID: selectionDiscussionID
+                ),
+                onReconnect: reconnectAgent,
+                onRetrySubmission: retryCurrentSubmission,
+                onCheckStatus: checkSubmissionStatus,
+                onDiscardSubmission: discardRecoveredSubmission,
+                onAbandonUnknownSubmission: abandonUnconfirmedSubmission,
+                onRetryRecovery: {
+                    Task {
+                        await store.retryPendingHermesRecovery(
+                            selectionDiscussionID: selectionDiscussionID,
+                            appModel: appModel,
+                            appState: appState
+                        )
+                    }
+                },
+                onAbandonRecovery: stopHermesRecovery,
+                onStartNewDiscussion: {
+                    guard let selectionDiscussionID else { return }
+                    store.saveDraft(
+                        inputText,
+                        for: selectionDiscussionID,
+                        expectedWorkspaceID: draftWorkspaceID
+                    )
+                    Task {
+                        do {
+                            let replacement = try await store.replaceMissingSelectionDiscussion(
+                                id: selectionDiscussionID,
+                                appModel: appModel
                             )
-                        } label: {
-                            Label(
-                                "On‑Device",
-                                systemImage: displayedAgentID == CourseAgentProvider.appleOnDevice
-                                    ? "checkmark.circle.fill"
-                                    : "iphone"
-                            )
+                            onSelectionDiscussionReplaced(replacement)
+                        } catch {
+                            let replacementErrorMessage = error.localizedDescription
+                            store.selectionDiscussionErrors[selectionDiscussionID] =
+                                replacementErrorMessage
                         }
-                        .disabled(
-                            !store.canSwitchCurrentThread(
-                                to: CourseAgentProvider.appleOnDevice
-                            )
-                        )
-                    } label: {
-                        Image(systemName: "arrow.triangle.2.circlepath")
                     }
-                    .disabled(isAgentWorking)
-                    .accessibilityLabel("Switch Apple model")
-                    .accessibilityIdentifier("course-chat-apple-provider-switch")
-                }
-                agentStatusControl
-            }
+                },
+                onDismiss: dismissDisplayedError,
+                allowsDismissal:
+                    CourseHermesRecoveryProgressPolicy.allowsErrorDismissal(
+                        hasRecoveryPresentation: recoveryPresentation != nil
+                    )
+            )
         }
-        .fileImporter(
-            isPresented: $showsFileImporter,
-            allowedContentTypes: [.data],
-            allowsMultipleSelection: true
-        ) { result in
-            switch result {
-            case .success(let urls):
-                Task {
-                    do {
-                        try await store.importDocumentSources(
-                            urls,
-                            selectionDiscussionID: selectionDiscussionID
-                        )
-                    } catch is CancellationError {
-                        return
-                    } catch {
-                        attachmentError = CourseSourceAttachmentErrorPresentation(
-                            error: error
-                        )
-                    }
+    }
+
+    /// Durable Hermes recovery progress, when a recovery journal is running.
+    @ViewBuilder
+    private var hermesRecoveryProgress: some View {
+        if let recoveryPresentation = displayedHermesRecoveryPresentation,
+           let progressState =
+               CourseHermesRecoveryProgressPolicy.progressState(
+                   for: recoveryPresentation.provenance.journalState
+               ),
+           CourseHermesRecoveryProgressPolicy.shouldShow(
+               progressState: progressState,
+               hasDisplayedError: false,
+               isStopping: isStoppingAgent
+           ) {
+            CourseHermesRecoveryProgressView(
+                agentID: displayedAgentID,
+                provenance: recoveryPresentation.provenance,
+                progressState: progressState,
+                allowsWorkspaceDeletion:
+                    store.canDeletePendingHermesDraft(
+                        selectionDiscussionID:
+                            selectionDiscussionID
+                    ),
+                onStopRecovery: stopHermesRecovery
+            )
+        }
+    }
+
+    private var showsHermesRecoveryProgress: Bool {
+        guard let recoveryPresentation = displayedHermesRecoveryPresentation,
+              let progressState = CourseHermesRecoveryProgressPolicy.progressState(
+                  for: recoveryPresentation.provenance.journalState
+              ) else { return false }
+        return CourseHermesRecoveryProgressPolicy.shouldShow(
+            progressState: progressState,
+            hasDisplayedError: false,
+            isStopping: isStoppingAgent
+        )
+    }
+
+    /// The classic transcript's provider-specific working row.
+    @ViewBuilder
+    private var classicWorkingIndicator: some View {
+        if showsHermesRecoveryProgress {
+            hermesRecoveryProgress
+        } else {
+            HStack(alignment: .center, spacing: 8) {
+                AgentIconView(kind: displayedAgentID, size: 27)
+                if isStoppingAgent {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Stopping…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                } else if displayedAgentID == CourseAgentProvider.hosted,
+                          let progress = store.hostedReplyProgress[
+                            CourseChatScope(selectionDiscussionID: selectionDiscussionID)
+                          ] {
+                    HostedReplyProgressView(progress: progress)
+                } else {
+                    TypingIndicator()
                 }
-            case .failure(let error):
-                attachmentError = CourseSourceAttachmentErrorPresentation(
-                    error: error
+                Spacer()
+            }
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    // MARK: - Shared chat timeline
+
+    /// Context cards above the first turn.
+    @ViewBuilder
+    private var courseChatHeader: some View {
+        VStack(spacing: 18) {
+            if let selectionContext {
+                CourseSelectionContextCard(
+                    reference: selectionContext,
+                    agentName: displayedAgentID.displayLabel,
+                    focusedQAState: focusedQAState
+                )
+            } else if let pageContext {
+                coursePageContextCard(pageContext)
+            } else if chatModel.isEmpty || keepsIntroAboveFirstMessage {
+                CourseChatIntro(
+                    agentID: displayedAgentID,
+                    supportsBinarySources: CourseAgentProvider.supportsBinarySources(
+                        displayedAgentID
+                    )
                 )
             }
+            if isPreparingSelectionDiscussion {
+                preparingSelectionDiscussionRow
+            }
         }
-        .onChange(of: selectedPhoto) { _, item in
-            guard let item else { return }
-            Task {
-                defer { selectedPhoto = nil }
-                let data: Data
-                do {
-                    guard let loadedData = try await item.loadTransferable(type: Data.self) else {
-                        attachmentError = CourseSourceAttachmentErrorPresentation(
-                            kind: .parse
-                        )
-                        return
-                    }
-                    data = loadedData
-                } catch is CancellationError {
-                    return
-                } catch {
-                    attachmentError = CourseSourceAttachmentErrorPresentation(
-                        error: error,
-                        fallbackKind: .parse
-                    )
+        .padding(.top, 6)
+    }
+
+    /// Course state at the end of the newest turn.
+    @ViewBuilder
+    private var courseChatTrailing: some View {
+        VStack(spacing: 18) {
+            if isAgentWorking, displayedAgentError == nil, showsHermesRecoveryProgress {
+                hermesRecoveryProgress
+            }
+            courseStatusCards
+        }
+    }
+
+    private func importSelectedPhoto(_ item: PhotosPickerItem) {
+        Task {
+            defer { selectedPhoto = nil }
+            let data: Data
+            do {
+                guard let loaded = try await item.loadTransferable(type: Data.self) else {
+                    attachmentError = CourseSourceAttachmentErrorPresentation(kind: .parse)
                     return
                 }
+                data = loaded
+            } catch is CancellationError {
+                return
+            } catch {
+                attachmentError = CourseSourceAttachmentErrorPresentation(error: error, fallbackKind: .parse)
+                return
+            }
+            do {
+                try await store.importImageSource(data: data, selectionDiscussionID: selectionDiscussionID)
+            } catch is CancellationError {
+                return
+            } catch {
+                attachmentError = CourseSourceAttachmentErrorPresentation(error: error)
+            }
+        }
+    }
+
+    private func handleDocumentSourceImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            Task {
                 do {
-                    try await store.importImageSource(
-                        data: data,
+                    try await store.importDocumentSources(
+                        urls,
                         selectionDiscussionID: selectionDiscussionID
                     )
                 } catch is CancellationError {
                     return
                 } catch {
-                    attachmentError = CourseSourceAttachmentErrorPresentation(
-                        error: error
-                    )
+                    attachmentError = CourseSourceAttachmentErrorPresentation(error: error)
                 }
             }
+        case .failure(let error):
+            attachmentError = CourseSourceAttachmentErrorPresentation(error: error)
         }
-        .courseSourceAttachmentErrorAlert(error: $attachmentError)
-        .alert("Couldn’t Resolve Discussion", isPresented: Binding(
-            get: { resolveError != nil },
-            set: { if !$0 { resolveError = nil } }
-        )) {
-            Button("OK", role: .cancel) { resolveError = nil }
-        } message: {
-            Text(resolveError ?? "The discussion is still open.")
+    }
+
+    private func coursePageContextCard(_ pageContext: CoursePageChatContext) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(pageContext.pageTitle, systemImage: "doc.text")
+                .font(.headline)
+            Text("Ask anything about this page. Its content is included with your message.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 18))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-page-chat-context")
+    }
+
+    private var preparingSelectionDiscussionRow: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Starting a focused discussion…")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Starting a focused discussion")
+    }
+
+    /// Points the timeline at the scope's current Rust chat thread. The key
+    /// changes when a hosted or Apple session or an app-server thread is
+    /// created, or when the agent is switched.
+    private func syncChatModel() {
+        guard !usesClassicCourseChat else { return }
+        let key = store.chatThreadKey(selectionDiscussionID: selectionDiscussionID)
+        guard key != chatModelKey || (key != nil && !chatModelHasSource) else { return }
+        chatModelKey = key
+        chatModelHasSource = key != nil
+        // The model (held in this view's state) keeps these closures, so they
+        // capture the store and app model weakly and never this view.
+        let store = store
+        let appModel = appModel
+        let selectionDiscussionID = selectionDiscussionID
+        let isMainCourseChat = selectionDiscussionID == nil && selectionContext == nil && pageContext == nil
+        let source = key.map { key in
+            RustChatTimelineSource(
+                store: appModel.store,
+                key: key,
+                options: store.chatViewOptions(selectionDiscussionID: selectionDiscussionID),
+                routing: ChatIntentRouting(
+                    // Course messages, tapped options included, go through
+                    // the course composer path (`ChatScreen.sendOption`).
+                    send: { _ in false },
+                    stop: { [weak store, weak appModel] in
+                        guard let store, let appModel else { return }
+                        store.interruptAgent(
+                            appModel: appModel,
+                            selectionDiscussionID: selectionDiscussionID
+                        )
+                    },
+                    respondToRequest: { [weak appModel] requestID, questionID, option in
+                        guard let appModel else { return }
+                        Task { @MainActor in
+                            try? await appModel.store.respondToUserInput(
+                                requestId: requestID,
+                                answers: [PendingUserInputAnswer(questionId: questionID, answers: [option])]
+                            )
+                        }
+                    }
+                ),
+                prepare: { [weak store, weak appModel] in
+                    guard let store, let appModel else { return }
+                    store.syncPlatformChatTranscript(
+                        selectionDiscussionID: selectionDiscussionID,
+                        appStore: appModel.store
+                    )
+                }
+            )
+        }
+        let model = ChatScreenModel(source: source)
+        if isMainCourseChat {
+            // Plans presented through tools reach the plan card as their rows
+            // arrive, instead of through a polling loop.
+            model.onRowsChanged = { [weak store, weak appModel] _ in
+                guard let store, let appModel else { return }
+                store.applyCompletedCoursePlanToolCalls(appModel: appModel)
+            }
+        }
+        // The first message of a new chat creates its thread, so this swap
+        // can happen mid-send; keep that send's pending bubble.
+        model.continuePendingSend(from: chatModel)
+        chatModel = model
     }
 
     @ViewBuilder
@@ -1731,7 +2107,7 @@ struct CourseChatView: View {
             }
             CourseChatComposer(
                 inputText: $inputText,
-                prompt: pendingQuestion != nil
+                prompt: hasPendingQuestion
                     ? CourseChatQuestion.freeTextPrompt
                     : pageContext != nil ? "Ask about this page" : selectionDiscussionID == nil
                     ? "Message your course agent"
@@ -1739,8 +2115,10 @@ struct CourseChatView: View {
                 sources: displayedSources,
                 isFocused: $composerFocused,
                 onRemoveSource: { store.removeSource($0, for: selectionDiscussionID) },
-                onSend: sendCurrentMessage,
-                isAgentWorking: isAgentWorking,
+                onSend: { sendCurrentMessage() },
+                // A pending `request_user_input` question takes a typed
+                // answer, so the composer offers Send rather than Stop.
+                isAgentWorking: isAgentWorking && !awaitsRequestAnswer,
                 isPreparing: isPreparingSelectionDiscussion || isPreparingDisplayedSource,
                 preparationLabel: isPreparingSelectionDiscussion
                     ? "Starting focused discussion…"
@@ -1749,7 +2127,8 @@ struct CourseChatView: View {
                 isAgentReady: isAgentReady
                     && displayedSubmissionRecoveryState?.blocksNewSubmission != true
                     && !blocksNewSubmissionForHermesRecovery,
-                isStopping: isStoppingAgent,
+                isStopping: isStoppingAgent
+                    || (!usesClassicCourseChat && chatModel.phase == .stopping),
                 onStop: {
                     store.interruptAgent(
                         appModel: appModel,
@@ -1775,26 +2154,105 @@ struct CourseChatView: View {
         return CourseChatQuestionPolicy.pendingQuestion(in: remoteTimelineItems)
     }
 
+    /// Whether the agent's newest reply asks the learner a question.
+    private var hasPendingQuestion: Bool {
+        if usesClassicCourseChat { return pendingQuestion != nil }
+        return chatModel.answerableQuestionRowID != nil
+    }
+
+    /// Whether the agent can take a message apart from finishing its
+    /// current turn: the composer's own send guards, minus `isAgentWorking`.
+    private var canTakeMessageWhenFree: Bool {
+        CourseChatSendGate.canTakeMessageWhenFree(
+            isAgentReady: isAgentReady,
+            isPreparing: isPreparingSelectionDiscussion || isPreparingDisplayedSource,
+            blocksNewSubmission: displayedSubmissionRecoveryState?.blocksNewSubmission == true
+                || blocksNewSubmissionForHermesRecovery
+        )
+    }
+
+    /// Question options are tappable when the agent can take a message. A
+    /// tap while the previous turn is still winding down is queued.
+    private var canTakeQuestionOption: Bool {
+        canTakeMessageWhenFree
+    }
+
+    /// The classic transcript's options, which have no queue.
     private var canSendQuestionOption: Bool {
-        isAgentReady
-            && !isAgentWorking
-            && !isPreparingSelectionDiscussion
-            && !isPreparingDisplayedSource
-            && displayedSubmissionRecoveryState?.blocksNewSubmission != true
-            && !blocksNewSubmissionForHermesRecovery
+        canTakeMessageWhenFree && !isAgentWorking
+    }
+
+    /// True while a Codex `request_user_input` question waits for the
+    /// learner's answer in the shared timeline.
+    private var awaitsRequestAnswer: Bool {
+        !usesClassicCourseChat && chatModel.awaitsRequestAnswer
     }
 
     /// Sends a tapped answer through the ordinary composer path so every
-    /// readiness guard applies. If sending is refused, the answer stays in
-    /// the composer for the learner to send later.
-    private func sendQuestionOption(_ option: String) {
-        inputText = option
-        sendCurrentMessage()
+    /// readiness guard applies. Rust enables options as soon as the turn
+    /// settles, a moment before the store's run state does; a tap in that
+    /// window is queued and sent once the agent is free.
+    @discardableResult
+    private func sendQuestionOption(_ option: String) -> Bool {
+        switch CourseChatSendGate.optionDisposition(
+            canSendNow: canSubmitMessage,
+            canTakeMessageWhenFree: canTakeMessageWhenFree
+        ) {
+        case .send:
+            guard submitMessage(option) else {
+                inputText = option
+                return false
+            }
+            return true
+        case .queue:
+            queuedQuestionOption = option
+            chatModel.setLocalPreview(option)
+            return true
+        case .refuse:
+            // Not sendable now; leave it in the composer for later.
+            inputText = option
+            return false
+        }
+    }
+
+    private func sendQueuedQuestionOptionIfReady() {
+        guard let option = queuedQuestionOption, canTakeMessageWhenFree else { return }
+        guard canSubmitMessage else { return }
+        queuedQuestionOption = nil
+        if !submitMessage(option) {
+            chatModel.setLocalPreview(nil)
+            inputText = option
+        }
     }
 
     /// Sends the tapped follow-up question once. If the agent is not ready the
     /// question stays in the composer for the learner to send later.
     private func sendPendingInitialQuestionIfReady() {
+        acknowledgeAssistantInitiationIfAccepted()
+        guard selectionDiscussionID == nil || hasPreparedDiscussion,
+              !isPreparingSelectionDiscussion else { return }
+        if let instruction = pendingAssistantInitiation {
+            if store.assistantInitiationWasAccepted(instruction, selectionDiscussionID: selectionDiscussionID) {
+                pendingAssistantInitiation = nil
+                onAssistantInitiationSent()
+                return
+            }
+            guard isAgentReady, !isAgentWorking, !blocksNewSubmissionForHermesRecovery else { return }
+            // Its exact tagged prefix reaches the Rust transcript projection.
+            // Do not wrap it in a fabricated learner question or page envelope.
+            guard store.sendMessage(
+                instruction,
+                selectionDiscussionID: selectionDiscussionID,
+                visibility: .assistantInitiated,
+                appModel: appModel,
+                appState: appState
+            ) else { return }
+            pendingAssistantInitiation = nil
+            awaitingAssistantInitiationAcceptance = instruction
+            hasSentPageContext = true
+            acknowledgeAssistantInitiationIfAccepted()
+            return
+        }
         guard let question = pendingInitialQuestion,
               isAgentReady,
               !isAgentWorking,
@@ -1803,13 +2261,43 @@ struct CourseChatView: View {
         sendCurrentMessage()
     }
 
-    private func sendCurrentMessage() {
-        guard !isPreparingSelectionDiscussion,
-              !isPreparingDisplayedSource,
-              isAgentReady,
-              !isAgentWorking,
-              !blocksNewSubmissionForHermesRecovery else { return }
-        let text = inputText
+    private func acknowledgeAssistantInitiationIfAccepted() {
+        guard let instruction = awaitingAssistantInitiationAcceptance,
+              instruction == pageContext?.assistantInitiation,
+              store.assistantInitiationWasAccepted(instruction, selectionDiscussionID: selectionDiscussionID) else { return }
+        awaitingAssistantInitiationAcceptance = nil
+        onAssistantInitiationSent()
+    }
+
+    @discardableResult
+    private func sendCurrentMessage() -> Bool {
+        if awaitsRequestAnswer {
+            // The live turn waits on this answer, so it is not a new message.
+            guard chatModel.send(inputText) else { return false }
+            inputText = ""
+            composerFocused = false
+            return true
+        }
+        guard submitMessage(inputText) else { return false }
+        inputText = ""
+        composerFocused = false
+        return true
+    }
+
+    /// The composer's send guards.
+    private var canSubmitMessage: Bool {
+        !isPreparingSelectionDiscussion
+            && !isPreparingDisplayedSource
+            && isAgentReady
+            && !isAgentWorking
+            && !blocksNewSubmissionForHermesRecovery
+    }
+
+    /// Sends `text` as the learner's next message. Returns `false` when it
+    /// was refused.
+    @discardableResult
+    private func submitMessage(_ text: String) -> Bool {
+        guard canSubmitMessage else { return false }
         let reference = hasSentSelectionContext ? nil : selectionContext
         let accepted = store.sendMessage(
             text,
@@ -1819,12 +2307,16 @@ struct CourseChatView: View {
             appModel: appModel,
             appState: appState
         )
-        guard accepted else { return }
+        guard accepted else { return false }
         hasSentPageContext = true
-        inputText = ""
-        composerFocused = false
         autoFollowStreaming = true
         isNearBottom = true
+        if !usesClassicCourseChat {
+            if chatModel.isEmpty { keepsIntroAboveFirstMessage = true }
+            // The message is shown as pending until the source stages it.
+            chatModel.noteLocalSend(previewText: text)
+        }
+        return true
     }
 
     private func retryCurrentSubmission() {
@@ -1855,7 +2347,7 @@ struct CourseChatView: View {
                     id: selectionDiscussionID,
                     appModel: appModel
                 )
-                dismiss()
+                dismissDiscussion()
             } catch {
                 resolveError = "The agent discussion could not be closed, so the passage remains highlighted. \(error.localizedDescription)"
             }
@@ -1897,6 +2389,13 @@ struct CourseChatView: View {
                 appModel: appModel,
                 appState: appState
             )
+            // A message the agent received leaves the composer, so sending
+            // can't duplicate it; one it never got stays for a resend.
+            if store.submissionStatusCheckOutcome(
+                selectionDiscussionID: selectionDiscussionID
+            )?.result == .resolved {
+                inputText = store.takeDraft(for: selectionDiscussionID) ?? ""
+            }
         }
     }
 
@@ -4705,83 +5204,31 @@ private struct CourseSelectionConflictCheckpointView: View {
 }
 #endif
 
-#if DEBUG
-/// Debug-only transcript for verifying inline multiple-choice questions
-/// without a live agent. Launch with `--ui-test-course-chat-question`.
-struct CourseChatQuestionUITestHarnessView: View {
-    static var isEnabled: Bool {
-        ProcessInfo.processInfo.arguments.contains("--ui-test-course-chat-question")
+
+
+/// Send gating for tapped question options in the course chat.
+enum CourseChatSendGate {
+    enum OptionDisposition: Equatable {
+        case send
+        /// Blocked only because the agent is still finishing its turn.
+        case queue
+        case refuse
     }
 
-    @State private var messages: [CourseChatMessage] = [
-        CourseChatMessage(role: .learner, text: "Zk snarks"),
-        CourseChatMessage(
-            role: .agent,
-            text: """
-            Great topic. To personalize your course, let's understand your learning goal and background knowledge.
-
-            \(CourseChatQuestionPromptPolicy.exampleBlock)
-            """
-        ),
-    ]
-    @State private var inputText = ""
-    @State private var selectedPhoto: PhotosPickerItem?
-    @FocusState private var composerFocused: Bool
-
-    private var pendingQuestion: CourseChatQuestion? {
-        CourseChatQuestionPolicy.pendingQuestion(in: messages)
+    /// Whether the agent could take a message once it stops working.
+    static func canTakeMessageWhenFree(
+        isAgentReady: Bool,
+        isPreparing: Bool,
+        blocksNewSubmission: Bool
+    ) -> Bool {
+        isAgentReady && !isPreparing && !blocksNewSubmission
     }
 
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    ForEach(messages) { message in
-                        CourseMessageRow(message: message, agentID: CourseAgentProvider.hosted)
-                    }
-                    if let pendingQuestion {
-                        CourseChatQuestionOptionsView(
-                            question: pendingQuestion,
-                            isEnabled: true,
-                            onSelect: send
-                        )
-                        .padding(.top, 2)
-                    }
-                }
-                .padding(16)
-            }
-            .courseBottomBar {
-                CourseChatComposer(
-                    inputText: $inputText,
-                    prompt: pendingQuestion != nil
-                        ? CourseChatQuestion.freeTextPrompt
-                        : "Message your course agent",
-                    sources: [],
-                    isFocused: $composerFocused,
-                    onRemoveSource: { _ in },
-                    onSend: { send(inputText) },
-                    isAgentWorking: false,
-                    isPreparing: false,
-                    isEditingEnabled: true,
-                    isAgentReady: true,
-                    isStopping: false,
-                    onStop: {},
-                    supportsBinarySources: true,
-                    selectedPhoto: $selectedPhoto,
-                    onChooseFile: {},
-                    onPasteLink: {}
-                )
-            }
-            .navigationTitle("New Course")
-            .navigationBarTitleDisplayMode(.inline)
-        }
-    }
-
-    private func send(_ text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        messages.append(CourseChatMessage(role: .learner, text: trimmed))
-        inputText = ""
+    static func optionDisposition(
+        canSendNow: Bool,
+        canTakeMessageWhenFree: Bool
+    ) -> OptionDisposition {
+        if canSendNow { return .send }
+        return canTakeMessageWhenFree ? .queue : .refuse
     }
 }
-#endif

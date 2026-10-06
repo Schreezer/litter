@@ -1,3 +1,16 @@
 name = "learnfold"
-compatibility_date = "2024-12-01"
+compatibility_date = "2026-09-09"
 pages_build_output_dir = "./public"
+
+[vars]
+MAIL_ENABLED = "true"
+COPY_EXPERIMENT_MODE = "active"
+COPY_EXPERIMENT_HOST = "learnfold.pages.dev"
+POSTHOG_PROJECT_KEY = "phc_qHU3sUFAnfFnJEJDmC4t3Kwyzh6uKgxXPPTN7eH2J4eF"
+POSTHOG_HOST = "https://us.i.posthog.com"
+
+[[d1_databases]]
+binding = "EXPERIMENTS"
+database_name = "learnfold-landing-experiments"
+database_id = "740e7597-d731-471c-98f7-1f182f297d41"
+migrations_dir = "migrations"

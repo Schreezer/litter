@@ -353,7 +353,8 @@ enum CourseMCPProtocol {
             case "tools/list":
                 // Codex proposes plans as `learnfold-plan` reply blocks.
                 let definitions = try CourseAgentTools.mcpToolDefinitions(
-                    includePresentPlan: false
+                    includePresentPlan: false,
+                    includeCourseBash: CourseRuntimePaths.currentFileSystem != .nativeMac
                 )
                 let toolsData = try JSONSerialization.data(
                     withJSONObject: definitions.map(\.jsonObject),
@@ -433,6 +434,13 @@ enum CourseMCPProtocol {
         }
 
         if name == CourseAgentTools.courseBash {
+            guard CourseRuntimePaths.currentFileSystem != .nativeMac else {
+                return toolResult(
+                    id: id,
+                    value: ["error": "course_bash is unavailable on Mac. Use Codex's built-in shell in this course's working directory."],
+                    isError: true
+                )
+            }
             guard let script = arguments["script"]?.stringValue else {
                 return toolResult(
                     id: id,
@@ -630,9 +638,7 @@ enum CourseMCPProtocol {
 
     private static func workspaceURL(for workspaceID: String) -> URL? {
         guard CourseBashTool.isValidWorkspaceID(workspaceID) else { return nil }
-        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Apps", isDirectory: true)
-            .appendingPathComponent("Courses", isDirectory: true)
+        return CourseRuntimePaths.defaultCoursesRootURL
             .appendingPathComponent(workspaceID, isDirectory: true)
     }
 

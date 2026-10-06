@@ -31,7 +31,8 @@ struct AppThreadLaunchConfig: Equatable, Sendable {
             approvalPolicy: approvalPolicy,
             sandbox: sandbox,
             developerInstructions: developerInstructions,
-            persistExtendedHistory: persistExtendedHistory
+            persistExtendedHistory: persistExtendedHistory,
+            configJson: configJSON
         )
     }
 

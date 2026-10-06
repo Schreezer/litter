@@ -241,10 +241,12 @@ struct CourseSyncWorkspaceManifest: Codable, Hashable, Sendable {
     }
 }
 
-struct CourseSyncWorkspaceSnapshot: Codable, Hashable, Sendable {
+struct CourseSyncWorkspaceSnapshot: Codable, Equatable, Sendable {
     let manifest: CourseSyncWorkspaceManifest
     let items: [CourseSyncLibraryItem]
     let pages: [CourseSyncPageDocument]
+    /// Absent in legacy page-only generations. Existing checksums remain valid.
+    let continuation: CourseSyncContinuation?
     let checksum: String
 
     init(
@@ -252,7 +254,8 @@ struct CourseSyncWorkspaceSnapshot: Codable, Hashable, Sendable {
         workspace: PageWorkspace,
         generationID: String = UUID().uuidString.lowercased(),
         previousGenerationID: String? = nil,
-        version: CourseSyncVersionVector = .init()
+        version: CourseSyncVersionVector = .init(),
+        continuation: CourseSyncContinuation? = nil
     ) throws {
         let items = workspace.items.values
             .map(CourseSyncLibraryItem.init)
@@ -272,10 +275,13 @@ struct CourseSyncWorkspaceSnapshot: Codable, Hashable, Sendable {
         )
         self.items = items
         self.pages = pages
+        self.continuation = continuation
+        try continuation?.validate(workspaceID: workspaceID)
         checksum = try Self.computeContentChecksum(
             rootPageID: workspace.rootPageID,
             items: items,
-            pages: pages
+            pages: pages,
+            continuation: continuation
         )
     }
 
@@ -299,10 +305,12 @@ struct CourseSyncWorkspaceSnapshot: Codable, Hashable, Sendable {
                 throw CourseCloudSyncModelError.checksumMismatch(page.id)
             }
         }
+        try continuation?.validate(workspaceID: manifest.workspaceID)
         let expected = try Self.computeContentChecksum(
             rootPageID: manifest.rootPageID,
             items: items,
-            pages: pages
+            pages: pages,
+            continuation: continuation
         )
         guard expected == checksum else {
             throw CourseCloudSyncModelError.checksumMismatch(manifest.generationID)
@@ -320,15 +328,17 @@ struct CourseSyncWorkspaceSnapshot: Codable, Hashable, Sendable {
     private static func computeContentChecksum(
         rootPageID: String,
         items: [CourseSyncLibraryItem],
-        pages: [CourseSyncPageDocument]
+        pages: [CourseSyncPageDocument],
+        continuation: CourseSyncContinuation?
     ) throws -> String {
         struct ChecksumEnvelope: Encodable {
             let rootPageID: String
             let items: [CourseSyncLibraryItem]
             let pages: [CourseSyncPageDocument]
+            let continuation: CourseSyncContinuation?
         }
         return try CourseSyncChecksum.value(
-            for: ChecksumEnvelope(rootPageID: rootPageID, items: items, pages: pages)
+            for: ChecksumEnvelope(rootPageID: rootPageID, items: items, pages: pages, continuation: continuation)
         )
     }
 }
@@ -469,6 +479,7 @@ enum CourseCloudSyncModelError: Error, Equatable, LocalizedError {
     case duplicateRecord
     case invalidFileManifest
     case unsafeRelativePath(String)
+    case invalidContinuation(String)
 
     var errorDescription: String? {
         switch self {
@@ -478,6 +489,7 @@ enum CourseCloudSyncModelError: Error, Equatable, LocalizedError {
         case .duplicateRecord: "A generation contains duplicate record identifiers."
         case .invalidFileManifest: "The course file manifest is invalid."
         case .unsafeRelativePath(let path): "Unsafe course-relative path: \(path)"
+        case .invalidContinuation(let detail): "Course continuation could not be synchronized. \(detail)"
         }
     }
 }

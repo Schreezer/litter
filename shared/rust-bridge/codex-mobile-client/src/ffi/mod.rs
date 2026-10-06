@@ -7,6 +7,7 @@
 pub(crate) mod alleycat;
 mod android;
 mod app_store;
+mod chat;
 mod client;
 mod discovery;
 mod errors;
@@ -23,6 +24,7 @@ pub use alleycat::{
     AppAlleycatPairPayload,
 };
 pub use app_store::{AppStore, AppStoreSubscription};
+pub use chat::ChatSubscription;
 pub use client::AppClient;
 pub use discovery::{
     AppSlingshotEnvironment, DiscoveryBridge, DiscoveryScanSubscription, ServerBridge,

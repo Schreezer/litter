@@ -80,10 +80,18 @@ final class AppRuntimeController {
         await appModel.restoreMissingLocalAuthStateIfNeeded()
         await appModel.refreshSnapshot()
         persistAlleycatSecretKeyIfNeeded()
+        if LitterPlatform.isDirectDistMac,
+           ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+            LocalCodexBootstrap.shared.startIfNeeded(appModel: appModel)
+        }
     }
 
     func reconnectServer(serverId: String) async {
         guard let appModel else { return }
+        if LitterPlatform.isDirectDistMac, serverId == LocalCodexBootstrap.serverId {
+            _ = try? await LocalCodexBootstrap.shared.ensureConnected(appModel: appModel)
+            return
+        }
         let servers = SavedServerStore.reconnectRecords(
             localDisplayName: appModel.resolvedLocalServerDisplayName()
         )
@@ -114,10 +122,11 @@ final class AppRuntimeController {
     }
 
     func handleSnapshot(_ snapshot: AppSnapshotRecord?) {}
+    var canBeginUserInitiatedTurn: Bool { false }
     func beginUserInitiatedTurn(
         key: ThreadKey,
         appModel: AppModel,
-        agentName: String = "Codex",
+        context: ContinuedTurnContext,
         keepsAliveAcrossTurns: Bool = false
     ) -> UUID? { nil }
     func markUserInitiatedTurnAccepted(_ token: UUID?) {}
@@ -126,7 +135,7 @@ final class AppRuntimeController {
         key: ThreadKey,
         agentName: String
     ) -> UUID? { nil }
-    func finishUserInitiatedMultiTurn(key: ThreadKey, success: Bool) {}
+    func finishUserInitiatedMultiTurn(key: ThreadKey, outcome: TurnOutcome) {}
     func appDidEnterBackground() {
         lastBackgroundedAt = Date()
     }

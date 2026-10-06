@@ -459,6 +459,12 @@ struct CourseExperienceRootView: View {
     @Environment(AppState.self) private var appState
     @Bindable var store: CourseExperienceStore
     var onConnectRemoteAgent: () -> Void
+    #if targetEnvironment(macCatalyst)
+    @State private var navigationHistory = CourseNavigationHistory<CourseRoute>()
+    @State private var showsCommandDraftReplacementConfirmation = false
+    @State private var showsDesktopAgentSettings = false
+    @State private var showsDesktopAppSettings = false
+    #endif
 
     var body: some View {
         courseExperience
@@ -473,6 +479,67 @@ struct CourseExperienceRootView: View {
             guard store.setupComplete else { return }
             await store.installStarterCourseIfNeeded()
         }
+        #if targetEnvironment(macCatalyst)
+        .focusedSceneValue(\.learnfoldCourseStore, store)
+        .sheet(isPresented: $showsDesktopAgentSettings) {
+            CourseAgentSettingsView(store: store, onConnectRemoteAgent: onConnectRemoteAgent)
+                .environment(appModel)
+                .frame(minWidth: 540, idealWidth: 600, minHeight: 600, idealHeight: 680)
+        }
+        .sheet(isPresented: $showsDesktopAppSettings) {
+            SettingsView().environment(appModel).environment(appState)
+                .frame(minWidth: 540, idealWidth: 600, minHeight: 600, idealHeight: 680)
+        }
+        .onChange(of: store.navigationPath, initial: true) { _, path in
+            navigationHistory.record(path: path)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .learnfoldCommandNewCourse)) { notification in
+            guard notification.object as? CourseExperienceStore === store,
+                  store.setupComplete, store.hasCompletedIntro else { return }
+            if store.requiresDraftReplacementConfirmation {
+                showsCommandDraftReplacementConfirmation = true
+            } else {
+                store.beginNewCourse()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .learnfoldCommandShowLibrary)) { notification in
+            guard notification.object as? CourseExperienceStore === store,
+                  store.setupComplete else { return }
+            store.navigationPath.removeAll()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .learnfoldCommandShowAppSettings)) { notification in
+            guard notification.object as? CourseExperienceStore === store else { return }
+            showsDesktopAppSettings = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .learnfoldCommandNavigateBack)) { notification in
+            guard notification.object as? CourseExperienceStore === store else { return }
+            navigationHistory.record(path: store.navigationPath)
+            if let path = navigationHistory.back() {
+                store.navigationPath = path
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .learnfoldCommandNavigateForward)) { notification in
+            guard notification.object as? CourseExperienceStore === store else { return }
+            navigationHistory.record(path: store.navigationPath)
+            if let path = navigationHistory.forward() {
+                store.navigationPath = path
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .learnfoldCommandSelectCourse)) { notification in
+            guard notification.object as? CourseExperienceStore === store,
+                  store.setupComplete,
+                  let index = notification.userInfo?["index"] as? Int,
+                  store.courses.indices.contains(index) else { return }
+            store.navigationPath = [.course(store.courses[index].id)]
+        }
+        .alert("Start a new course?", isPresented: $showsCommandDraftReplacementConfirmation) {
+            Button("Continue Draft") { store.resumeCourseDraft() }
+            Button("Discard Draft and Start New", role: .destructive) { store.beginNewCourse() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("You already have an unfinished course conversation. Starting a new course will remove that workspace and anything saved in it.")
+        }
+        #endif
     }
 
     @ViewBuilder
@@ -486,16 +553,22 @@ struct CourseExperienceRootView: View {
                 }
                 .transition(.opacity)
             } else if store.setupComplete {
-                NavigationStack(path: $store.navigationPath) {
-                    CourseHomeView(
-                        store: store,
-                        onConnectRemoteAgent: onConnectRemoteAgent
-                    )
-                    .navigationDestination(for: CourseRoute.self) { route in
-                        CourseRouteDestinationView(route: route, store: store)
-                    }
-                }
-                .tint(.blue)
+                #if targetEnvironment(macCatalyst)
+                MacCourseWorkspaceView(
+                    store: store,
+                    onNewCourse: {
+                        if store.requiresDraftReplacementConfirmation {
+                            showsCommandDraftReplacementConfirmation = true
+                        } else {
+                            store.beginNewCourse()
+                        }
+                    },
+                    onOpenAppSettings: { showsDesktopAppSettings = true },
+                    onOpenAgentSettings: { showsDesktopAgentSettings = true }
+                ) { courseNavigation }
+                #else
+                courseNavigation
+                #endif
             } else {
                 CourseAgentSetupView(
                     store: store,
@@ -503,6 +576,16 @@ struct CourseExperienceRootView: View {
                 )
             }
         }
+    }
+
+    private var courseNavigation: some View {
+        NavigationStack(path: $store.navigationPath) {
+            CourseHomeView(store: store, onConnectRemoteAgent: onConnectRemoteAgent)
+                .navigationDestination(for: CourseRoute.self) { route in
+                    CourseRouteDestinationView(route: route, store: store)
+                }
+        }
+        .tint(.blue)
     }
 }
 
@@ -529,8 +612,16 @@ struct CourseRouteDestinationView: View {
     private var routeDestination: some View {
         switch route {
         case .newCourse:
+            #if targetEnvironment(macCatalyst)
             CourseChatView(store: store)
                 .id(store.draftWorkspaceID(for: nil))
+                .frame(maxWidth: 940)
+                .frame(maxWidth: .infinity)
+                .background(Color(uiColor: .systemGroupedBackground))
+            #else
+            CourseChatView(store: store)
+                .id(store.draftWorkspaceID(for: nil))
+            #endif
         case .building:
             CourseBuildingView(store: store)
         case .course(let courseID):
@@ -567,6 +658,13 @@ struct CourseRouteDestinationView: View {
                     onOpenCourseStructure: { recoveredCourse = course },
                     onReturnToLibrary: returnToLibrary
                 )
+                #if targetEnvironment(macCatalyst)
+                .id(CoursePageRouteCheckID(
+                    courseID: course.id,
+                    workspaceID: course.workspaceID,
+                    pageID: pageID
+                ))
+                #endif
             } else if let course = store.course(withID: courseID) {
                 unavailableView(kind: .page, course: course)
             } else {
@@ -890,12 +988,14 @@ private struct CourseAgentSetupConnectionControls: View {
                     if connectionState == .connecting {
                         ProgressView().tint(.white)
                     } else {
-                        Image(systemName: "iphone.and.arrow.forward")
+                        Image(systemName: LitterPlatform.isCatalyst ? "desktopcomputer" : "iphone.and.arrow.forward")
                     }
                     Text(
                         connectionState == .connecting
                             ? "Connecting…"
-                            : agentID == CourseAgentProvider.hosted ? "Continue" : "Connect \(agentID.displayLabel)"
+                            : agentID == CourseAgentProvider.hosted ? "Continue"
+                            : agentID == CourseAgentProvider.codex && LitterPlatform.isDirectDistMac ? "Use Mac Codex"
+                            : "Connect \(agentID.displayLabel)"
                     )
                 }
                 .font(.headline)
@@ -910,7 +1010,8 @@ private struct CourseAgentSetupConnectionControls: View {
                needsAuthentication {
                 Button(action: onSignIn) {
                     Label(
-                        isSigningIn ? "Opening ChatGPT sign-in…" : "Sign in again with ChatGPT",
+                        LitterPlatform.isDirectDistMac ? "Check Codex login again"
+                            : isSigningIn ? "Opening ChatGPT sign-in…" : "Sign in again with ChatGPT",
                         systemImage: "person.crop.circle.badge.checkmark"
                     )
                     .frame(maxWidth: .infinity)
@@ -920,10 +1021,26 @@ private struct CourseAgentSetupConnectionControls: View {
                 .accessibilityIdentifier("course-agent-sign-in-again")
             }
 
+            if agentID == CourseAgentProvider.codex,
+               needsAuthentication,
+               LitterPlatform.isDirectDistMac {
+                VStack(spacing: 6) {
+                    Text("Sign in to Codex in Terminal, then check your login again.")
+                    Text("codex login")
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("course-agent-mac-login-instructions")
+            }
+
             Label {
                 Text(agentID == CourseAgentProvider.hosted
                     ? "No login needed during the beta. Your prompts are processed in the cloud. Daily usage limits apply."
-                    : "You can change your course agent later in Course Settings.")
+                    : agentID == CourseAgentProvider.codex && LitterPlatform.isDirectDistMac
+                        ? "Uses your Mac’s Codex login, skills, and configured tools. Learnfold adds instructions for this course."
+                        : "You can change your course agent later in Course Settings.")
                     .accessibilityIdentifier("course-agent-connection-lifecycle")
                     .accessibilityValue(statusValue)
             } icon: {
@@ -968,7 +1085,13 @@ private struct CourseAgentSetupPickerContent: View {
             && agentOptions.contains { $0.id == CourseAgentProvider.hosted && $0.available }
     }
 
-    private var showsAllAgents: Bool { showsAgentChoices || !usesHostedDefault }
+    private var showsAllAgents: Bool {
+        LitterPlatform.isDirectDistMac || showsAgentChoices || !usesHostedDefault
+    }
+
+    private var usesMacCodex: Bool {
+        LitterPlatform.isDirectDistMac && selectedAgentID == CourseAgentProvider.codex
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 28) {
@@ -988,13 +1111,16 @@ private struct CourseAgentSetupPickerContent: View {
                         .foregroundStyle(.white)
                 }
 
-                Text(usesHostedDefault && !showsAgentChoices ? "Ready to start learning" : "Choose your course agent")
+                Text(usesMacCodex ? "Use Codex on this Mac"
+                    : usesHostedDefault && !showsAllAgents ? "Ready to start learning" : "Choose your course agent")
                     .font(.system(size: 38, weight: .bold, design: .rounded))
                     .tracking(-1.1)
                     .accessibilityIdentifier("course-agent-setup-picker")
                     .accessibilityValue(availabilityValue)
 
-                Text(usesHostedDefault && !showsAgentChoices
+                Text(usesMacCodex
+                    ? "Learnfold uses your installed Codex with course instructions and editor tools. Choose another agent below if you prefer."
+                    : usesHostedDefault && !showsAllAgents
                     ? "Your Hosted course agent is ready. Start with a topic, a question, or a link."
                     : "Choose the agent you'd like to use for your courses. You can change it later.")
                     .font(.system(size: 18))
@@ -1036,7 +1162,9 @@ private struct CourseAgentSetupPickerContent: View {
                             Text("Connect Hermes on a server")
                                 .font(.headline)
                                 .foregroundStyle(.primary)
-                            Text("Pair with Learnfold Link. Connecting authorizes Hermes to use phone-side tools confined to this course. The shell is read-only until plan approval, read-write afterward, and has no outbound network access.")
+                            Text(LitterPlatform.isCatalyst
+                                ? "Pair with Learnfold Link to use Hermes for your courses."
+                                : "Pair with Learnfold Link. Connecting authorizes Hermes to use phone-side tools confined to this course. The shell is read-only until plan approval, read-write afterward, and has no outbound network access.")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                                 .multilineTextAlignment(.leading)
@@ -1057,7 +1185,7 @@ private struct CourseAgentSetupPickerContent: View {
                 .accessibilityIdentifier("course-agent-add-server")
             }
 
-            if selectedAgentID == CourseAgentProvider.codex {
+            if selectedAgentID == CourseAgentProvider.codex, !LitterPlatform.isCatalyst {
                 CourseAgentCustomProviderButton(
                     hasCustomEndpoint: hasCustomEndpoint,
                     action: onOpenCustomProvider
@@ -1092,10 +1220,12 @@ enum CourseAgentSetupSelectionPolicy {
     static func initialSelection(
         savedAgentID: String?,
         options: [CourseAgentOption],
-        preferredAgentID: String
+        preferredAgentID: String,
+        preservesUnavailableSavedSelection: Bool = LitterPlatform.isDirectDistMac
     ) -> CourseAgentSetupSelectionResolution {
         if let savedAgentID,
-           options.first(where: { $0.id == savedAgentID })?.available == true {
+           let savedOption = options.first(where: { $0.id == savedAgentID }),
+           savedOption.available || preservesUnavailableSavedSelection {
             return CourseAgentSetupSelectionResolution(
                 agentID: savedAgentID,
                 isAutomatic: false
@@ -1120,6 +1250,89 @@ enum CourseAgentSetupSelectionPolicy {
         return preferredAgentID
     }
 }
+
+#if targetEnvironment(macCatalyst)
+private struct MacCodexSetupStatusView: View {
+    @Bindable private var bootstrap = LocalCodexBootstrap.shared
+    let onRetry: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                if bootstrap.status == .starting {
+                    ProgressView()
+                } else {
+                    Image(systemName: statusIcon)
+                        .foregroundStyle(statusColor)
+                }
+                Text(statusTitle)
+                    .font(.headline)
+            }
+            Text(statusDetail)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if bootstrap.status != .starting {
+                Button(bootstrap.status == .ready ? "Refresh Mac Codex" : "Try Mac Codex again", action: onRetry)
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("course-agent-mac-codex-retry")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(.background, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-agent-mac-codex-status")
+        .accessibilityValue(statusValue)
+    }
+
+    private var statusTitle: String {
+        switch bootstrap.status {
+        case .idle: "Checking your installed Codex"
+        case .starting: "Starting Mac Codex…"
+        case .ready: "Connected to Mac Codex"
+        case .failed: "Mac Codex needs attention"
+        }
+    }
+
+    private var statusDetail: String {
+        switch bootstrap.status {
+        case .idle, .starting:
+            "Looking for Codex installed on this Mac and connecting to its local app-server."
+        case .ready:
+            "Learnfold uses the login and configuration from your Mac’s Codex installation."
+        case .failed(let message):
+            "\(message) Install Codex on this Mac and sign in with codex login, then try again."
+        }
+    }
+
+    private var statusIcon: String {
+        switch bootstrap.status {
+        case .idle, .starting: "desktopcomputer"
+        case .ready: "checkmark.circle.fill"
+        case .failed: "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var statusColor: Color {
+        switch bootstrap.status {
+        case .ready: .green
+        case .failed: .orange
+        case .idle, .starting: .secondary
+        }
+    }
+
+    private var statusValue: String {
+        switch bootstrap.status {
+        case .idle: "idle"
+        case .starting: "starting"
+        case .ready: "connected"
+        case .failed: "failed"
+        }
+    }
+}
+#endif
 
 private struct CourseAgentSetupView: View {
     @Environment(AppModel.self) private var appModel
@@ -1166,6 +1379,14 @@ private struct CourseAgentSetupView: View {
                             showsOpenAICompatibleSetup = true
                         }
                     )
+
+                    #if targetEnvironment(macCatalyst)
+                    if LitterPlatform.isDirectDistMac, selectedAgent == CourseAgentProvider.codex {
+                        MacCodexSetupStatusView {
+                            Task { await store.prepareLocalAgentCatalog(appModel: appModel) }
+                        }
+                    }
+                    #endif
 
                     CourseAgentSetupConnectionControls(
                         agentID: selectedAgent,
@@ -1254,6 +1475,16 @@ private struct CourseAgentSetupView: View {
     @MainActor
     private func signInAndConnectCodex() {
         guard !isSigningIn, selectedAgent == CourseAgentProvider.codex else { return }
+        if LitterPlatform.isDirectDistMac {
+            Task {
+                await store.connectLocalAgent(
+                    appModel: appModel,
+                    agentID: CourseAgentProvider.codex,
+                    modelID: selectedModelID.isEmpty ? nil : selectedModelID
+                )
+            }
+            return
+        }
         isSigningIn = true
         signInTask = Task { @MainActor in
             defer {
@@ -1287,18 +1518,7 @@ private struct CourseHomeView: View {
     @State private var showsDraftReplacementConfirmation = false
 
     var body: some View {
-        CourseLibraryContent(
-            courses: store.courses,
-            selectedAgentID: store.selectedAgentID ?? "codex",
-            resumableDraft: store.resumableCourseDraft,
-            onOpenAppSettings: { showsAppSettings = true },
-            onOpenAgentSettings: { showsCourseSettings = true },
-            onOpenCourse: { courseID in
-                store.navigationPath.append(.course(courseID))
-            },
-            onResumeDraft: { store.resumeCourseDraft() },
-            onNewCourse: requestNewCourse
-        )
+        library
         .toolbar(.visible, for: .navigationBar)
         .safeAreaInset(edge: .bottom) {
             if let error = store.starterCourseInstallationError {
@@ -1343,6 +1563,32 @@ private struct CourseHomeView: View {
                 "You already have an unfinished course conversation. Starting a new course will remove that workspace and anything saved in it."
             )
         }
+    }
+
+    @ViewBuilder
+    private var library: some View {
+        #if targetEnvironment(macCatalyst)
+        MacCourseLibraryView(
+            courses: store.courses,
+            resumableDraft: store.resumableCourseDraft,
+            onOpenCourse: { store.navigationPath.append(.course($0)) },
+            onResumeDraft: { store.resumeCourseDraft() },
+            onNewCourse: requestNewCourse
+        )
+        #else
+        CourseLibraryContent(
+            courses: store.courses,
+            selectedAgentID: store.selectedAgentID ?? "codex",
+            resumableDraft: store.resumableCourseDraft,
+            onOpenAppSettings: { showsAppSettings = true },
+            onOpenAgentSettings: { showsCourseSettings = true },
+            onOpenCourse: { courseID in
+                store.navigationPath.append(.course(courseID))
+            },
+            onResumeDraft: { store.resumeCourseDraft() },
+            onNewCourse: requestNewCourse
+        )
+        #endif
     }
 
     private func requestNewCourse() {
@@ -1511,7 +1757,7 @@ private struct CourseLibraryEmptyState: View {
             VStack(spacing: 6) {
                 Text("Your library is ready")
                     .font(.title3.weight(.bold))
-                Text("Create a course with your agent. Only courses actually generated on this device will appear here.")
+                Text("Create a course with your agent. Your courses and learning progress can sync across your devices through iCloud.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -1585,6 +1831,8 @@ enum CourseAgentSettingsDraftPolicy {
 
 private struct CourseCloudSyncStatusSection: View {
     let availability: CourseCloudSyncAvailability
+    let workspaceErrors: [String: String]
+    let courseTitles: [String: String]
     let isRetrying: Bool
     let onRetry: () -> Void
 
@@ -1597,8 +1845,8 @@ private struct CourseCloudSyncStatusSection: View {
                         Text("Retrying…")
                     }
                 } else {
-                    Text(availability.label)
-                        .foregroundStyle(availability.tint)
+                    Text(workspaceErrors.isEmpty ? availability.label : "Some changes need attention")
+                        .foregroundStyle(workspaceErrors.isEmpty ? availability.tint : .orange)
                 }
             } label: {
                 Label("Course iCloud Sync", systemImage: "icloud")
@@ -1612,9 +1860,19 @@ private struct CourseCloudSyncStatusSection: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .accessibilityIdentifier("course-cloud-sync-retrying")
-            } else if availability.canRetry {
+            } else if availability.canRetry || !workspaceErrors.isEmpty {
                 Button("Retry iCloud Connection", action: onRetry)
                     .accessibilityIdentifier("course-cloud-sync-retry")
+            }
+            ForEach(workspaceErrors.keys.sorted(), id: \.self) { workspaceID in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(courseTitles[workspaceID] ?? "Course waiting to sync")
+                        .font(.subheadline.weight(.medium))
+                    Text(workspaceErrors[workspaceID] ?? "")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityIdentifier("course-cloud-sync-workspace-error")
             }
         } footer: {
             Text(availability.explanation)
@@ -1766,22 +2024,32 @@ private struct CourseAgentSettingsErrorSection: View {
                 if showsChatGPTSignIn {
                     Button(action: onSignIn) {
                         Label(
-                            isSigningIn ? "Opening ChatGPT sign-in…" : "Sign in again with ChatGPT",
+                            LitterPlatform.isDirectDistMac ? "Check Codex login again"
+                                : isSigningIn ? "Opening ChatGPT sign-in…" : "Sign in again with ChatGPT",
                             systemImage: "person.crop.circle.badge.checkmark"
                         )
                     }
                     .disabled(isSigningIn)
                     .accessibilityIdentifier("course-settings-codex-sign-in")
+
+                    if LitterPlatform.isDirectDistMac {
+                        Text("Sign in in Terminal with codex login, then check your login again.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
                 }
 
-                Button(action: onOpenProvider) {
-                    Label(
-                        hasCustomEndpoint ? "Edit your API key and endpoint" : "Use your own API key",
-                        systemImage: "key.horizontal"
-                    )
+                if !LitterPlatform.isCatalyst {
+                    Button(action: onOpenProvider) {
+                        Label(
+                            hasCustomEndpoint ? "Edit your API key and endpoint" : "Use your own API key",
+                            systemImage: "key.horizontal"
+                        )
+                    }
+                    .disabled(isSigningIn)
+                    .accessibilityIdentifier("course-settings-codex-provider-recovery")
                 }
-                .disabled(isSigningIn)
-                .accessibilityIdentifier("course-settings-codex-provider-recovery")
 
                 Button("Try Codex again", action: onRetry)
                     .disabled(isSigningIn)
@@ -1807,6 +2075,7 @@ private struct CourseAgentSettingsView: View {
     @State private var isSigningIn = false
     @State private var signInTask: Task<Void, Never>?
     @State private var cloudSyncAvailability: CourseCloudSyncAvailability = .missingEntitlement
+    @State private var cloudSyncWorkspaceErrors: [String: String] = [:]
     @State private var isRetryingCloudSync = false
     @State private var saveTask: Task<Void, Never>?
 
@@ -1830,7 +2099,7 @@ private struct CourseAgentSettingsView: View {
     }
 
     private var usesCustomEndpoint: Bool {
-        hasCustomEndpoint && !appModel.prefersLocalChatGPTAuth
+        !LitterPlatform.isCatalyst && hasCustomEndpoint && !appModel.prefersLocalChatGPTAuth
     }
 
     private var connectedHermesServer: AppServerSnapshot? {
@@ -1853,6 +2122,10 @@ private struct CourseAgentSettingsView: View {
             Form {
                 CourseCloudSyncStatusSection(
                     availability: cloudSyncAvailability,
+                    workspaceErrors: cloudSyncWorkspaceErrors,
+                    courseTitles: Dictionary(store.courses.compactMap { course in
+                        course.workspaceID.map { ($0, course.title) }
+                    }, uniquingKeysWith: { first, _ in first }),
                     isRetrying: isRetryingCloudSync,
                     onRetry: retryCloudSync
                 )
@@ -1901,37 +2174,52 @@ private struct CourseAgentSettingsView: View {
                     )
                 }
 
-                Section {
-                    Button {
-                        showsOpenAICompatibleSetup = true
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: "key.horizontal")
-                                .frame(width: 24)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(hasStoredAPIKey ? "Manage your API key" : "Use your own API key")
-                                    .foregroundStyle(.primary)
-                                Text(
-                                    hasCustomEndpoint && !configuredProviderModelID.isEmpty
-                                        ? "Configured for Codex · \(configuredProviderModelID)"
-                                        : hasStoredAPIKey
-                                            ? "OpenAI API key saved on this iPhone"
-                                            : "API key; optional custom URL and model ID"
-                                )
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                if !LitterPlatform.isCatalyst {
+                    Section {
+                        Button {
+                            showsOpenAICompatibleSetup = true
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "key.horizontal")
+                                    .frame(width: 24)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(hasStoredAPIKey ? "Manage your API key" : "Use your own API key")
+                                        .foregroundStyle(.primary)
+                                    Text(
+                                        hasCustomEndpoint && !configuredProviderModelID.isEmpty
+                                            ? "Configured for Codex · \(configuredProviderModelID)"
+                                            : hasStoredAPIKey
+                                                ? "OpenAI API key saved on this iPhone"
+                                                : "API key; optional custom URL and model ID"
+                                    )
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
                             }
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.tertiary)
                         }
+                        .accessibilityIdentifier("course-settings-byok")
+                    } header: {
+                        Text("Your provider")
+                    } footer: {
+                        Text("Uses Codex on this iPhone. Endpoint changes affect existing Codex conversations too.")
                     }
-                    .accessibilityIdentifier("course-settings-byok")
-                } header: {
-                    Text("Your provider")
-                } footer: {
-                    Text("Uses Codex on this iPhone. Endpoint changes affect existing Codex conversations too.")
+                } else if selectedAgent == CourseAgentProvider.codex {
+                    Section("Mac Codex") {
+                        Text("Uses the login, skills, tools, and provider configuration from your Mac’s installed Codex. Learnfold adds its own course instructions and editor tools to course conversations.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        #if targetEnvironment(macCatalyst)
+                        if LitterPlatform.isDirectDistMac {
+                            MacCodexSetupStatusView {
+                                Task { await store.prepareLocalAgentCatalog(appModel: appModel) }
+                            }
+                        }
+                        #endif
+                    }
                 }
 
                 if selectedAgent == CourseAgentProvider.codex, usesCustomEndpoint {
@@ -2009,12 +2297,22 @@ private struct CourseAgentSettingsView: View {
                 } header: {
                     Text("Remote agent")
                 } footer: {
-                    Text("Connecting Hermes authorizes it to use Learnfold’s phone-side course tools for your course turns. The shell is confined to the active course folder, read-only until you approve the course plan and read-write afterward. It cannot access sibling courses or make outbound network connections.")
+                    Text(LitterPlatform.isCatalyst
+                        ? "Connect a remote Hermes agent for your courses."
+                        : "Connecting Hermes authorizes it to use Learnfold’s phone-side course tools for your course turns. The shell is confined to the active course folder, read-only until you approve the course plan and read-write afterward. It cannot access sibling courses or make outbound network connections.")
                 }
 
             }
             .task {
-                cloudSyncAvailability = await CourseCloudSyncEngine.shared.availability
+                while !Task.isCancelled {
+                    cloudSyncAvailability = await CourseCloudSyncEngine.shared.availability
+                    cloudSyncWorkspaceErrors = await CourseCloudSyncEngine.shared.workspaceErrors
+                    do {
+                        try await Task.sleep(for: .seconds(3))
+                    } catch {
+                        break
+                    }
+                }
             }
             .navigationTitle("Course Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -2098,7 +2396,11 @@ private struct CourseAgentSettingsView: View {
         isRetryingCloudSync = true
         Task { @MainActor in
             await CourseCloudSyncEngine.shared.startIfAvailable()
+            for workspaceID in cloudSyncWorkspaceErrors.keys {
+                store.exportCourseContinuation(workspaceID: workspaceID)
+            }
             cloudSyncAvailability = await CourseCloudSyncEngine.shared.availability
+            cloudSyncWorkspaceErrors = await CourseCloudSyncEngine.shared.workspaceErrors
             isRetryingCloudSync = false
         }
     }
@@ -2162,6 +2464,10 @@ private struct CourseAgentSettingsView: View {
         guard !isSigningIn,
               draft.agentID == CourseAgentProvider.codex
                 || store.activeAgentID == CourseAgentProvider.codex else { return }
+        if LitterPlatform.isDirectDistMac {
+            retryCodexSelection()
+            return
+        }
         isSigningIn = true
         signInTask = Task { @MainActor in
             defer {
@@ -2780,6 +3086,90 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
     }
 
     var body: some View {
+        #if targetEnvironment(macCatalyst)
+        desktopBody
+        #else
+        mobileBody
+        #endif
+    }
+
+    private var desktopBody: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                HStack(alignment: .top, spacing: 18) {
+                    CourseArtwork(course: course)
+                        .frame(width: 64, height: 64)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(course.title)
+                            .font(.largeTitle.weight(.bold))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(progressSummary ?? course.subtitle)
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("course-progress-summary")
+                        HStack(spacing: 12) {
+                            Label(course.lessonCount == 1 ? "1 lesson" : "\(course.lessonCount) lessons", systemImage: "doc.text")
+                            Label(course.duration, systemImage: "clock")
+                        }
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+
+                if course.workspaceID != nil {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 18) {
+                            if let readingAction { readingAction.frame(maxWidth: 440, alignment: .leading) }
+                            Spacer(minLength: 0)
+                            desktopAgentButton
+                        }
+                        VStack(alignment: .leading, spacing: 12) {
+                            if let readingAction { readingAction }
+                            desktopAgentButton
+                        }
+                    }
+
+                    Divider()
+                    Picker("Course view", selection: $selectedSection) {
+                        ForEach(CourseDetailSection.allCases) { section in
+                            Text(section.rawValue).tag(section)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 240)
+                    .accessibilityIdentifier("course-detail-section-picker")
+                    .accessibilityValue(selectedSection.rawValue)
+                }
+
+                switch selectedSection {
+                case .learn: learnSection
+                case .structure: structureSection
+                }
+            }
+            .frame(maxWidth: 1040, alignment: .leading)
+            .padding(.horizontal, 24)
+            .padding(.top, 20)
+            .padding(.bottom, 32)
+            .frame(maxWidth: .infinity, alignment: .top)
+        }
+        .background(Color(uiColor: .systemBackground))
+        .navigationTitle(course.title)
+        .navigationBarTitleDisplayMode(.inline)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-detail-root")
+    }
+
+    private var desktopAgentButton: some View {
+        Button(action: onTalkToCourseAgent) {
+            Label("Course Discussion", systemImage: "bubble.left.and.bubble.right")
+        }
+        .buttonStyle(.bordered)
+        .accessibilityIdentifier("talk-to-course-agent-button")
+    }
+
+    private var mobileBody: some View {
         ZStack {
             Color(uiColor: .systemGroupedBackground).ignoresSafeArea()
 
@@ -2951,6 +3341,10 @@ private struct CourseDetailView: View {
     @State private var selectedChapterID: String?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var courseAgentNavigationError: String?
+    @State private var explorationLauncher = CourseExplorationLauncher()
+    #if targetEnvironment(macCatalyst)
+    @State private var desktopExpandedNodeIDs: Set<String> = []
+    #endif
 
     init(
         course: LearningCourse,
@@ -2991,12 +3385,13 @@ private struct CourseDetailView: View {
                 )
             }
         }
-        let activeNodeID = store.backgroundGeneratingCourseID == course.id
-            ? store.backgroundGeneratingNodeID
-            : nil
+        var activeNodeIDs = store.activeExplorationNodeIDs(courseID: course.id)
+        if store.backgroundGeneratingCourseID == course.id, let id = store.backgroundGeneratingNodeID {
+            activeNodeIDs.insert(id)
+        }
         return CourseLearningPathResolver.overlayGeneratingStatus(
             in: resolved,
-            targetNodeID: activeNodeID
+            targetNodeIDs: activeNodeIDs
         )
     }
 
@@ -3061,12 +3456,19 @@ private struct CourseDetailView: View {
         guard let node = CourseReadingOrder.resume(
             in: learningNodes, bookmark: store.readingBookmark(for: course)
         ) else { return nil }
+        let title = if store.readingBookmark(for: course) == nil {
+            "Start course"
+        } else if CourseExplorationMap.isExploration(node) {
+            "Continue exploring"
+        } else {
+            "Continue course"
+        }
         return AnyView(CourseLessonActionButton(
             course: course,
             node: node,
             store: store,
-            title: store.readingBookmark(for: course) == nil ? "Start course" : "Continue course",
-            usesGlass: true
+            title: title,
+            usesGlass: !LitterPlatform.isCatalyst
         ))
     }
 
@@ -3077,9 +3479,18 @@ private struct CourseDetailView: View {
     private var progressSummary: String {
         let lessons = CourseReadingOrder.lessons(in: learningNodes)
         let ready = lessons.filter { $0.status == .generated }.count
-        var parts = ["\(learningNodes.count) \(learningNodes.count == 1 ? "chapter" : "chapters")"]
+        let explored = CourseExplorationMap.explorations(in: learningNodes).count
+        var parts: [String] = []
+        // Once the learner explores, the chapter count matters less than
+        // how far they wandered; the chapter switcher still shows chapters.
+        if explored == 0 {
+            parts.append("\(learningNodes.count) \(learningNodes.count == 1 ? "chapter" : "chapters")")
+        }
         if !lessons.isEmpty {
             parts.append("\(ready) of \(lessons.count) lessons ready")
+        }
+        if explored > 0 {
+            parts.append("\(explored) explored")
         }
         return parts.joined(separator: " · ")
     }
@@ -3100,6 +3511,60 @@ private struct CourseDetailView: View {
 
     private var learnSection: some View {
         VStack(alignment: .leading, spacing: 18) {
+            CourseExplorationOverview(
+                nodes: learningNodes,
+                resumeNode: resumeNode,
+                progress: store.explorationProgress(for: course),
+                launcher: explorationLauncher,
+                stateOf: { node in
+                    store.explorationState(
+                        of: node, courseID: course.id, progress: store.explorationProgress(for: course)
+                    )
+                },
+                onOpen: { node in
+                    explorationLauncher.open(
+                        node, course: course, store: store, appModel: appModel, appState: appState
+                    )
+                },
+                onSynthesize: { anchor, titles in
+                    guard let pageID = anchor.pageID else { return }
+                    explorationLauncher.launch(
+                        CourseExplorationRequest(
+                            parentPageID: pageID,
+                            parentTitle: anchor.title,
+                            direction: .synthesis,
+                            exploredTitles: titles
+                        ),
+                        course: course, store: store, appModel: appModel, appState: appState
+                    )
+                }
+            )
+
+            #if targetEnvironment(macCatalyst)
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text("Course outline").font(.system(size: 17, weight: .semibold))
+                    Spacer()
+                    Button(desktopExpandedNodeIDs.isEmpty ? "Expand all" : "Collapse all") {
+                        desktopExpandedNodeIDs = desktopExpandedNodeIDs.isEmpty
+                            ? Set(allExpandableIDs(in: learningNodes)) : []
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .buttonStyle(.borderless)
+                }
+                CourseLearningTreeView(
+                    nodes: learningNodes,
+                    expandedNodeIDs: $desktopExpandedNodeIDs,
+                    generationDisabled: store.isCourseNodeGenerationDisabled,
+                    runtimeID: course.agentRuntimeKind ?? CourseAgentProvider.codex,
+                    onOpenMarkdown: { store.openCoursePage(courseID: course.id, pageID: $0) },
+                    onGenerate: generate
+                )
+            }
+            .padding(20)
+            .background(Color(uiColor: .secondarySystemGroupedBackground),
+                        in: RoundedRectangle(cornerRadius: 14))
+            #else
             if let chapter = displayedChapter {
                 CourseChapterSwitcherCard(
                     chapters: learningNodes,
@@ -3134,6 +3599,7 @@ private struct CourseDetailView: View {
                     chapter: chapter.node,
                     chapterNumber: chapter.index + 1,
                     currentNodeID: resumeNode?.id,
+                    explorationProgress: store.explorationProgress(for: course),
                     generationDisabled: store.isCourseNodeGenerationDisabled,
                     runtimeID: course.agentRuntimeKind ?? CourseAgentProvider.codex,
                     onOpenMarkdown: { pageID in
@@ -3143,7 +3609,13 @@ private struct CourseDetailView: View {
                 )
                 .id(chapter.node.id)
                 .transition(.opacity)
+                .environment(\.courseExplorationState) { node in
+                    store.explorationState(
+                        of: node, courseID: course.id, progress: store.explorationProgress(for: course)
+                    )
+                }
             }
+            #endif
 
             if store.backgroundGenerationErrorCourseID == course.id,
                let error = store.backgroundGenerationError {
@@ -3155,7 +3627,23 @@ private struct CourseDetailView: View {
         }
     }
 
+    #if targetEnvironment(macCatalyst)
+    private func allExpandableIDs(in nodes: [CourseLearningNode]) -> [String] {
+        nodes.flatMap { node in
+            (node.children.isEmpty ? [] : [node.id]) + allExpandableIDs(in: node.children)
+        }
+    }
+    #endif
+
     private func generate(_ node: CourseLearningNode) {
+        // Explorations have their own writers: the course agent stays free,
+        // and nothing opens when the page is written.
+        if CourseExplorationMap.isExploration(node) {
+            explorationLauncher.open(
+                node, course: course, store: store, appModel: appModel, appState: appState
+            )
+            return
+        }
         store.generateCourseNodeInBackground(
             for: course,
             node: node,
@@ -3443,12 +3931,33 @@ private struct CourseLearningTreeNodeView: View {
     }
 
     private var canExpand: Bool {
+        #if targetEnvironment(macCatalyst)
+        !node.children.isEmpty
+        #else
         node.kind == .folder && !node.children.isEmpty
+        #endif
     }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
+                #if targetEnvironment(macCatalyst)
+                if node.kind != .folder, canExpand {
+                    Button {
+                        withAnimation(.snappy(duration: 0.24)) {
+                            if isExpanded { expandedNodeIDs.remove(node.id) }
+                            else { expandedNodeIDs.insert(node.id) }
+                        }
+                    } label: {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                            .frame(width: 20, height: 24)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(isExpanded ? "Hide" : "Show") explorations for \(node.title)")
+                    .accessibilityIdentifier("mac-course-branch-\(node.id)")
+                }
+                #endif
                 Button(action: primaryAction) {
                     HStack(spacing: 10) {
                         if node.kind == .folder {
@@ -3542,6 +4051,9 @@ private struct CourseLearningTreeNodeView: View {
                 for: node,
                 runtimeID: runtimeID
             ) {
+                // Explorations have their own writers, so a busy course agent
+                // never blocks them.
+                let blocked = generationDisabled && !CourseExplorationMap.isExploration(node)
                 Button(generationRequest.controlTitle) { onGenerate(node) }
                     .font(.caption.weight(.semibold))
                     .buttonStyle(.borderedProminent)
@@ -3550,18 +4062,18 @@ private struct CourseLearningTreeNodeView: View {
                         "generate-course-node-\(node.id)"
                     )
                     .accessibilityValue(
-                        generationDisabled
+                        blocked
                             ? "pending_generation-disabled"
                             : "pending_generation"
                     )
                     .accessibilityLabel(generationRequest.accessibilityLabel)
                     .accessibilityHint(
-                        generationDisabled
+                        blocked
                             ? "Wait for the current course agent request to finish."
                             : generationRequest.accessibilityHint
                     )
-                    .disabled(generationDisabled)
-                    .opacity(generationDisabled ? 0.45 : 1)
+                    .disabled(blocked)
+                    .opacity(blocked ? 0.45 : 1)
             } else {
                 Text("Pending")
                     .font(.caption.weight(.semibold))
@@ -4027,6 +4539,7 @@ private struct CourseLessonPathView: View {
     let chapter: CourseLearningNode
     let chapterNumber: Int
     let currentNodeID: String?
+    var explorationProgress = CourseExplorationProgress()
     let generationDisabled: Bool
     let runtimeID: String
     let onOpenMarkdown: (String) -> Void
@@ -4091,21 +4604,25 @@ private struct CourseLessonPathView: View {
                         CourseLessonPathStop(
                             stop: stop,
                             isCurrent: stop.node.id == currentNodeID,
+                            explorationCount: CourseExplorationMap.explorationCount(below: stop.node),
                             generationDisabled: generationDisabled,
                             runtimeID: runtimeID,
                             onOpenMarkdown: onOpenMarkdown,
                             onGenerate: onGenerate
                         )
                         if !stop.node.children.isEmpty {
-                            CourseBranchList(
-                                lesson: stop.node,
+                            CourseSideTrailList(
+                                origin: stop.node,
+                                depth: 0,
+                                currentNodeID: currentNodeID,
+                                progress: explorationProgress,
                                 generationDisabled: generationDisabled,
                                 runtimeID: runtimeID,
                                 onOpenMarkdown: onOpenMarkdown,
                                 onGenerate: onGenerate
                             )
-                            // Hang branches from the center of the lesson badge.
-                            .padding(.leading, CourseLessonPathStop.badgeCenterOffset)
+                            // Trails sprout from the center of the lesson badge.
+                            .padding(.leading, CourseLessonPathStop.badgeCenterOffset - 1)
                         }
                     }
                     .padding(.leading, inset)
@@ -4123,6 +4640,7 @@ private struct CourseLessonPathView: View {
 private struct CourseLessonPathStop: View {
     let stop: CourseLearningPathLayout.Stop
     let isCurrent: Bool
+    var explorationCount = 0
     let generationDisabled: Bool
     let runtimeID: String
     let onOpenMarkdown: (String) -> Void
@@ -4227,6 +4745,9 @@ private struct CourseLessonPathStop: View {
 
     private var accessibilityLabel: String {
         var parts = [node.title]
+        if explorationCount > 0 {
+            parts.append("\(explorationCount) \(explorationCount == 1 ? "exploration" : "explorations")")
+        }
         if let section = stop.sectionTitle {
             parts.append("lesson \(stop.positionInSection) of \(stop.sectionLessonCount) in \(section)")
         } else {
@@ -4273,6 +4794,23 @@ private struct CourseLessonPathStop: View {
             }
         }
         .frame(width: badgeSize + 14, height: badgeSize + 14)
+        .overlay(alignment: .topTrailing) {
+            if explorationCount > 0 {
+                // How far the learner wandered from this stop.
+                HStack(spacing: 2) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 9, weight: .bold))
+                    Text("\(explorationCount)")
+                        .font(.caption2.weight(.bold).monospacedDigit())
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(Color.courseExploration, in: Capsule())
+                .overlay(Capsule().strokeBorder(Color(uiColor: .systemGroupedBackground), lineWidth: 2))
+                .accessibilityHidden(true)
+            }
+        }
     }
 
     private var fill: Color {
@@ -4318,197 +4856,6 @@ private struct CourseLessonPathStop: View {
         case .generating, .partiallyGenerated:
             break
         }
-    }
-}
-
-/// Optional side paths the agent grew from a learner's question. They hang
-/// off their lesson and never change the main reading order.
-private struct CourseBranchList: View {
-    let lesson: CourseLearningNode
-    let generationDisabled: Bool
-    let runtimeID: String
-    let onOpenMarkdown: (String) -> Void
-    let onGenerate: (CourseLearningNode) -> Void
-
-    @State private var showsAll = false
-    private let collapsedLimit = 2
-
-    var body: some View {
-        let branches = lesson.children
-        let visible = showsAll ? branches : Array(branches.prefix(collapsedLimit))
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(visible.enumerated()), id: \.element.id) { index, branch in
-                CourseBranchRow(
-                    branch: branch,
-                    isLast: index == visible.count - 1
-                        && (showsAll || branches.count <= collapsedLimit),
-                    generationDisabled: generationDisabled,
-                    runtimeID: runtimeID,
-                    onOpenMarkdown: onOpenMarkdown,
-                    onGenerate: onGenerate
-                )
-            }
-            if !showsAll, branches.count > collapsedLimit {
-                Button {
-                    withAnimation(.snappy(duration: 0.24)) { showsAll = true }
-                } label: {
-                    Text("+\(branches.count - collapsedLimit) more side \(branches.count - collapsedLimit == 1 ? "path" : "paths")")
-                        .font(.footnote.weight(.semibold))
-                }
-                .buttonStyle(.borderless)
-                .padding(.leading, CourseBranchRow.connectorWidth + 4)
-                .padding(.top, 6)
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Side paths from \(lesson.title)")
-    }
-}
-
-private struct CourseBranchRow: View {
-    static let connectorWidth: CGFloat = 22
-    private static let badgeSize: CGFloat = 36
-
-    let branch: CourseLearningNode
-    let isLast: Bool
-    let generationDisabled: Bool
-    let runtimeID: String
-    let onOpenMarkdown: (String) -> Void
-    let onGenerate: (CourseLearningNode) -> Void
-
-    private var generationRequest: CourseDirectGenerationRequest? {
-        CourseExperienceStore.directGenerationRequest(for: branch, runtimeID: runtimeID)
-    }
-
-    private var isEnabled: Bool {
-        switch branch.status {
-        case .generated: branch.pageID != nil
-        case .pendingGeneration: generationRequest != nil && !generationDisabled
-        case .generating, .partiallyGenerated: false
-        }
-    }
-
-    var body: some View {
-        Button(action: action) {
-            HStack(alignment: .center, spacing: 0) {
-                CourseBranchConnector(isLast: isLast)
-                    .stroke(
-                        Color.accentColor.opacity(0.35),
-                        style: StrokeStyle(lineWidth: 2, lineCap: .butt, lineJoin: .round)
-                    )
-                    .frame(width: Self.connectorWidth)
-                    .frame(maxHeight: .infinity)
-                badge
-                    .padding(.trailing, 10)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(branch.title)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.primary)
-                        .multilineTextAlignment(.leading)
-                        .lineLimit(2)
-                    if let question = branch.originQuestion, !question.isEmpty {
-                        Text("“\(question)”")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
-                    if !branch.children.isEmpty {
-                        Text("\(branch.children.count) follow-up\(branch.children.count == 1 ? "" : "s")")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(Color.accentColor)
-                    }
-                }
-                .padding(.vertical, 8)
-                Spacer(minLength: 0)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .allowsHitTesting(isEnabled)
-        .accessibilityElement(children: .ignore)
-        .accessibilityIdentifier("course-branch-\(branch.id)")
-        .accessibilityLabel(accessibilityLabel)
-        .accessibilityAddTraits(isEnabled ? .isButton : [])
-    }
-
-    private var accessibilityLabel: String {
-        var parts = ["Side path", branch.title]
-        if let question = branch.originQuestion, !question.isEmpty {
-            parts.append("from your question: \(question)")
-        }
-        switch branch.status {
-        case .generated: parts.append("ready")
-        case .pendingGeneration: parts.append("not created yet")
-        case .generating, .partiallyGenerated: parts.append("being written")
-        }
-        if !branch.children.isEmpty {
-            parts.append("\(branch.children.count) follow-ups")
-        }
-        return parts.joined(separator: ", ")
-    }
-
-    private var badge: some View {
-        ZStack {
-            Circle()
-                .fill(branch.status == .generated
-                      ? Color.accentColor.opacity(0.14)
-                      : Color(uiColor: .tertiarySystemFill))
-            Circle()
-                .strokeBorder(
-                    branch.status == .generated
-                        ? Color.accentColor.opacity(0.25)
-                        : Color(uiColor: .separator),
-                    lineWidth: 1
-                )
-            switch branch.status {
-            case .generating, .partiallyGenerated:
-                ProgressView().controlSize(.small)
-            case .pendingGeneration:
-                Image(systemName: "sparkle")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.secondary)
-            case .generated:
-                Image(systemName: "arrow.triangle.branch")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
-            }
-        }
-        .frame(width: Self.badgeSize, height: Self.badgeSize)
-    }
-
-    private func action() {
-        switch branch.status {
-        case .generated:
-            if let pageID = branch.pageID { onOpenMarkdown(pageID) }
-        case .pendingGeneration:
-            if generationRequest != nil { onGenerate(branch) }
-        case .generating, .partiallyGenerated:
-            break
-        }
-    }
-}
-
-/// A trunk line that runs down the left edge and curves into each branch.
-private struct CourseBranchConnector: Shape {
-    let isLast: Bool
-
-    func path(in rect: CGRect) -> Path {
-        var path = Path()
-        let midY = rect.midY
-        let radius = min(10, rect.width / 2, midY)
-        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
-        path.addLine(to: CGPoint(x: rect.minX, y: midY - radius))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.minX + radius, y: midY),
-            control: CGPoint(x: rect.minX, y: midY)
-        )
-        path.addLine(to: CGPoint(x: rect.maxX, y: midY))
-        if !isLast {
-            path.move(to: CGPoint(x: rect.minX, y: midY - radius))
-            path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
-        }
-        return path
     }
 }
 
@@ -4595,8 +4942,14 @@ struct CourseLearningPathUITestHarnessView: View {
                 node.children = [
                     branch("why-bey", "Why bills quote a discount rate", .generated,
                            question: "Why don't bills just quote a yield like notes?",
-                           followUps: [branch("bey-history", "A short history of bill quoting", .generated,
-                                              question: "When did that convention start?")]),
+                           followUps: [
+                               branch("bey-history", "A short history of bill quoting", .generated,
+                                      question: "When did that convention start?",
+                                      followUps: [branch("explore-auction", "How Treasury auctions set the first price", .generated,
+                                                         question: "Who decides the price at auction?")]),
+                               branch("explore-banks", "Why banks prefer discount instruments", .pendingGeneration,
+                                      question: "Who actually buys bills?"),
+                           ]),
                     branch("clean-dirty", "Clean versus dirty in practice", .generating,
                            question: "Which price do traders actually see on screen?"),
                     branch("par-yield", "What a par yield really means",
@@ -4633,6 +4986,21 @@ struct CourseLearningPathUITestHarnessView: View {
         ]),
     ]
 
+    /// `--ui-test-learning-path-in-exploration` puts the learner deep in a trail.
+    private static var currentNodeID: String {
+        ProcessInfo.processInfo.arguments.contains("--ui-test-learning-path-in-exploration")
+            ? "explore-auction" : "accrued"
+    }
+
+    private static let progress: CourseExplorationProgress = {
+        var progress = CourseExplorationProgress()
+        progress.finishedPageIDs = ["page-why-bey"]
+        progress.lastVisitedAt["page-why-bey"] = Date(timeIntervalSince1970: 1)
+        progress.lastVisitedAt["page-bey-history"] = Date(timeIntervalSince1970: 2)
+        progress.pinnedNodeIDs = ["bey-history"]
+        return progress
+    }()
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -4649,7 +5017,8 @@ struct CourseLearningPathUITestHarnessView: View {
                 CourseLessonPathView(
                     chapter: Self.chapters[selectedIndex],
                     chapterNumber: selectedIndex + 1,
-                    currentNodeID: "accrued",
+                    currentNodeID: Self.currentNodeID,
+                    explorationProgress: Self.progress,
                     generationDisabled: false,
                     runtimeID: CourseAgentProvider.codex,
                     onOpenMarkdown: { _ in },
@@ -5988,6 +6357,8 @@ private struct ProviderSettingsSourceCheckpointValidHarnessView: View {
             Form {
                 CourseCloudSyncStatusSection(
                     availability: cloudAvailability,
+                    workspaceErrors: [:],
+                    courseTitles: [:],
                     isRetrying: scenario == .lf28Retry || didRetry,
                     onRetry: {
                         recordMemoryOnlyAction()

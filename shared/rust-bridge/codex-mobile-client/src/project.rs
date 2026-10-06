@@ -148,6 +148,8 @@ mod tests {
             stats: None,
             token_usage: None,
             goal: None,
+            current_activity: None,
+            last_turn_outcome: None,
         }
     }
 

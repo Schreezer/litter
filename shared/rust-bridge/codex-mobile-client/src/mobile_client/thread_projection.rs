@@ -61,6 +61,9 @@ pub fn copy_thread_runtime_fields(source: &ThreadSnapshot, target: &mut ThreadSn
         target.pending_plan_implementation_turn_id =
             source.pending_plan_implementation_turn_id.clone();
     }
+    if target.last_turn_outcome.is_none() && target.active_turn_id.is_none() {
+        target.last_turn_outcome = source.last_turn_outcome.clone();
+    }
     target.is_resumed = target.is_resumed || source.is_resumed;
 }
 
@@ -819,7 +822,8 @@ pub(super) fn active_turn_id_from_turns(turns: &[upstream::Turn]) -> Option<Stri
 ///   - With no turn list available (e.g. include_turns=false), preserve local
 ///     state — we have no evidence the turn ended.
 ///   - With a turn list, preserve only if our local id appears as InProgress
-///     (defensive); otherwise honor the rebuild and clear.
+///     (defensive); otherwise honor the rebuild and clear. A cleared turn
+///     the list shows as finished records its outcome.
 /// - `info.status` is derived from the resolved `active_turn_id`: Active iff
 ///   Some, otherwise the upstream-supplied value is left untouched.
 pub fn reconcile_active_turn(
@@ -844,6 +848,33 @@ pub fn reconcile_active_turn(
     if preserve {
         target.active_turn_id = Some(local_id);
         target.info.status = ThreadSummaryStatus::Active;
+    } else if let Some(outcome) = upstream_turns
+        .iter()
+        .find(|t| t.id == local_id)
+        .and_then(upstream_turn_outcome)
+    {
+        // The turn/completed for the local turn was missed; the turn list
+        // is the authoritative record of how it ended.
+        target.last_turn_outcome = Some(outcome);
+    }
+}
+
+/// How an upstream turn ended, or `None` while it is still running.
+fn upstream_turn_outcome(turn: &upstream::Turn) -> Option<crate::source::TurnOutcome> {
+    use crate::source::TurnOutcome;
+    match turn.status {
+        upstream::TurnStatus::Completed => Some(TurnOutcome::Completed),
+        upstream::TurnStatus::Interrupted => Some(TurnOutcome::Interrupted),
+        upstream::TurnStatus::Failed => Some(TurnOutcome::Failed {
+            message: turn
+                .error
+                .as_ref()
+                .map(|error| error.message.trim())
+                .filter(|message| !message.is_empty())
+                .unwrap_or("The agent stopped with an error.")
+                .to_string(),
+        }),
+        upstream::TurnStatus::InProgress => None,
     }
 }
 

@@ -167,6 +167,13 @@ final class AppRuntimeController {
         }
     }
 
+    /// Whether a user-initiated turn started now could get a
+    /// continued-processing task. Lets callers skip work that only feeds the
+    /// task's banner.
+    var canBeginUserInitiatedTurn: Bool {
+        continuedTurnBackground != nil && UIApplication.shared.applicationState == .active
+    }
+
     /// Called synchronously with the user action that starts a Codex turn.
     /// This is intentionally separate from snapshot observation because iOS 26
     /// only permits continued-processing requests that directly follow a
@@ -174,16 +181,14 @@ final class AppRuntimeController {
     func beginUserInitiatedTurn(
         key: ThreadKey,
         appModel: AppModel,
-        agentName: String = "Codex",
+        context: ContinuedTurnContext,
         keepsAliveAcrossTurns: Bool = false
     ) -> UUID? {
         guard self.appModel === appModel else { return nil }
         guard UIApplication.shared.applicationState == .active else { return nil }
-        let title = appModel.threadSnapshot(for: key)?.displayTitle ?? "Codex task"
         let token = continuedTurnBackground?.beginUserInitiatedTurn(
             key: key,
-            title: title,
-            agentName: agentName,
+            context: context,
             keepsAliveAcrossTurns: keepsAliveAcrossTurns
         )
         updateLiveActivityOwnership(snapshot: appModel.snapshot)
@@ -215,11 +220,13 @@ final class AppRuntimeController {
         )
     }
 
+    /// Ends a multi-turn lease. `outcome` says why: `.interrupted` only for a
+    /// learner's stop or abandon, `.failed` for errors.
     func finishUserInitiatedMultiTurn(
         key: ThreadKey,
-        success: Bool
+        outcome: TurnOutcome
     ) {
-        continuedTurnBackground?.finishMultiTurnSession(key: key, success: success)
+        continuedTurnBackground?.finishMultiTurnSession(key: key, outcome: outcome)
         updateLiveActivityOwnership(snapshot: appModel?.snapshot)
     }
 

@@ -119,6 +119,9 @@ pub struct AppStoreReducer {
     dynamic_tool_arg_buffers: RwLock<HashMap<(ThreadKey, String), DynamicToolCallArgBuffer>>,
     updates_tx: broadcast::Sender<AppStoreUpdateRecord>,
     voice_state: VoiceRealtimeState,
+    /// Per-thread turn machines, source-owned transcripts and chat
+    /// subscription wake-ups. See `store/chat.rs`.
+    pub(crate) chat: super::chat::ChatHub,
 }
 
 /// State we carry per (thread, call_id) while streaming argument deltas.
@@ -148,6 +151,7 @@ impl AppStoreReducer {
             dynamic_tool_arg_buffers: RwLock::new(HashMap::new()),
             updates_tx,
             voice_state: VoiceRealtimeState::default(),
+            chat: super::chat::ChatHub::default(),
         }
     }
 
@@ -728,8 +732,14 @@ impl AppStoreReducer {
                 overlay_id = item_id,
                 "stage_local_user_message_overlay skipped: thread not in store"
             );
-            return None;
+            // The chat outbox keeps the message visible to chat subscribers
+            // until the server echoes it. The snapshot is unchanged; the id is
+            // returned so the caller's accept/failure path reaches the outbox.
+            self.chat.outbox_push(key, emitted_item);
+            return Some(item_id);
         }
+        self.chat
+            .apply_local_if_tracked(key, crate::store::turn::LocalAction::Send);
         self.emit_thread_item_changed(key, emitted_item);
         Some(item_id)
     }
@@ -740,6 +750,14 @@ impl AppStoreReducer {
         item_id: &str,
         turn_id: &str,
     ) {
+        self.chat.apply_events_if_tracked(
+            key,
+            &[crate::source::SourceEvent::TurnAccepted {
+                client_msg_id: Some(item_id.to_string()),
+                turn_id: turn_id.to_string(),
+            }],
+            super::chat::now_ms(),
+        );
         if let Some((updated_item, removed_item_ids, needs_reprojection)) = self
             .mutate_thread_with_result(key, |thread| {
                 let mut updated_item = None;
@@ -782,14 +800,15 @@ impl AppStoreReducer {
         key: &ThreadKey,
         turn_id: &str,
     ) {
-        if let Some((updated_item, removed_item_ids, needs_reprojection)) = self
-            .mutate_thread_with_result(key, |thread| {
+        let mut bound_overlay_id: Option<String> = None;
+        let result = self.mutate_thread_with_result(key, |thread| {
                 let mut updated_item = None;
                 let mut needs_reprojection = false;
                 if let Some(item) = thread.local_overlay_items.iter_mut().find(|item| {
                     item.id.starts_with(LOCAL_USER_MESSAGE_ITEM_PREFIX)
                         && item.source_turn_id.is_none()
                 }) {
+                    bound_overlay_id = Some(item.id.clone());
                     item.source_turn_id = Some(turn_id.to_string());
                     needs_reprojection = true;
                     updated_item = Some(item.clone());
@@ -806,8 +825,11 @@ impl AppStoreReducer {
                     removed_item_ids,
                     needs_reprojection,
                 )
-            })
-        {
+            });
+        if let Some(overlay_id) = bound_overlay_id.as_deref() {
+            self.chat.bind_user_row_if_tracked(key, turn_id, overlay_id);
+        }
+        if let Some((updated_item, removed_item_ids, needs_reprojection)) = result {
             if !removed_item_ids.is_empty() || needs_reprojection {
                 self.emit_thread_upsert(key);
             } else if let Some(item) = updated_item {
@@ -817,6 +839,10 @@ impl AppStoreReducer {
     }
 
     pub(crate) fn remove_local_overlay_item(&self, key: &ThreadKey, item_id: &str) {
+        if item_id.starts_with(LOCAL_USER_MESSAGE_ITEM_PREFIX) {
+            // Only a failed turn/start removes a learner overlay.
+            self.chat.outbox_fail(key, item_id);
+        }
         if self
             .mutate_thread_with_result(key, |thread| {
                 let before = thread.local_overlay_items.len();
@@ -1454,6 +1480,274 @@ impl AppStoreReducer {
     }
 
     pub(crate) fn apply_ui_event(&self, event: &UiEvent) {
+        self.apply_ui_event_to_snapshot(event);
+        self.apply_ui_event_to_chat(event);
+    }
+
+    // ── Chat intake (AppServerAdapter + source-owned threads) ─────────────
+
+    /// Feeds the per-thread turn machine from a `UiEvent` the snapshot has
+    /// already absorbed. Threads without chat state are skipped before any
+    /// conversion or extra locking: a chat opened later reconciles from the
+    /// snapshot.
+    fn apply_ui_event_to_chat(&self, event: &UiEvent) {
+        if let UiEvent::ConnectionStateChanged { server_id, .. } = event {
+            self.chat.touch_server(server_id);
+            return;
+        }
+        let Some(key) = crate::source::app_server::event_thread_key(event) else {
+            return;
+        };
+        if !self.chat.is_tracked(&key) {
+            return;
+        }
+        if let UiEvent::TurnRetrying { turn_id, .. } = event {
+            let snapshot = self.snapshot.read().expect("app store lock poisoned");
+            if !snapshot
+                .threads
+                .get(&key)
+                .is_some_and(|thread| thread.active_turn_id.as_deref() == Some(turn_id.as_str()))
+            {
+                // A replayed retry for a settled or replaced turn must not
+                // resurrect its reconnecting indicator.
+                return;
+            }
+        }
+        let Some((key, mut events)) = crate::source::app_server::source_events(event) else {
+            return;
+        };
+        if let UiEvent::TurnCompleted {
+            error: None,
+            interrupted: false,
+            ..
+        } = event
+            && let Some(request) = self.chat_pending_fence_question(&key)
+        {
+            events.push(crate::source::SourceEvent::InputRequested { request });
+        }
+        self.chat
+            .apply_events_if_tracked(&key, &events, super::chat::now_ms());
+    }
+
+    pub(crate) fn chat_source_kind(&self, key: &ThreadKey) -> crate::source::SourceKind {
+        use crate::source::SourceKind;
+        if key.server_id == super::chat::HOSTED_SERVER_ID {
+            return SourceKind::Hosted;
+        }
+        if key.server_id == super::chat::APPLE_SERVER_ID {
+            return SourceKind::Apple;
+        }
+        let snapshot = self.snapshot.read().expect("app store lock poisoned");
+        SourceKind::app_server(
+            snapshot
+                .threads
+                .get(key)
+                .map(|thread| thread.agent_runtime_kind.as_str())
+                .unwrap_or(""),
+        )
+    }
+
+    pub(crate) fn apply_source_events(
+        &self,
+        key: &ThreadKey,
+        source_kind: crate::source::SourceKind,
+        events: &[crate::source::SourceEvent],
+    ) {
+        self.chat
+            .apply_events(key, source_kind, events, super::chat::now_ms());
+    }
+
+    /// A device action (stop, stop failed) on any thread.
+    pub(crate) fn chat_local_action(&self, key: &ThreadKey, action: super::turn::LocalAction) {
+        if matches!(self.chat_source_kind(key), crate::source::SourceKind::AppServer { .. }) {
+            self.chat.apply_local_if_tracked(key, action);
+        } else {
+            self.chat.apply_local(key, self.chat_source_kind(key), action);
+        }
+    }
+
+    /// The fence question a settled turn left for the learner, read from the
+    /// app-server snapshot or the hub's source-owned transcript.
+    pub(crate) fn chat_pending_fence_question(
+        &self,
+        key: &ThreadKey,
+    ) -> Option<crate::source::InputRequest> {
+        {
+            let snapshot = self.snapshot.read().expect("app store lock poisoned");
+            if let Some(thread) = snapshot.threads.get(key) {
+                return super::chat::pending_fence_question(&thread.items);
+            }
+        }
+        self.chat.owned_pending_fence_question(key)
+    }
+
+    pub(crate) fn chat_subscribe(&self, key: &ThreadKey) -> tokio::sync::watch::Receiver<u64> {
+        self.chat.subscribe(key, self.chat_source_kind(key))
+    }
+
+    pub(crate) fn chat_unsubscribe(&self, key: &ThreadKey) {
+        self.chat.unsubscribe(key);
+    }
+
+    /// Wakes a thread's chat subscribers without a canonical change.
+    pub(crate) fn chat_touch(&self, key: &ThreadKey) {
+        self.chat.touch(key);
+    }
+
+    /// The chat for one thread. Snapshot facts and hub state are copied under
+    /// the locks (snapshot, then hub); the timeline is derived after both are
+    /// released, so streaming writers never wait on a derivation.
+    pub(crate) fn chat_view(
+        &self,
+        key: &ThreadKey,
+        options: &super::chat::ChatViewOptions,
+    ) -> super::chat::ChatView {
+        let capture = {
+            let snapshot = self.snapshot.read().expect("app store lock poisoned");
+            let pending_questions: Vec<super::chat::PendingQuestionInput> = snapshot
+                .pending_user_inputs
+                .iter()
+                .filter(|request| {
+                    request.server_id == key.server_id && request.thread_id == key.thread_id
+                })
+                .flat_map(|request| {
+                    request.questions.iter().map(|question| super::chat::PendingQuestionInput {
+                        request_id: request.id.clone(),
+                        question_id: question.id.clone(),
+                        turn_id: Some(request.turn_id.clone()).filter(|id| !id.is_empty()),
+                        prompt: question.question.clone(),
+                        options: question.options.iter().map(|option| option.label.clone()).collect(),
+                        allows_free_text: question.is_other_allowed || question.options.is_empty(),
+                    })
+                })
+                .collect();
+            let facts = snapshot.threads.get(key).map(|thread| {
+                let pending_request_ids = snapshot
+                    .pending_approvals
+                    .iter()
+                    .filter(|approval| {
+                        approval.server_id == key.server_id
+                            && approval.thread_id.as_deref() == Some(key.thread_id.as_str())
+                    })
+                    .map(|approval| approval.id.clone())
+                    .chain(
+                        snapshot
+                            .pending_user_inputs
+                            .iter()
+                            .filter(|request| {
+                                request.server_id == key.server_id
+                                    && request.thread_id == key.thread_id
+                            })
+                            .map(|request| request.id.clone()),
+                    )
+                    .collect();
+                super::chat::ThreadFacts {
+                    thread,
+                    server: snapshot.servers.get(&key.server_id),
+                    pending_request_ids,
+                }
+            });
+            self.chat.capture(key, facts, pending_questions)
+        };
+        super::chat::derive_view(capture, options)
+    }
+
+    /// Platform-run sources (Apple Foundation Models) push their events here.
+    /// Server-owned threads (in the snapshot, or app-server keys it has not
+    /// loaded yet) only accept `Progress` (for example Hermes recovery steps)
+    /// and stop requests; their items stay server-owned.
+    pub(crate) fn chat_ingest_external(
+        &self,
+        key: &ThreadKey,
+        source_kind: crate::source::SourceKind,
+        events: Vec<crate::source::ExternalSourceEvent>,
+    ) {
+        use crate::source::{ExternalSourceEvent, SourceEvent, SourceKind};
+        let in_snapshot = {
+            let snapshot = self.snapshot.read().expect("app store lock poisoned");
+            snapshot.threads.contains_key(key)
+        };
+        let platform_key = matches!(
+            self.chat_source_kind(key),
+            SourceKind::Hosted | SourceKind::Apple
+        );
+        let is_app_server_thread =
+            in_snapshot || (!platform_key && matches!(source_kind, SourceKind::AppServer { .. }));
+        if !is_app_server_thread || self.chat.owns_transcript(key) {
+            self.chat
+                .ingest_external(key, source_kind, events, super::chat::now_ms());
+            return;
+        }
+        let mut progress = Vec::new();
+        for event in events {
+            match event {
+                ExternalSourceEvent::Progress { label } => {
+                    progress.push(SourceEvent::Progress { label });
+                }
+                ExternalSourceEvent::StopRequested => {
+                    self.chat
+                        .apply_local_if_tracked(key, super::turn::LocalAction::Stop);
+                }
+                ExternalSourceEvent::StopFailed => {
+                    self.chat
+                        .apply_local_if_tracked(key, super::turn::LocalAction::StopFailed);
+                }
+                ExternalSourceEvent::CarriedOverTranscript { messages } => {
+                    self.chat.set_carried_over(key, source_kind.clone(), &messages);
+                }
+                other => {
+                    tracing::warn!(
+                        target: "store",
+                        server_id = key.server_id,
+                        thread_id = key.thread_id,
+                        event = ?other,
+                        "ignoring external item event for a server-owned thread"
+                    );
+                }
+            }
+        }
+        self.chat
+            .apply_events_if_tracked(key, &progress, super::chat::now_ms());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mutate_snapshot_for_test(&self, f: impl FnOnce(&mut AppSnapshot)) {
+        f(&mut self.snapshot.write().expect("app store lock poisoned"));
+    }
+
+    pub(crate) fn chat_replace_owned_transcript(
+        &self,
+        key: &ThreadKey,
+        source_kind: crate::source::SourceKind,
+        items: Vec<HydratedConversationItem>,
+    ) {
+        self.chat.replace_owned_transcript(key, source_kind, items);
+    }
+
+    /// Wakes chat subscribers for whatever thread an update concerns.
+    fn note_chat_update(&self, update: &AppStoreUpdateRecord) {
+        match update {
+            AppStoreUpdateRecord::FullResync => self.chat.touch_all(),
+            AppStoreUpdateRecord::ServerChanged { server_id }
+            | AppStoreUpdateRecord::ServerRemoved { server_id } => {
+                self.chat.touch_server(server_id)
+            }
+            AppStoreUpdateRecord::ThreadUpserted { thread, .. } => self.chat.touch(&thread.key),
+            AppStoreUpdateRecord::ThreadMetadataChanged { state, .. } => {
+                self.chat.touch(&state.key)
+            }
+            AppStoreUpdateRecord::ThreadRemoved { key, .. } => self.chat.remove_thread(key),
+            AppStoreUpdateRecord::ThreadItemChanged { key, .. }
+            | AppStoreUpdateRecord::ThreadStreamingDelta { key, .. }
+            | AppStoreUpdateRecord::DynamicWidgetStreaming { key, .. } => self.chat.touch(key),
+            // A resolved request is no longer listed, so its thread cannot be
+            // named; wake every chat so stale question rows disappear.
+            AppStoreUpdateRecord::PendingUserInputsChanged { .. } => self.chat.touch_all(),
+            _ => {}
+        }
+    }
+
+    fn apply_ui_event_to_snapshot(&self, event: &UiEvent) {
         match event {
             UiEvent::ThreadStarted { key, notification } => {
                 let info = thread_info_from_upstream(notification.thread.clone());
@@ -1483,6 +1777,18 @@ impl AppStoreReducer {
                         status,
                         ThreadSummaryStatus::Idle | ThreadSummaryStatus::SystemError
                     ) {
+                        // Upstream reports a system error before the turn's
+                        // turn/completed; record a provisional failure so the
+                        // gap never reads as a clean finish. TurnCompleted
+                        // replaces it with the exact outcome.
+                        if matches!(status, ThreadSummaryStatus::SystemError)
+                            && thread.active_turn_id.is_some()
+                            && thread.last_turn_outcome.is_none()
+                        {
+                            thread.last_turn_outcome = Some(crate::source::TurnOutcome::Failed {
+                                message: String::new(),
+                            });
+                        }
                         thread.active_turn_id = None;
                         thread.active_plan_progress = None;
                         thread.info.status = status.clone();
@@ -1534,6 +1840,7 @@ impl AppStoreReducer {
                         thread.active_turn_id = Some(turn_id.clone());
                         thread.active_plan_progress = None;
                         thread.pending_plan_implementation_turn_id = None;
+                        thread.last_turn_outcome = None;
                         thread.info.status = ThreadSummaryStatus::Active;
                         if thread.info.parent_thread_id.is_some() {
                             thread.info.agent_status = Some("running".to_string());
@@ -1545,11 +1852,20 @@ impl AppStoreReducer {
                     self.emit_thread_metadata_changed(key);
                 }
             }
-            UiEvent::TurnCompleted { key, turn_id, .. } => {
+            UiEvent::TurnCompleted {
+                key,
+                turn_id,
+                error,
+                interrupted,
+            } => {
                 if self
                     .mutate_thread_with_result(key, |thread| {
                         thread.active_turn_id = None;
                         thread.active_plan_progress = None;
+                        thread.last_turn_outcome = Some(crate::source::app_server::turn_outcome(
+                            error.as_deref(),
+                            *interrupted,
+                        ));
                         thread.info.status = ThreadSummaryStatus::Idle;
                         if thread.info.parent_thread_id.is_some() {
                             thread.info.agent_status = Some("completed".to_string());
@@ -2153,6 +2469,9 @@ impl AppStoreReducer {
                     }
                 }
             }
+            // Recoverable failures are rendered through the turn machine's
+            // progress label and must never become historical error items.
+            UiEvent::TurnRetrying { .. } => {}
             UiEvent::UserInputRequested { request, seed } => {
                 let requests = {
                     let mut snapshot = self.snapshot.write().expect("app store lock poisoned");
@@ -2717,6 +3036,7 @@ impl AppStoreReducer {
                 tracing::debug!(target: "store", "emit TerminalSessionsChanged")
             }
         }
+        self.note_chat_update(&update);
         let _ = self.updates_tx.send(update);
     }
 
@@ -3410,6 +3730,11 @@ fn preserve_thread_runtime_state(source: &ThreadSnapshot, target: &mut ThreadSna
     if target.pending_plan_implementation_turn_id.is_none() {
         target.pending_plan_implementation_turn_id =
             source.pending_plan_implementation_turn_id.clone();
+    }
+    // A rebuilt thread cannot recover how its last turn ended; keep the
+    // recorded outcome unless the rebuilt thread is already running again.
+    if target.last_turn_outcome.is_none() && target.active_turn_id.is_none() {
+        target.last_turn_outcome = source.last_turn_outcome.clone();
     }
 }
 
@@ -5809,6 +6134,133 @@ mod tests {
         assert!(entry_b.buffer.contains("BBB"));
         assert_eq!(entry_a.item_id, "item-A");
         assert_eq!(entry_b.item_id, "item-B");
+    }
+
+    fn complete_turn(
+        reducer: &AppStoreReducer,
+        key: &ThreadKey,
+        turn_id: &str,
+        error: Option<&str>,
+        interrupted: bool,
+    ) -> Option<crate::source::TurnOutcome> {
+        reducer.apply_ui_event(&UiEvent::TurnStarted {
+            key: key.clone(),
+            turn_id: turn_id.to_string(),
+        });
+        reducer.apply_ui_event(&UiEvent::TurnCompleted {
+            key: key.clone(),
+            turn_id: turn_id.to_string(),
+            error: error.map(str::to_string),
+            interrupted,
+        });
+        reducer.snapshot().threads[key].last_turn_outcome.clone()
+    }
+
+    #[test]
+    fn turn_completed_records_last_turn_outcome() {
+        use crate::source::TurnOutcome;
+        let reducer = AppStoreReducer::new();
+        let key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        reducer
+            .upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("thread")));
+
+        assert_eq!(
+            complete_turn(&reducer, &key, "turn-1", None, false),
+            Some(TurnOutcome::Completed)
+        );
+        assert_eq!(
+            complete_turn(&reducer, &key, "turn-2", None, true),
+            Some(TurnOutcome::Interrupted)
+        );
+        assert_eq!(
+            complete_turn(&reducer, &key, "turn-3", Some("Model overloaded"), false),
+            Some(TurnOutcome::Failed {
+                message: "Model overloaded".to_string()
+            })
+        );
+        // A stop that also carries an error is still a stop.
+        assert_eq!(
+            complete_turn(&reducer, &key, "turn-4", Some("aborted"), true),
+            Some(TurnOutcome::Interrupted)
+        );
+        assert_eq!(
+            complete_turn(&reducer, &key, "turn-5", Some("   "), false),
+            Some(TurnOutcome::Completed)
+        );
+    }
+
+    #[test]
+    fn turn_started_clears_last_turn_outcome() {
+        let reducer = AppStoreReducer::new();
+        let key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        reducer
+            .upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("thread")));
+        assert!(complete_turn(&reducer, &key, "turn-1", Some("boom"), false).is_some());
+
+        reducer.apply_ui_event(&UiEvent::TurnStarted {
+            key: key.clone(),
+            turn_id: "turn-2".to_string(),
+        });
+        let snapshot = reducer.snapshot();
+        assert_eq!(snapshot.threads[&key].last_turn_outcome, None);
+        let summary = snapshot
+            .threads
+            .get(&key)
+            .map(|thread| crate::store::boundary::app_session_summary(thread, None))
+            .expect("summary");
+        assert_eq!(summary.last_turn_outcome, None);
+    }
+
+    #[test]
+    fn preserve_runtime_state_carries_outcome_only_when_idle() {
+        use crate::source::TurnOutcome;
+        let reducer = AppStoreReducer::new();
+        let key = ThreadKey {
+            server_id: "srv".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        reducer
+            .upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("thread")));
+        let failed = TurnOutcome::Failed {
+            message: "boom".to_string(),
+        };
+        assert_eq!(
+            complete_turn(&reducer, &key, "turn-1", Some("boom"), false),
+            Some(failed.clone())
+        );
+        let recorded = reducer.snapshot().threads[&key].clone();
+
+        // An idle rebuild (reconnect, thread/read) keeps the outcome.
+        reducer
+            .upsert_thread_snapshot(ThreadSnapshot::from_info("srv", make_thread_info("thread")));
+        assert_eq!(
+            reducer.snapshot().threads[&key].last_turn_outcome,
+            Some(failed.clone())
+        );
+        let mut idle = ThreadSnapshot::from_info("srv", make_thread_info("thread"));
+        crate::copy_thread_runtime_fields(&recorded, &mut idle);
+        assert_eq!(idle.last_turn_outcome, Some(failed.clone()));
+
+        // A rebuild that is already running a new turn does not.
+        let mut running = ThreadSnapshot::from_info("srv", make_thread_info("thread"));
+        running.active_turn_id = Some("turn-2".to_string());
+        let mut copied = running.clone();
+        crate::copy_thread_runtime_fields(&recorded, &mut copied);
+        assert_eq!(copied.last_turn_outcome, None);
+        reducer.upsert_thread_snapshot(running);
+        assert_eq!(reducer.snapshot().threads[&key].last_turn_outcome, None);
+
+        // An outcome the rebuild already knows wins over the recorded one.
+        let mut known = ThreadSnapshot::from_info("srv", make_thread_info("thread"));
+        known.last_turn_outcome = Some(TurnOutcome::Interrupted);
+        crate::copy_thread_runtime_fields(&recorded, &mut known);
+        assert_eq!(known.last_turn_outcome, Some(TurnOutcome::Interrupted));
     }
 }
 

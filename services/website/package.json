@@ -1,0 +1,20 @@
+{
+  "name": "learnfold-website",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler pages dev public --ip 127.0.0.1 --port 4174",
+    "types": "wrangler types worker-configuration.d.ts",
+    "check": "npm run types && tsc -p tsconfig.json && node --check public/experiment.js && node --check public/waitlist.js",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "report": "python3 scripts/experiment-report.py",
+    "deploy": "wrangler pages deploy public --project-name learnfold --branch main --commit-dirty=true"
+  },
+  "devDependencies": {
+    "typescript": "5.9.2",
+    "wrangler": "4.130.0"
+  },
+  "dependencies": {
+    "aws4fetch": "^1.0.20"
+  }
+}

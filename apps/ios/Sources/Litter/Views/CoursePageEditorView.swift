@@ -439,8 +439,18 @@ private final class CourseReadingViewport {
     var position: NativeBlockEditorReadingPosition?
 }
 
+private struct CoursePageChatPresentation: Identifiable {
+    let context: CoursePageChatContext
+    let discussionID: UUID
+    var assessment: CourseAssessmentDefinition? = nil
+    var assessmentAttempt: CourseAssessmentAttempt? = nil
+
+    var id: UUID { discussionID }
+}
+
 struct CoursePageEditorView: View {
     @Environment(AppModel.self) private var appModel
+    @Environment(AppState.self) private var appState
     let course: LearningCourse
     let pageID: String
     @Bindable var store: CourseExperienceStore
@@ -452,9 +462,12 @@ struct CoursePageEditorView: View {
     @State private var loadingError: String?
     @State private var reloadGeneration = 0
     @State private var chatError: String?
-    @State private var activePageChat: CoursePageChatContext?
+    @State private var activePageChat: CoursePageChatPresentation?
+    @State private var assessmentAttempts: CourseAssessmentAttemptStore?
+    @State private var assessmentStorageError: String?
     @State private var activeDiscussion: CourseSelectionDiscussion?
     @State private var discussionConflict: CourseSelectionDiscussionConflict?
+    @State private var explorationLauncher = CourseExplorationLauncher()
 #if DEBUG
     @State private var lf51RuntimeProbeState = CourseEditorLF51RuntimeProbeState()
 #endif
@@ -469,42 +482,15 @@ struct CoursePageEditorView: View {
     }
 
     var body: some View {
-        Group {
+        // Keep modal presentation attached to one concrete host as the reader
+        // and assessment state update underneath an open discussion.
+        ZStack {
             if let model, !model.isLoading {
-                CoursePageEditorCanvas(
-                    model: model,
-                    textAnnotations: textAnnotations(in: model),
-                    onAskAboutSelection: { selection in
-                        askAboutSelection(selection, model: model)
-                    },
-                    onOpenTextAnnotation: { annotation in
-                        openDiscussion(annotation: annotation)
-                    },
-                    onOpenPage: { destination in
-                        store.openCoursePage(courseID: course.id, pageID: destination.id)
-                    },
-                    readingFooter: readingFooter(for: model),
-                    onAskAboutPage: {
-                        openPageChat(model: model)
-                    },
-                    initialReadingPosition: initialReadingPosition,
-                    onReadingPositionChange: { position in
-                        guard store.navigationPath.last == .coursePage(courseID: course.id, pageID: pageID),
-                              CourseReadingOrder.lessons(in: readingNodes).contains(where: { $0.pageID == pageID }) else { return }
-                        latestReadingViewport.position = position
-                        store.saveReadingBookmark(CourseReadingBookmark(
-                            pageID: pageID, offset: position.offset, isAtEnd: position.isAtEnd
-                        ), for: course)
-                    }
-                )
-                .id(pageID)
-                .onAppear {
-                    if let position = latestReadingViewport.position {
-                        store.saveReadingBookmark(CourseReadingBookmark(
-                            pageID: pageID, offset: position.offset, isAtEnd: position.isAtEnd
-                        ), for: course)
-                    }
-                }
+                #if targetEnvironment(macCatalyst)
+                macReadingWorkspace(for: model)
+                #else
+                editorCanvas(for: model)
+                #endif
             } else if let loadingError {
                 CoursePageLoadFailureView(pageID: pageID, error: loadingError) {
                     model = nil
@@ -526,7 +512,13 @@ struct CoursePageEditorView: View {
             runtimeProbeOverlay
         }
 #endif
+        #if targetEnvironment(macCatalyst)
+        // The window title names the course; an empty title would fall back
+        // to the app name.
+        .navigationTitle(course.title)
+        #else
         .navigationTitle("")
+        #endif
         .task(id: loadID) {
             await loadPage(requestID: loadID)
         }
@@ -534,23 +526,20 @@ struct CoursePageEditorView: View {
             guard let model else { return }
             Task { await model.flush() }
         }
-        .fullScreenCover(item: $activePageChat) { context in
+        #if targetEnvironment(macCatalyst)
+        .onChange(of: pageID) { _, _ in closeInlineDiscussion() }
+        .onChange(of: course.id) { _, _ in closeInlineDiscussion() }
+        #else
+        .fullScreenCover(item: $activePageChat) { chat in
             NavigationStack {
-                CourseChatView(store: store, pageContext: context, showsDismissButton: true)
+                pageDiscussionView(chat)
             }
+            .id(chat.discussionID)
         }
         .fullScreenCover(item: $activeDiscussion) { discussion in
             if let reference = discussion.reference {
                 NavigationStack {
-                    CourseChatView(
-                        store: store,
-                        selectionContext: reference,
-                        selectionDiscussionID: discussion.id,
-                        showsDismissButton: true,
-                        onSelectionDiscussionReplaced: { replacement in
-                            activeDiscussion = replacement
-                        }
-                    )
+                    selectionDiscussionView(discussion, reference: reference)
                 }
 #if DEBUG
                 .overlay(alignment: .topLeading) {
@@ -569,57 +558,609 @@ struct CoursePageEditorView: View {
                 }
             }
         }
+        #endif
         .courseSelectionDiscussionAlerts(
             chatError: $chatError,
             conflict: $discussionConflict,
-            onContinueExisting: { activeDiscussion = $0 },
+            onContinueExisting: presentSelectionDiscussion,
             onReplaceConflict: replaceConflictingDiscussion
+        )
+        .task(id: store.courseWorkspaceRefreshVersion) {
+            // New explorations fork off this page while it stays open.
+            guard model != nil,
+                  let repository = try? await store.documentRepository(for: course),
+                  let outline = try? await repository.outline(),
+                  !Task.isCancelled else { return }
+            readingNodes = outline.learningPages
+        }
+    }
+
+    private func editorCanvas(
+        for model: CoursePageEditorModel,
+        onToggleOutline: (() -> Void)? = nil,
+        isOutlineVisible: Bool = false
+    ) -> some View {
+        CoursePageEditorCanvas(
+            model: model,
+            textAnnotations: textAnnotations(in: model),
+            onAskAboutSelection: { selection in
+                askAboutSelection(selection, model: model)
+            },
+            onExploreSelection: isReadablePage ? { selection, question in
+                try await explorationLauncher.fork(
+                    explorationRequest(
+                        direction: .question,
+                        question: question,
+                        quotedPassage: selection.text,
+                        model: model
+                    ),
+                    anchor: CourseSelectionAnchorResolver.reference(
+                        courseID: course.id,
+                        pageID: pageID,
+                        pageTitle: model.title,
+                        selection: selection,
+                        document: model.document
+                    ).map {
+                        CourseExplorationAnchor(
+                            blockID: $0.blockID,
+                            pathIndices: $0.pathIndices,
+                            rangeLocation: $0.rangeLocation,
+                            rangeLength: $0.rangeLength,
+                            selectedText: $0.selectedText
+                        )
+                    },
+                    course: course, store: store, appModel: appModel, appState: appState
+                )
+            } : nil,
+            explorationOverlap: { selection in explorationOverlap(with: selection, in: model) },
+            explorationStatus: explorationStatus,
+            onOpenTextAnnotation: { annotation in
+                openDiscussion(annotation: annotation)
+            },
+            onTapTextAnnotations: handleAnnotationHit,
+            passageThreads: passageThreads,
+            onPassageAction: performPassageAction,
+            onOpenPage: { destination in
+                // A link to an exploration follows the same rule as everywhere
+                // else: written pages open, unwritten ones are written instead.
+                if let node = CourseExplorationMap.node(withPageID: destination.id, in: readingNodes),
+                   CourseExplorationMap.isExploration(node) {
+                    explorationLauncher.open(node, course: course, store: store, appModel: appModel, appState: appState)
+                } else {
+                    store.openCoursePage(courseID: course.id, pageID: destination.id)
+                }
+            },
+            readingFooter: readingFooter(for: model),
+            additionalHiddenReadingBlockIDs: CourseAssessmentPageContent.extract(
+                from: model.document
+            ).hiddenBlockIDs,
+            onAskAboutPage: { openPageChat(model: model) },
+            initialReadingPosition: initialReadingPosition,
+            onReadingPositionChange: { position in
+                guard store.navigationPath.last == .coursePage(courseID: course.id, pageID: pageID),
+                      isReadablePage else { return }
+                latestReadingViewport.position = position
+                store.saveReadingBookmark(CourseReadingBookmark(
+                    pageID: pageID, offset: position.offset, isAtEnd: position.isAtEnd
+                ), for: course)
+                store.recordReading(pageID: pageID, isAtEnd: position.isAtEnd, for: course)
+            },
+            onToggleOutline: onToggleOutline,
+            isOutlineVisible: isOutlineVisible
+        )
+        .id(pageID)
+        .onAppear {
+            if let position = latestReadingViewport.position {
+                store.saveReadingBookmark(CourseReadingBookmark(
+                    pageID: pageID, offset: position.offset, isAtEnd: position.isAtEnd
+                ), for: course)
+            }
+        }
+    }
+
+    private func pageDiscussionView(
+        _ chat: CoursePageChatPresentation,
+        isEmbedded: Bool = false
+    ) -> CourseChatView {
+        CourseChatView(
+            store: store,
+            pageContext: chat.context,
+            selectionDiscussionID: chat.discussionID,
+            showsDismissButton: true,
+            isEmbedded: isEmbedded,
+            onDismiss: isEmbedded ? closeInlineDiscussion : nil,
+            onSelectionDiscussionReplaced: { replacement in
+                presentPageDiscussion(CoursePageChatPresentation(
+                    context: chat.context,
+                    discussionID: replacement.id,
+                    assessment: chat.assessment,
+                    assessmentAttempt: chat.assessmentAttempt
+                ))
+            },
+            onAssistantInitiationSent: {
+                guard let attempt = chat.assessmentAttempt else { return }
+                do {
+                    try assessmentAttempts?.markDiscussionStarted(for: attempt)
+                } catch {
+                    chatError = error.localizedDescription
+                }
+            }
         )
     }
 
-    private func openPageChat(model: CoursePageEditorModel, initialQuestion: String? = nil) {
-        guard store.prepareContextualCourseChat(for: course) else {
-            chatError = store.agentError ?? "This course’s chat could not be opened."
-            return
+    private func selectionDiscussionView(
+        _ discussion: CourseSelectionDiscussion,
+        reference: CourseTextReference,
+        isEmbedded: Bool = false
+    ) -> CourseChatView {
+        CourseChatView(
+            store: store,
+            selectionContext: reference,
+            selectionDiscussionID: discussion.id,
+            showsDismissButton: true,
+            isEmbedded: isEmbedded,
+            onDismiss: isEmbedded ? closeInlineDiscussion : nil,
+            onSelectionDiscussionReplaced: presentSelectionDiscussion
+        )
+    }
+
+    private func presentPageDiscussion(_ presentation: CoursePageChatPresentation) {
+        #if targetEnvironment(macCatalyst)
+        activeDiscussion = nil
+        #endif
+        activePageChat = presentation
+    }
+
+    private func presentSelectionDiscussion(_ discussion: CourseSelectionDiscussion) {
+        #if targetEnvironment(macCatalyst)
+        activePageChat = nil
+        #endif
+        activeDiscussion = discussion
+    }
+
+    private func closeInlineDiscussion() {
+        activePageChat = nil
+        activeDiscussion = nil
+    }
+
+    #if targetEnvironment(macCatalyst)
+    private func macReadingWorkspace(for model: CoursePageEditorModel) -> some View {
+        MacCourseReadingWorkspace(
+            courseTitle: course.title,
+            nodes: CourseLearningPathResolver.overlayGeneratingStatus(
+                in: readingNodes,
+                targetNodeIDs: store.activeExplorationNodeIDs(courseID: course.id).union(
+                    store.backgroundGeneratingCourseID == course.id
+                        ? store.backgroundGeneratingNodeID.map { [$0] } ?? [] : []
+                )
+            ),
+            selectedPageID: pageID,
+            runtimeID: course.agentRuntimeKind ?? CourseAgentProvider.codex,
+            generationDisabled: store.isCourseNodeGenerationDisabled,
+            hasDiscussion: activePageChat != nil || activeDiscussion != nil,
+            onOpenPage: { destinationID in
+                guard destinationID != pageID else { return }
+                store.openReadingPage(
+                    courseID: course.id, pageID: destinationID, replacingCurrentPage: true
+                )
+            },
+            onGenerate: { node in
+                if CourseExplorationMap.isExploration(node) {
+                    // Explorations have their own writers; the course agent
+                    // stays free, and nothing opens when the page is written.
+                    explorationLauncher.open(
+                        node, course: course, store: store, appModel: appModel, appState: appState
+                    )
+                } else {
+                    store.generateCourseNodeInBackground(
+                        for: course, node: node, appModel: appModel, appState: appState
+                    )
+                }
+            },
+            reader: { chrome in
+                editorCanvas(
+                    for: model,
+                    onToggleOutline: chrome.toggleOutline,
+                    isOutlineVisible: chrome.isOutlineVisible
+                )
+            },
+            discussion: { inlineDiscussion }
+        )
+    }
+
+    @ViewBuilder
+    private var inlineDiscussion: some View {
+        if let chat = activePageChat {
+            pageDiscussionView(chat, isEmbedded: true)
+                .id(chat.discussionID)
+        } else if let discussion = activeDiscussion {
+            if let reference = discussion.reference {
+                selectionDiscussionView(discussion, reference: reference, isEmbedded: true)
+                    .id(discussion.id)
+            } else {
+                ContentUnavailableView {
+                    Label("This discussion is unavailable", systemImage: "text.badge.xmark")
+                } description: {
+                    Text("Its passage is no longer part of this page.")
+                } actions: {
+                    Button("Back to lesson", action: closeInlineDiscussion)
+                        .buttonStyle(.bordered)
+                }
+                .accessibilityIdentifier("course-selection-discussion-unavailable")
+            }
         }
-        activePageChat = CoursePageChatContext(
+    }
+    #endif
+
+    private func openPageChat(model: CoursePageEditorModel, initialQuestion: String? = nil) {
+        let context = CoursePageChatContext(
             pageID: pageID,
             pageTitle: model.title,
             content: AppFlowyMarkdownCodec().encode(model.document),
             initialQuestion: initialQuestion
         )
+        do {
+            let discussion = try store.beginPageDiscussion(for: course, context: context)
+            presentPageDiscussion(CoursePageChatPresentation(
+                context: context,
+                discussionID: discussion.id
+            ))
+        } catch {
+            chatError = error.localizedDescription
+        }
     }
 
     /// Lesson navigation, when this page is part of the reading order.
     private func readingFooter(for model: CoursePageEditorModel) -> AnyView? {
-        lessonReadingFooter
+        let content = CourseAssessmentPageContent.extract(from: model.document)
+        guard !content.hiddenBlockIDs.isEmpty else { return lessonReadingFooter }
+        return AnyView(VStack(alignment: .leading, spacing: 24) {
+            if let assessmentAttempts {
+                CourseAssessmentPanel(
+                    assessments: content.assessments,
+                    invalidCheckCount: content.invalidCheckCount,
+                    attempts: assessmentAttempts,
+                    review: { assessment, attempt in
+                        let context = CoursePageChatContext(
+                            pageID: pageID,
+                            pageTitle: model.title,
+                            content: AppFlowyMarkdownCodec().encode(model.document)
+                        )
+                        return try await store.reviewAssessment(
+                            assessment,
+                            attempt: attempt,
+                            context: context,
+                            course: course,
+                            appModel: appModel
+                        )
+                    },
+                    discuss: { assessment, attempt, openingQuestion in
+                        openAssessmentDiscussion(
+                            assessment, attempt: attempt, openingQuestion: openingQuestion, model: model
+                        )
+                    }
+                )
+                .id("\(course.id)/\(pageID)/assessment-section")
+            } else {
+                Label(
+                    assessmentStorageError ?? "Saved practice is unavailable. You can continue reading.",
+                    systemImage: "exclamationmark.circle"
+                )
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("course-assessment-storage-error")
+            }
+            if let lessonReadingFooter { lessonReadingFooter }
+        })
+    }
+
+    private func openAssessmentDiscussion(
+        _ assessment: CourseAssessmentDefinition,
+        attempt: CourseAssessmentAttempt?,
+        openingQuestion: String?,
+        model: CoursePageEditorModel
+    ) {
+        // A slow review may finish after the learner has opened another page.
+        // Save its feedback, but only present chat from its own visible page.
+        guard store.navigationPath.last == .coursePage(courseID: course.id, pageID: pageID) else { return }
+        let latestAttempt = assessmentAttempts?.latestAttempt(for: assessment) ?? attempt
+        let pageContext = CoursePageChatContext(
+            pageID: pageID, pageTitle: model.title,
+            content: AppFlowyMarkdownCodec().encode(model.document)
+        )
+        var instruction: String?
+        // Keep the frozen opening available for a replacement thread too.
+        // Scoped acceptance receipts prevent replay on the existing thread.
+        do {
+            let rawAnswer = assessment.kind == .multipleChoice
+                ? latestAttempt?.selectedOptionID
+                : latestAttempt?.answerText
+            let trimmedAnswer = rawAnswer?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let prompt = buildCourseAssessmentDiscussionPrompt(
+                assessment: assessment,
+                pageContext: pageContext.content,
+                learnerAnswer: trimmedAnswer.isEmpty ? nil : trimmedAnswer,
+                openingQuestion: openingQuestion
+            )
+            guard let generated = prompt.prompt else {
+                chatError = prompt.error ?? "This discussion can’t be started."
+                return
+            }
+            if let latestAttempt {
+                // Keep one durable opening per attempt, even if unrelated page
+                // prose changes before a failed or interrupted send is retried.
+                let identified = generated + "\n<learnfold_assessment_attempt_id>\(latestAttempt.id.uuidString)</learnfold_assessment_attempt_id>"
+                do {
+                    instruction = try assessmentAttempts?.discussionInstruction(
+                        for: latestAttempt, creating: identified
+                    ) ?? identified
+                } catch {
+                    chatError = error.localizedDescription
+                    return
+                }
+            } else {
+                instruction = generated
+            }
+        }
+        let context = CoursePageChatContext(
+            pageID: pageID,
+            pageTitle: model.title,
+            content: AppFlowyMarkdownCodec().encode(model.document),
+            assistantInitiation: instruction
+        )
+        do {
+            let discussion = try store.beginPageDiscussion(for: course, context: context)
+            presentPageDiscussion(CoursePageChatPresentation(
+                context: context, discussionID: discussion.id, assessment: assessment,
+                assessmentAttempt: latestAttempt
+            ))
+        } catch {
+            chatError = error.localizedDescription
+        }
+    }
+
+    /// Planned lessons and explorations alike: every page on the course map.
+    private var isReadablePage: Bool {
+        CourseReadingOrder.readablePages(in: readingNodes).contains { $0.pageID == pageID }
     }
 
     private var lessonReadingFooter: AnyView? {
-        let lessons = CourseReadingOrder.lessons(in: readingNodes)
-        let isLesson = lessons.contains(where: { $0.pageID == pageID })
-        // A branch page returns the learner to the main path after its lesson.
-        let isBranch = !isLesson
-            && CourseReadingOrder.trunkLesson(containing: pageID, in: lessons) != nil
-        guard isLesson || isBranch else { return nil }
+        guard isReadablePage,
+              let node = CourseExplorationMap.node(withPageID: pageID, in: readingNodes) else { return nil }
+        let isExploration = CourseExplorationMap.isExploration(node)
+        let progress = store.explorationProgress(for: course)
+        return AnyView(VStack(alignment: .leading, spacing: 28) {
+            CourseWhereNextSection(
+                exploredFromHere: node.children.filter(CourseExplorationMap.isExploration),
+                stateOf: { store.explorationState(of: $0, courseID: course.id, progress: progress) },
+                labelOf: explorationLabel,
+                forkParent: CourseExplorationMap.forkParent(ofPageID: pageID, in: readingNodes),
+                isExploration: isExploration,
+                isPinned: progress.pinnedNodeIDs.contains(node.id),
+                launcher: explorationLauncher,
+                onFork: { direction, question in
+                    guard let model else { return }
+                    launchExploration(
+                        direction: direction, question: question, quotedPassage: nil, model: model
+                    )
+                },
+                onOpen: { child in
+                    explorationLauncher.open(
+                        child, course: course, store: store, appModel: appModel, appState: appState
+                    )
+                },
+                onBack: returnToForkParent,
+                onTogglePin: { store.togglePinnedGoal(nodeID: node.id, for: course) }
+            )
+            suggestedRouteFooter(isExploration: isExploration)
+        })
+    }
+
+    /// The approved plan stays available as a suggested route, never a rail.
+    @ViewBuilder
+    private func suggestedRouteFooter(isExploration: Bool) -> some View {
         if let next = CourseReadingOrder.next(after: pageID, in: readingNodes) {
-            return AnyView(CourseLessonActionButton(
-                course: course, node: next, store: store,
-                title: isBranch ? "Back to the main path" : "Next lesson",
-                replacesCurrentPage: true
-            ))
-        }
-        return AnyView(VStack(spacing: 12) {
-            Label("You’ve reached the end of this course", systemImage: "checkmark.circle")
-                .font(.headline)
-            Button("Back to course") {
-                store.navigationPath = [.course(course.id)]
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Suggested route")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                CourseLessonActionButton(
+                    course: course, node: next, store: store,
+                    title: isExploration ? "Back to the suggested route" : "Next lesson",
+                    replacesCurrentPage: true
+                )
             }
-            .buttonStyle(.bordered)
+        } else {
+            VStack(spacing: 12) {
+                Label("You’ve reached the end of the suggested route", systemImage: "checkmark.circle")
+                    .font(.headline)
+                Button("Back to course") {
+                    store.navigationPath = [.course(course.id)]
+                }
+                .buttonStyle(.bordered)
+            }
+            .frame(maxWidth: .infinity)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("course-reading-end")
         }
-        .frame(maxWidth: .infinity)
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("course-reading-end"))
+    }
+
+    private func launchExploration(
+        direction: CourseExplorationDirection,
+        question: String?,
+        quotedPassage: String?,
+        model: CoursePageEditorModel
+    ) {
+        explorationLauncher.launch(
+            explorationRequest(direction: direction, question: question, quotedPassage: quotedPassage, model: model),
+            course: course, store: store, appModel: appModel, appState: appState
+        )
+    }
+
+    private func explorationRequest(
+        direction: CourseExplorationDirection,
+        question: String?,
+        quotedPassage: String?,
+        model: CoursePageEditorModel
+    ) -> CourseExplorationRequest {
+        let explored = CourseExplorationMap.explorations(in: readingNodes)
+            .filter { $0.status == .generated && $0.pageID != pageID }
+            .map(\.title)
+        return CourseExplorationRequest(
+            parentPageID: pageID,
+            parentTitle: model.title,
+            direction: direction,
+            question: question,
+            quotedPassage: quotedPassage,
+            exploredTitles: explored
+        )
+    }
+
+    /// Every exploration the learner started in this course, from any page,
+    /// as one quiet status in the reader's toolbar.
+    private var explorationStatus: CourseExplorationStatusContent? {
+        let summary = CourseExplorationStatusSummary(
+            jobs: store.explorationJobs(courseID: course.id),
+            currentPageID: pageID
+        )
+        guard !summary.isEmpty else { return nil }
+        return CourseExplorationStatusContent(
+            summary: summary,
+            currentPageID: pageID,
+            onOpen: { job in
+                guard let childPageID = job.pageID else {
+                    store.dismissExplorationJob(nodeID: job.id)
+                    return
+                }
+                store.openReadingPage(courseID: course.id, pageID: childPageID, replacingCurrentPage: false)
+            },
+            onRetry: { job in
+                store.retryExploration(nodeID: job.id, appModel: appModel, appState: appState)
+            },
+            onDismiss: { job in store.dismissExplorationJob(nodeID: job.id) },
+            onMarkAllSeen: { store.dismissExplorationNotices(courseID: course.id) }
+        )
+    }
+
+    /// The explorations that fork from this page, in the order they were forked.
+    private var explorationsFromHere: [CourseLearningNode] {
+        (CourseExplorationMap.node(withPageID: pageID, in: readingNodes)?.children ?? [])
+            .filter(CourseExplorationMap.isExploration)
+    }
+
+    /// How the learner asked for an exploration, until it has its own title.
+    private func explorationLabel(_ node: CourseLearningNode) -> String {
+        store.explorationJob(nodeID: node.id)?.label ?? CourseExplorationRequest.statusLabel(for: node)
+    }
+
+    /// A tap on highlighted text. Explorations show everything that starts
+    /// there; a discussion on its own opens directly, as it always has.
+    /// Returns true when the passage's threads should be shown.
+    private func handleAnnotationHit(_ hit: NativeBlockEditorAnnotationHit) -> Bool {
+        let nodeIDs = hit.annotations.compactMap(CourseSelectionAnchorResolver.branchNodeID(of:))
+        guard !nodeIDs.isEmpty else {
+            openDiscussion(annotation: hit.primary)
+            return false
+        }
+        // ⌘-click is the Mac shortcut straight into a single written page.
+        if hit.isCommandClick, hit.annotations.count == 1,
+           let node = explorationsFromHere.first(where: { $0.id == nodeIDs[0] }),
+           store.explorationState(
+               of: node, courseID: course.id, progress: store.explorationProgress(for: course)
+           ).isWritten {
+            explorationLauncher.open(node, course: course, store: store, appModel: appModel, appState: appState)
+            return false
+        }
+        // A new passage starts clean; only its own Write It can show an error.
+        explorationLauncher.error = nil
+        return true
+    }
+
+    /// What starts at a tapped passage. Built on every update, so a page that
+    /// finishes while this is open turns into a row that opens it.
+    private func passageThreads(
+        for hit: NativeBlockEditorAnnotationHit,
+        perform: @escaping (CoursePassageAction) -> Void
+    ) -> AnyView {
+        let nodeIDs = Set(hit.annotations.compactMap(CourseSelectionAnchorResolver.branchNodeID(of:)))
+        let progress = store.explorationProgress(for: course)
+        let explorations = explorationsFromHere.filter { nodeIDs.contains($0.id) }.map { node in
+            CoursePassageThreadsList.Exploration(
+                node: node,
+                state: store.explorationState(of: node, courseID: course.id, progress: progress),
+                label: explorationLabel(node)
+            )
+        }
+        let discussions = hit.annotations
+            .filter { CourseSelectionAnchorResolver.branchNodeID(of: $0) == nil }
+            .compactMap { UUID(uuidString: $0.id).flatMap(store.selectionDiscussion(id:)) }
+            .filter { $0.status == .unresolved }
+        // Exploring again starts from the most specific explored passage here.
+        let explored = hit.annotations.filter { $0.style.isBranch }
+        let passage = NativeBlockEditorAnnotationComposer.primary(of: explored) ?? hit.primary
+        let selection = hit.selection(for: passage)
+        return AnyView(CoursePassageThreadsList(
+            explorations: explorations,
+            discussions: discussions,
+            error: explorationLauncher.error,
+            onOpenExploration: { perform(.openExploration($0)) },
+            onWrite: { node in
+                explorationLauncher.open(node, course: course, store: store, appModel: appModel, appState: appState)
+            },
+            onOpenDiscussion: { perform(.openDiscussion($0)) },
+            onExploreAgain: { perform(.exploreAgain(selection)) },
+            onAsk: discussions.isEmpty ? { perform(.ask(selection)) } : nil
+        ))
+    }
+
+    private func performPassageAction(_ action: CoursePassageAction) {
+        switch action {
+        case .openExploration(let node):
+            explorationLauncher.open(node, course: course, store: store, appModel: appModel, appState: appState)
+        case .openDiscussion(let discussion):
+            presentSelectionDiscussion(discussion)
+        case .exploreAgain, .ask:
+            // The canvas owns the Explore prompt and the selection actions.
+            break
+        }
+    }
+
+    /// Explorations that already start on a selected passage, so the Explore
+    /// prompt can say so before the learner forks the same idea twice.
+    private func explorationOverlap(
+        with selection: NativeBlockEditorSelection,
+        in model: CoursePageEditorModel
+    ) -> CourseExplorationOverlap {
+        let overlapping = textAnnotations(in: model).filter { annotation in
+            guard annotation.style.isBranch else { return false }
+            let sameBlock = annotation.blockID != nil && selection.blockID != nil
+                ? annotation.blockID == selection.blockID
+                : annotation.path == selection.path
+            return sameBlock && NSIntersectionRange(annotation.range, selection.range).length > 0
+        }
+        let nodeIDs = Set(overlapping.compactMap(CourseSelectionAnchorResolver.branchNodeID(of:)))
+        let nodes = explorationsFromHere.filter { nodeIDs.contains($0.id) }
+        let progress = store.explorationProgress(for: course)
+        return CourseExplorationOverlap(
+            titles: nodes.map { node in
+                store.explorationState(of: node, courseID: course.id, progress: progress).isWritten
+                    ? node.title : explorationLabel(node)
+            },
+            usedIntents: Set(CourseExplorePassageIntent.allCases.filter { intent in
+                nodes.contains { $0.originQuestion?.hasPrefix(intent.question) == true }
+            })
+        )
+    }
+
+    private func returnToForkParent(_ parent: CourseLearningNode) {
+        guard let parentPageID = parent.pageID else { return }
+        let parentRoute = CourseRoute.coursePage(courseID: course.id, pageID: parentPageID)
+        let path = store.navigationPath
+        if path.count >= 2, path[path.count - 2] == parentRoute {
+            store.navigationPath.removeLast()
+        } else {
+            store.openReadingPage(courseID: course.id, pageID: parentPageID, replacingCurrentPage: true)
+        }
     }
 
     private func loadPage(requestID: CoursePageEditorLoadID) async {
@@ -630,6 +1171,8 @@ struct CoursePageEditorView: View {
         ) else { return }
         model = nil
         loadingError = nil
+        assessmentAttempts = nil
+        assessmentStorageError = nil
         do {
             let repository = try await store.documentRepository(for: course)
             guard CoursePageEditorLoadPolicy.acceptsCompletion(
@@ -654,8 +1197,10 @@ struct CoursePageEditorView: View {
                 guard !Task.isCancelled, requestID == loadID else { return }
                 readingNodes = outline.learningPages
                 let bookmark = store.readingBookmark(for: course)
-                let isLesson = CourseReadingOrder.lessons(in: readingNodes).contains { $0.pageID == pageID }
-                if isLesson {
+                let isReadable = CourseReadingOrder.readablePages(in: outline.learningPages)
+                    .contains { $0.pageID == pageID }
+                if isReadable {
+                    store.recordReading(pageID: pageID, isAtEnd: false, for: course)
                     let saved: CourseReadingBookmark
                     if let bookmark, bookmark.pageID == pageID {
                         saved = bookmark
@@ -668,6 +1213,11 @@ struct CoursePageEditorView: View {
                     initialReadingPosition = nil
                 }
                 latestReadingViewport.position = initialReadingPosition
+                do {
+                    assessmentAttempts = try store.assessmentAttemptStore(for: course, pageID: requestID.pageID)
+                } catch {
+                    assessmentStorageError = error.localizedDescription
+                }
                 model = editorModel
             }
         } catch {
@@ -705,7 +1255,7 @@ struct CoursePageEditorView: View {
         do {
             switch try store.beginSelectionDiscussion(for: course, reference: reference) {
             case .open(let discussion):
-                activeDiscussion = discussion
+                presentSelectionDiscussion(discussion)
                 callbackResult = "discussion-opened"
             case .targetConflict(let existing, let selected):
                 discussionConflict = CourseSelectionDiscussionConflict(
@@ -734,12 +1284,13 @@ struct CoursePageEditorView: View {
         discussionConflict = nil
         Task {
             do {
-                activeDiscussion = try await store.replaceSelectionDiscussion(
+                let replacement = try await store.replaceSelectionDiscussion(
                     existingID: conflict.existing.id,
                     reference: conflict.reference,
                     selectedTarget: conflict.selectedTarget,
                     appModel: appModel
                 )
+                presentSelectionDiscussion(replacement)
             } catch {
                 chatError = error.localizedDescription
             }
@@ -749,13 +1300,31 @@ struct CoursePageEditorView: View {
     private func textAnnotations(
         in model: CoursePageEditorModel
     ) -> [NativeBlockEditorTextAnnotation] {
-        store.unresolvedSelectionDiscussions(courseID: course.id, pageID: pageID)
+        let discussions = store.unresolvedSelectionDiscussions(courseID: course.id, pageID: pageID)
             .compactMap {
                 CourseSelectionAnchorResolver.annotation(
                     for: $0,
                     document: model.document
                 )
             }
+        // Where each exploration forked from a passage on this page, inked by
+        // its state: dashed until written, filled until first opened.
+        let progress = store.explorationProgress(for: course)
+        let branches = explorationsFromHere.compactMap { node -> NativeBlockEditorTextAnnotation? in
+            guard let anchor = node.originAnchor else { return nil }
+            let style: NativeBlockEditorTextAnnotation.Style =
+                switch store.explorationState(of: node, courseID: course.id, progress: progress) {
+                case .written(let isNew, _): isNew ? .branchNew : .branch
+                case .queued, .writing, .failed, .unwritten: .branchPending
+                }
+            return CourseSelectionAnchorResolver.branchAnnotation(
+                nodeID: node.id,
+                anchor: anchor,
+                style: style,
+                document: model.document
+            )
+        }
+        return branches + discussions
     }
 
     @discardableResult
@@ -772,7 +1341,7 @@ struct CoursePageEditorView: View {
 #endif
             return false
         }
-        activeDiscussion = discussion
+        presentSelectionDiscussion(discussion)
 #if DEBUG
         recordLF51AnnotationCallback(
             annotation,
@@ -2246,7 +2815,8 @@ private struct CourseEditorCheckpointUITestValidHarnessView: View {
                     onOpenPage: { destination in
                         Task { await openLinkedPage(destination.id) }
                     },
-                    startsInEditingMode: true,
+                    // Highlights only open in reading mode; editing places the caret.
+                    startsInEditingMode: !showsAnnotation,
                     onRetrySave: onRetrySave
                 )
             }
@@ -3136,49 +3706,151 @@ private struct CourseSelectionDiscussionUnavailableView: View {
 }
 
 
+/// A selected passage waiting for the learner to say what to explore.
+private struct CourseExploreSelectionItem: Identifiable {
+    let id = UUID()
+    let selection: NativeBlockEditorSelection
+
+    var passage: String {
+        selection.text
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+    }
+}
+
+/// What a tap inside a passage's threads asks the reader to do once they close.
+enum CoursePassageAction {
+    case openExploration(CourseLearningNode)
+    case openDiscussion(CourseSelectionDiscussion)
+    case exploreAgain(NativeBlockEditorSelection)
+    case ask(NativeBlockEditorSelection)
+}
+
+/// Explorations that already start on a selected passage.
+struct CourseExplorationOverlap {
+    var titles: [String] = []
+    var usedIntents: Set<CourseExplorePassageIntent> = []
+}
+
+/// The reader's exploration status and what its menu can do.
+struct CourseExplorationStatusContent {
+    let summary: CourseExplorationStatusSummary
+    let currentPageID: String
+    let onOpen: (CourseExplorationJob) -> Void
+    let onRetry: (CourseExplorationJob) -> Void
+    let onDismiss: (CourseExplorationJob) -> Void
+    let onMarkAllSeen: () -> Void
+
+    func menu(_ placement: CourseExplorationStatusMenu.Placement) -> CourseExplorationStatusMenu {
+        CourseExplorationStatusMenu(
+            summary: summary,
+            currentPageID: currentPageID,
+            placement: placement,
+            onOpen: onOpen,
+            onRetry: onRetry,
+            onDismiss: onDismiss,
+            onMarkAllSeen: onMarkAllSeen
+        )
+    }
+}
+
+/// A tapped passage whose threads are showing, and where to point at it.
+private struct CoursePassagePresentation: Identifiable {
+    let hit: NativeBlockEditorAnnotationHit
+    /// The tapped words, in the canvas's own coordinates.
+    let anchorRect: CGRect
+    /// Whether the threads sit below the tapped line.
+    let opensBelow: Bool
+    /// The reading offset when it opened; scrolling away closes it.
+    let readingOffset: CGFloat?
+    var id: UUID { hit.id }
+}
+
 private struct CoursePageEditorCanvas: View {
     @Bindable var model: CoursePageEditorModel
     @AppStorage("coursePage.wrapsCodeLines") private var wrapsCodeLines = false
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
     @State private var isEditing: Bool
     @State private var readingSelection: NativeBlockEditorSelection?
+    @State private var exploringSelection: CourseExploreSelectionItem?
+    @State private var passagePresentation: CoursePassagePresentation?
+    @State private var pendingPassageAction: CoursePassageAction?
+    @State private var canvasFrame: CGRect = .zero
+    @State private var latestReadingOffset: CGFloat?
     let textAnnotations: [NativeBlockEditorTextAnnotation]
     let onAskAboutSelection: (NativeBlockEditorSelection) -> CourseTextReference?
+    /// Forks an exploration from the passage, with the learner's optional
+    /// question. Returns once the new page exists.
+    let onExploreSelection: ((NativeBlockEditorSelection, String?) async throws -> Void)?
+    let explorationOverlap: ((NativeBlockEditorSelection) -> CourseExplorationOverlap)?
+    /// Every exploration the learner started in this course.
+    let explorationStatus: CourseExplorationStatusContent?
     let onOpenTextAnnotation: (NativeBlockEditorTextAnnotation) -> Bool
+    /// Decides what a tap on highlighted text does; true shows its threads.
+    let onTapTextAnnotations: ((NativeBlockEditorAnnotationHit) -> Bool)?
+    let passageThreads: ((NativeBlockEditorAnnotationHit, @escaping (CoursePassageAction) -> Void) -> AnyView)?
+    let onPassageAction: ((CoursePassageAction) -> Void)?
     let onOpenPage: (NativeBlockEditorPageDestination) -> Void
     var onRetrySave: (() -> Void)?
     let readingFooter: AnyView?
+    let additionalHiddenReadingBlockIDs: Set<UUID>
     let onAskAboutPage: (() -> Void)?
     let initialReadingPosition: NativeBlockEditorReadingPosition?
     let onReadingPositionChange: ((NativeBlockEditorReadingPosition) -> Void)?
+    let onToggleOutline: (() -> Void)?
+    let isOutlineVisible: Bool
 
     init(
         model: CoursePageEditorModel,
         textAnnotations: [NativeBlockEditorTextAnnotation],
         onAskAboutSelection: @escaping (NativeBlockEditorSelection) -> CourseTextReference?,
+        onExploreSelection: ((NativeBlockEditorSelection, String?) async throws -> Void)? = nil,
+        explorationOverlap: ((NativeBlockEditorSelection) -> CourseExplorationOverlap)? = nil,
+        explorationStatus: CourseExplorationStatusContent? = nil,
         onOpenTextAnnotation: @escaping (NativeBlockEditorTextAnnotation) -> Bool,
+        onTapTextAnnotations: ((NativeBlockEditorAnnotationHit) -> Bool)? = nil,
+        passageThreads: ((NativeBlockEditorAnnotationHit, @escaping (CoursePassageAction) -> Void) -> AnyView)? = nil,
+        onPassageAction: ((CoursePassageAction) -> Void)? = nil,
         onOpenPage: @escaping (NativeBlockEditorPageDestination) -> Void,
         startsInEditingMode: Bool = false,
         onRetrySave: (() -> Void)? = nil,
         readingFooter: AnyView? = nil,
+        additionalHiddenReadingBlockIDs: Set<UUID> = [],
         onAskAboutPage: (() -> Void)? = nil,
         initialReadingPosition: NativeBlockEditorReadingPosition? = nil,
-        onReadingPositionChange: ((NativeBlockEditorReadingPosition) -> Void)? = nil
+        onReadingPositionChange: ((NativeBlockEditorReadingPosition) -> Void)? = nil,
+        onToggleOutline: (() -> Void)? = nil,
+        isOutlineVisible: Bool = false
     ) {
         self.model = model
         self.textAnnotations = textAnnotations
         self.onAskAboutSelection = onAskAboutSelection
+        self.onExploreSelection = onExploreSelection
+        self.explorationOverlap = explorationOverlap
+        self.explorationStatus = explorationStatus
         self.onOpenTextAnnotation = onOpenTextAnnotation
+        self.onTapTextAnnotations = onTapTextAnnotations
+        self.passageThreads = passageThreads
+        self.onPassageAction = onPassageAction
         self.onOpenPage = onOpenPage
         _isEditing = State(initialValue: startsInEditingMode)
         self.onRetrySave = onRetrySave
         self.readingFooter = readingFooter
+        self.additionalHiddenReadingBlockIDs = additionalHiddenReadingBlockIDs
         self.onAskAboutPage = onAskAboutPage
         self.initialReadingPosition = initialReadingPosition
         self.onReadingPositionChange = onReadingPositionChange
+        self.onToggleOutline = onToggleOutline
+        self.isOutlineVisible = isOutlineVisible
     }
 
     var body: some View {
         VStack(spacing: 0) {
+            #if targetEnvironment(macCatalyst)
+            desktopReaderControls
+            Divider()
+            #endif
             if displayedSaveState != .idle {
                 CoursePageSaveStatusView(state: displayedSaveState) {
                     if let onRetrySave {
@@ -3263,43 +3935,105 @@ private struct CoursePageEditorCanvas: View {
                 onOpenTextAnnotation: { annotation in
                     _ = onOpenTextAnnotation(annotation)
                 },
+                onTapTextAnnotations: onTapTextAnnotations.map { decide in
+                    { hit in
+                        // A live selection's Explore and Ask come first.
+                        guard readingSelection == nil else { return }
+                        if decide(hit) { presentPassage(hit) }
+                    }
+                },
+                textAnnotationActionName: onTapTextAnnotations == nil ? nil : { cluster, passage in
+                    let quoted = passage.count > 40 ? String(passage.prefix(40)) + "…" : passage
+                    return cluster.contains { $0.style.isBranch }
+                        ? "Explorations from “\(quoted)”"
+                        : "Discussion about “\(quoted)”"
+                },
                 wrapsCodeLines: $wrapsCodeLines,
                 initialReadingPosition: initialReadingPosition,
-                onReadingPositionChange: onReadingPositionChange
+                onReadingPositionChange: onReadingPositionChange.map { report in
+                    { position in
+                        latestReadingOffset = position.offset
+                        if let start = passagePresentation?.readingOffset,
+                           abs(position.offset - start) > 24 {
+                            passagePresentation = nil
+                        }
+                        report(position)
+                    }
+                }
             )
         }
-        .toolbar {
-            if !isEditing, let onAskAboutPage {
-                ToolbarItemGroup(placement: .bottomBar) {
-                    Spacer()
-                    Button {
-                        if let readingSelection {
-                            if onAskAboutSelection(readingSelection) != nil {
-                                self.readingSelection = nil
-                            }
-                        } else {
-                            onAskAboutPage()
-                        }
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "bubble.left.and.bubble.right")
-                            if readingSelection != nil {
-                                Text("Ask about this")
-                                    .font(.callout.weight(.semibold))
-                            }
-                        }
-                        .fixedSize(horizontal: true, vertical: false)
-                        .animation(.snappy(duration: 0.2), value: readingSelection != nil)
-                    }
-                    .accessibilityLabel(readingSelection == nil ? "Ask AI about this page" : "Ask about this")
-                    .accessibilityHint(readingSelection == nil
-                        ? "Opens chat with the current page as context"
-                        : "Opens chat with the selected passage as context")
-                    .accessibilityIdentifier("course-page-ask-ai")
-                }
-            }
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { canvasFrame = $0 }
+        .popover(
+            item: $passagePresentation,
+            attachmentAnchor: .rect(.rect(passagePresentation?.anchorRect ?? .zero)),
+            arrowEdge: passagePresentation?.opensBelow == false ? .bottom : .top
+        ) { presentation in
+            passageThreadsContent(for: presentation)
         }
         .toolbar {
+            #if !targetEnvironment(macCatalyst)
+            if !isEditing, onAskAboutPage != nil || explorationStatus != nil {
+                ToolbarItemGroup(placement: .bottomBar) {
+                    // A live selection's Explore and Ask take the bar; the
+                    // status comes back as soon as the selection clears.
+                    if let explorationStatus, readingSelection == nil {
+                        explorationStatus.menu(.toolbar(compact: dynamicTypeSize.isAccessibilitySize))
+                    }
+                    Spacer()
+                    if let readingSelection, onExploreSelection != nil {
+                        Button {
+                            exploringSelection = CourseExploreSelectionItem(selection: readingSelection)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "arrow.triangle.branch")
+                                Text("Explore")
+                                    .font(.callout.weight(.semibold))
+                            }
+                            .fixedSize(horizontal: true, vertical: false)
+                        }
+                        .accessibilityLabel("Explore this passage")
+                        .accessibilityHint("Asks what to explore, then writes a new page from the selected passage")
+                        .accessibilityIdentifier("course-page-explore-selection")
+                    }
+                    if let onAskAboutPage {
+                        Button {
+                            if let readingSelection {
+                                if onAskAboutSelection(readingSelection) != nil {
+                                    self.readingSelection = nil
+                                }
+                            } else {
+                                onAskAboutPage()
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "bubble.left.and.bubble.right")
+                                if readingSelection != nil {
+                                    Text("Ask about this")
+                                        .font(.callout.weight(.semibold))
+                                }
+                            }
+                            .fixedSize(horizontal: true, vertical: false)
+                            .animation(.snappy(duration: 0.2), value: readingSelection != nil)
+                        }
+                        .accessibilityLabel(readingSelection == nil ? "Ask AI about this page" : "Ask about this")
+                        .accessibilityHint(readingSelection == nil
+                            ? "Opens chat with the current page as context"
+                            : "Opens chat with the selected passage as context")
+                        .accessibilityIdentifier("course-page-ask-ai")
+                    }
+                }
+            }
+            #endif
+        }
+        #if !targetEnvironment(macCatalyst)
+        .sheet(item: $exploringSelection) { item in
+            explorePrompt(for: item, isCompact: false)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+        #endif
+        .toolbar {
+            #if !targetEnvironment(macCatalyst)
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     setEditing(!isEditing)
@@ -3314,10 +4048,159 @@ private struct CoursePageEditorCanvas: View {
                 )
                 .accessibilityIdentifier("course-page-edit-toggle")
             }
+            #endif
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("course-page-editor-\(model.pageID)")
     }
+
+    private func explorePrompt(for item: CourseExploreSelectionItem, isCompact: Bool) -> some View {
+        let overlap = explorationOverlap?(item.selection) ?? CourseExplorationOverlap()
+        return CourseExplorePassagePrompt(
+            passage: item.passage,
+            isCompact: isCompact,
+            alreadyExploredTitles: overlap.titles,
+            usedIntents: overlap.usedIntents,
+            onSubmit: { question in
+                try await onExploreSelection?(item.selection, question)
+                // Only close what this prompt opened; the learner may have
+                // moved on to another passage meanwhile.
+                if exploringSelection?.id == item.id { exploringSelection = nil }
+                if readingSelection == item.selection { readingSelection = nil }
+                UIAccessibility.post(notification: .announcement, argument: "Exploring. You can keep reading.")
+            },
+            onCancel: { exploringSelection = nil }
+        )
+    }
+
+    /// Shows the tapped passage's threads, pointing at the tapped words.
+    private func presentPassage(_ hit: NativeBlockEditorAnnotationHit) {
+        let anchor = hit.anchorRectInWindow.offsetBy(dx: -canvasFrame.minX, dy: -canvasFrame.minY)
+        pendingPassageAction = nil
+        passagePresentation = CoursePassagePresentation(
+            hit: hit,
+            anchorRect: anchor,
+            opensBelow: canvasFrame.height <= 0 || anchor.midY < canvasFrame.height * 0.6,
+            readingOffset: latestReadingOffset
+        )
+    }
+
+    @ViewBuilder
+    private func passageThreadsContent(for presentation: CoursePassagePresentation) -> some View {
+        let usesSheet = dynamicTypeSize.isAccessibilitySize || voiceOverEnabled
+        if let passageThreads {
+            passageThreads(presentation.hit) { action in
+                // Navigation and other presentations wait until this closes.
+                pendingPassageAction = action
+                passagePresentation = nil
+            }
+            .presentationCompactAdaptation(usesSheet ? .sheet : .popover)
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(usesSheet ? .visible : .hidden)
+            .onDisappear(perform: runPendingPassageAction)
+        }
+    }
+
+    private func runPendingPassageAction() {
+        guard let action = pendingPassageAction else { return }
+        pendingPassageAction = nil
+        switch action {
+        case .exploreAgain(let selection):
+            exploringSelection = CourseExploreSelectionItem(selection: selection)
+        case .ask(let selection):
+            _ = onAskAboutSelection(selection)
+        case .openExploration, .openDiscussion:
+            onPassageAction?(action)
+        }
+    }
+
+    #if targetEnvironment(macCatalyst)
+    private var desktopReaderControls: some View {
+        HStack(spacing: 10) {
+            if let onToggleOutline {
+                Button(action: onToggleOutline) {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 15))
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(isOutlineVisible ? Color.accentColor : Color.secondary)
+                .help(isOutlineVisible ? "Hide course outline" : "Show course outline")
+                .accessibilityLabel(isOutlineVisible ? "Hide course outline" : "Show course outline")
+                .accessibilityIdentifier("mac-course-toggle-outline")
+            }
+            if isEditing || (readingSelection == nil && explorationStatus == nil) {
+                Text(isEditing ? "Editing" : "Reading")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+            if let explorationStatus {
+                explorationStatus.menu(.macHeader)
+            }
+            Spacer(minLength: 0)
+
+            // Stays while the popover is open: focusing its field can clear
+            // the reader's selection, which would otherwise dismiss it.
+            if !isEditing, onExploreSelection != nil,
+               let selection = exploringSelection?.selection ?? readingSelection {
+                Button {
+                    exploringSelection = CourseExploreSelectionItem(selection: selection)
+                } label: {
+                    Label("Explore", systemImage: "arrow.triangle.branch")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .keyboardShortcut("e", modifiers: [.command])
+                .help("Explore this passage (⌘E)")
+                .accessibilityLabel("Explore this passage")
+                .accessibilityHint("Asks what to explore, then writes a new page from the selected passage")
+                .accessibilityIdentifier("course-page-explore-selection")
+                .popover(item: $exploringSelection, arrowEdge: .bottom) { item in
+                    explorePrompt(for: item, isCompact: true)
+                }
+            }
+
+            if !isEditing, let onAskAboutPage {
+                Button {
+                    if let readingSelection {
+                        if onAskAboutSelection(readingSelection) != nil {
+                            self.readingSelection = nil
+                        }
+                    } else {
+                        onAskAboutPage()
+                    }
+                } label: {
+                    Label(
+                        readingSelection == nil ? "Ask AI" : "Ask about this",
+                        systemImage: "bubble.left.and.bubble.right"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityLabel(readingSelection == nil ? "Ask AI about this page" : "Ask about this")
+                .accessibilityIdentifier("course-page-ask-ai")
+            }
+
+            Button {
+                setEditing(!isEditing)
+            } label: {
+                Image(systemName: isEditing ? "checkmark" : "pencil")
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(isEditing ? Color.accentColor : Color.secondary)
+            .help(isEditing ? "Finish editing" : "Edit page")
+            .accessibilityLabel(isEditing ? "Finish editing" : "Edit page")
+            .accessibilityIdentifier("course-page-edit-toggle")
+        }
+        .font(.system(size: 12, weight: .medium))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
+        .background(Color(uiColor: .systemBackground))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("mac-course-reader-toolbar")
+    }
+    #endif
 
     private var displayedSaveState: CoursePageEditorModel.SaveState {
         model.saveState
@@ -3330,7 +4213,7 @@ private struct CoursePageEditorCanvas: View {
     private var hiddenReadingBlockIDs: Set<UUID> {
         guard !isEditing else { return leadingTitleBlockIDs }
         let followUpIDs = CourseFollowUpQuestions.extract(from: model.document)?.hiddenBlockIDs ?? []
-        return leadingTitleBlockIDs.union(followUpIDs)
+        return leadingTitleBlockIDs.union(followUpIDs).union(additionalHiddenReadingBlockIDs)
     }
 
     private var leadingTitleBlockIDs: Set<UUID> {
@@ -3473,6 +4356,37 @@ enum CourseSelectionAnchorResolver {
             rangeLength: range.length,
             selectedText: selectedText
         )
+    }
+
+    private static let branchIDPrefix = "exploration:"
+
+    static func branchAnnotation(
+        nodeID: String,
+        anchor: CourseExplorationAnchor,
+        style: NativeBlockEditorTextAnnotation.Style = .branch,
+        document: BlockDocument
+    ) -> NativeBlockEditorTextAnnotation? {
+        guard let block = matchingBlock(
+            blockID: anchor.blockID,
+            path: BlockPath(anchor.pathIndices),
+            document: document
+        ), let range = anchoredRange(
+            preferred: NSRange(location: anchor.rangeLocation, length: anchor.rangeLength),
+            selectedText: anchor.selectedText,
+            blockText: block.node.delta?.plainText ?? ""
+        ) else { return nil }
+        return NativeBlockEditorTextAnnotation(
+            id: branchIDPrefix + nodeID,
+            blockID: block.node.stableBlockID,
+            path: block.path,
+            range: range,
+            style: style
+        )
+    }
+
+    static func branchNodeID(of annotation: NativeBlockEditorTextAnnotation) -> String? {
+        guard annotation.id.hasPrefix(branchIDPrefix) else { return nil }
+        return String(annotation.id.dropFirst(branchIDPrefix.count))
     }
 
     static func annotation(

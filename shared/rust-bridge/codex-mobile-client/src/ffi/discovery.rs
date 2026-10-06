@@ -194,6 +194,35 @@ impl ServerBridge {
         })
     }
 
+    /// Connect to the Mac's installed Codex over its loopback app-server.
+    /// This remains a local runtime in the store while using WebSocket,
+    /// rather than the embedded iOS runtime, for requests and reconnects.
+    pub async fn connect_host_local_server(
+        &self,
+        server_id: String,
+        display_name: String,
+        host: String,
+        port: u16,
+    ) -> Result<String, ClientError> {
+        let config = ServerConfig {
+            server_id,
+            display_name,
+            host,
+            port,
+            websocket_url: None,
+            is_local: true,
+            tls: false,
+        };
+        config
+            .validate_host_local()
+            .map_err(|error| ClientError::InvalidParams(error.to_string()))?;
+        blocking_async!(self.rt, self.inner, |c| {
+            c.connect_host_local(config)
+                .await
+                .map_err(|error| ClientError::Transport(error.to_string()))
+        })
+    }
+
     pub async fn connect_remote_url_server(
         &self,
         server_id: String,

@@ -16,11 +16,21 @@ enum CourseReadingOrder {
         }
     }
 
+    /// Every readable page, depth-first: planned lessons and the explorations
+    /// that fork off them at any depth.
+    static func readablePages(in nodes: [CourseLearningNode]) -> [CourseLearningNode] {
+        nodes.flatMap { node in
+            node.kind == .markdown
+                ? [node] + readablePages(in: node.children)
+                : readablePages(in: node.children)
+        }
+    }
+
+    /// Where the learner left off, even deep inside an exploration.
     static func resume(in nodes: [CourseLearningNode], bookmark: CourseReadingBookmark?) -> CourseLearningNode? {
         let ordered = lessons(in: nodes)
         guard let pageID = bookmark?.pageID else { return ordered.first }
-        return ordered.first { $0.pageID == pageID }
-            ?? trunkLesson(containing: pageID, in: ordered)
+        return readablePages(in: nodes).first { $0.pageID == pageID }
             ?? ordered.first
     }
 

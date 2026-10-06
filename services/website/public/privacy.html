@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Privacy Policy — Learnfold</title>
   <meta name="description" content="Learn how Learnfold handles course content, imported sources, cloud sync, connected learning agents, voice, pairing, and notifications.">
-  <meta name="theme-color" content="#4B3CF0">
+  <meta name="theme-color" content="#000000">
   <link rel="stylesheet" href="/style.css">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 </head>
@@ -28,7 +28,7 @@
   <div class="container">
     <section class="legal">
       <h1>Privacy Policy</h1>
-      <p class="updated">Last updated: August 1, 2026</p>
+      <p class="updated">Last updated: September 9, 2026</p>
 
       <h2>Overview</h2>
       <p>Learnfold is a native learning workspace that turns topics and sources into personal courses. This policy explains what the app stores on your device, what it may sync through Apple, and what it sends when you choose a connected learning agent, model provider, voice feature, pairing service, or notification feature.</p>
@@ -82,6 +82,16 @@
 
       <h2>Analytics, Advertising, and Tracking</h2>
       <p>Learnfold does not include third-party advertising, behavioral analytics, or cross-app tracking SDKs. We do not use course content, imported sources, microphone audio, or device identifiers for advertising, and we do not sell them.</p>
+
+      <h2>App usage analytics</h2>
+      <p>In app versions that include PostHog, Learnfold records anonymous feature-use events such as opening the app, starting a course, submitting a question, approving a plan and opening a course page. Events use a random installation identifier and include app version and structural context, such as whether a question came from a text selection. We do not send question text, course titles or contents, document identifiers, email addresses, advertising identifiers or session recordings. Analytics is not linked to your waitlist email or website visit.</p>
+      <p>You can turn off Share anonymous usage analytics in Settings. Local development and automated test builds do not send production analytics. PostHog processes these events for product analytics; we disable person profiles and IP-based geolocation. Network providers still process connection metadata when delivering requests.</p>
+      <h2>Early-access waitlist</h2>
+      <p>When you join, we store your email address, signup time and your agreement to receive Learnfold early-access updates in Cloudflare D1. When experiment measurement is enabled, we also associate the signup with the copy version and anonymous browser identifier. We use your email for early-access updates, not advertising lists. Duplicate addresses create only one entry. Signup does not verify ownership of the email address.</p>
+      <p>To limit abuse, we temporarily store an hourly, secret-keyed hash of your IP address and an attempt count. We do not store the raw IP address in the waitlist database. Expired limits are deleted during subsequent signup activity. We retain waitlist entries until early-access outreach is complete or you ask to be removed. Welcome emails are sent through Amazon Simple Email Service (SES), which processes your address and delivery information. Emails include an unsubscribe link; unsubscribing stops future waitlist emails and cancels queued messages. We retain a suppression record to respect your choice. To request deletion of your email, contact <a href="mailto:chirag@forgeme.xyz">chirag@forgeme.xyz</a>. Joining the waitlist works even if you opt out of experiment measurement.</p>
+      <h2>Landing Page Copy Test</h2>
+      <p>Our website compares two versions of its wording. A first-party cookie called <code>lf_copy_v2</code> keeps your browser on the same version for up to 30 days. We store a hashed random identifier, the version shown, and the first time the page was viewed, an early-access link was clicked, or the example was explored. The test also records when a new waitlist signup is successfully saved. Analytics events do not include your email, IP address, browsing history, or course content.</p>
+      <p>These records are stored with Cloudflare. When PostHog is connected, the same anonymous identifier, copy version and event timestamps are sent to PostHog to compare conversion rates. We do not enable session recording or send form contents to PostHog. Cloudflare experiment records older than 90 days are excluded from reports and removed during subsequent website use. This cleanup does not delete events already sent to PostHog; those are subject to the PostHog project retention settings. Clearing this site's cookies removes your browser's assignment. Browsers that send Do Not Track or Global Privacy Control headers are excluded from assignment and measurement. Preview links are also excluded.</p>
 
       <h2>Children's Privacy</h2>
       <p>Learnfold is not directed to children under 13, and we do not knowingly collect personal information from children. A parent, guardian, school, or organization using Learnfold with a minor is responsible for selecting appropriate connected services and obtaining any required consent.</p>

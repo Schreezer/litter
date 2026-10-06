@@ -5,6 +5,12 @@ pub mod reconcile;
 pub mod reducer;
 pub mod snapshot;
 pub mod updates;
+pub mod chat;
+#[cfg(test)]
+mod chat_fixtures;
+pub mod timeline;
+pub mod turn;
+pub mod turn_activity;
 mod voice;
 
 pub use agent_metadata::{AgentMetadataStore, AppAgentMetadata};
@@ -15,6 +21,7 @@ pub use boundary::{
     AppThreadStateRecord,
 };
 pub use reducer::AppStoreReducer;
+pub use turn_activity::{AppTurnActivity, AppTurnActivityKind};
 pub(crate) use snapshot::QueuedFollowUpDraft;
 pub use snapshot::{
     AppConnectionProgressSnapshot, AppConnectionStepKind, AppConnectionStepSnapshot,

@@ -434,10 +434,51 @@ pub struct ServerConfig {
     pub port: u16,
     /// Explicit WebSocket URL override for remote connections.
     pub websocket_url: Option<String>,
-    /// Whether this is a local (in-process) server.
+    /// Whether this server runs on the same device as the application.
+    /// Local embedded servers have no TCP endpoint; host-local Codex uses
+    /// a nonzero loopback port and the external app-server transport.
     pub is_local: bool,
     /// Whether to use TLS for the WebSocket connection.
     pub tls: bool,
+}
+
+/// Runtime locality is independent from the transport used to reach Codex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServerConnectionKind {
+    EmbeddedLocal,
+    HostLocal,
+    Remote,
+}
+
+impl ServerConfig {
+    pub(crate) fn connection_kind(&self) -> ServerConnectionKind {
+        if !self.is_local {
+            ServerConnectionKind::Remote
+        } else if self.port == 0 && self.websocket_url.is_none() {
+            ServerConnectionKind::EmbeddedLocal
+        } else {
+            ServerConnectionKind::HostLocal
+        }
+    }
+
+    pub(crate) fn validate_host_local(&self) -> Result<(), TransportError> {
+        let loopback = self.host.eq_ignore_ascii_case("localhost")
+            || self
+                .host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        if self.connection_kind() != ServerConnectionKind::HostLocal
+            || !loopback
+            || self.port == 0
+            || self.tls
+            || self.websocket_url.is_some()
+        {
+            return Err(TransportError::ConnectionFailed(
+                "host-local Codex requires a nonzero loopback app-server port".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Session-wide bookkeeping passed to `connect_remote_multiplexed`.
@@ -628,6 +669,20 @@ impl ServerSession {
         config: ServerConfig,
         in_process: InProcessConfig,
     ) -> Result<Self, TransportError> {
+        if cfg!(all(
+            any(target_os = "macos", target_abi = "macabi"),
+            not(test)
+        )) {
+            return Err(TransportError::ConnectionFailed(
+                "Mac Learnfold uses installed Codex; start and connect the host-local app-server"
+                    .to_string(),
+            ));
+        }
+        if config.connection_kind() != ServerConnectionKind::EmbeddedLocal {
+            return Err(TransportError::ConnectionFailed(
+                "embedded Codex cannot connect to an external server endpoint".to_string(),
+            ));
+        }
         use codex_app_server::in_process::InProcessStartArgs;
         use codex_app_server_protocol::{ClientInfo, InitializeCapabilities, InitializeParams};
         use codex_arg0::Arg0DispatchPaths;
@@ -1202,7 +1257,12 @@ pub(crate) fn remote_connect_args(config: &ServerConfig) -> (String, RemoteAppSe
         url
     } else {
         let scheme = if config.tls { "wss" } else { "ws" };
-        format!("{scheme}://{}:{}", config.host, config.port)
+        let host = if config.host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]", config.host)
+        } else {
+            config.host.clone()
+        };
+        format!("{scheme}://{host}:{}", config.port)
     };
 
     let args = RemoteAppServerConnectArgs {
@@ -2176,6 +2236,10 @@ mod tests {
             tls: false,
         };
         assert!(config.is_local);
+        assert_eq!(
+            config.connection_kind(),
+            ServerConnectionKind::EmbeddedLocal
+        );
         assert_eq!(config.server_id, "local-1");
     }
 
@@ -2191,8 +2255,29 @@ mod tests {
             tls: true,
         };
         assert!(!config.is_local);
+        assert_eq!(config.connection_kind(), ServerConnectionKind::Remote);
         assert!(config.tls);
         assert_eq!(config.port, 443);
+    }
+
+    #[test]
+    fn host_local_config_uses_external_transport_and_rejects_non_loopback_hosts() {
+        let mut config = ServerConfig {
+            server_id: "local-mac".into(),
+            display_name: "This Mac".into(),
+            host: "127.0.0.1".into(),
+            port: 8390,
+            websocket_url: None,
+            is_local: true,
+            tls: false,
+        };
+        assert_eq!(config.connection_kind(), ServerConnectionKind::HostLocal);
+        assert!(config.validate_host_local().is_ok());
+        config.host = "192.168.1.20".into();
+        assert!(config.validate_host_local().is_err());
+        config.host = "localhost".into();
+        config.port = 0;
+        assert!(config.validate_host_local().is_err());
     }
 
     #[test]

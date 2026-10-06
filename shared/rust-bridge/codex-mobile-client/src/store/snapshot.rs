@@ -239,6 +239,9 @@ pub struct ThreadSnapshot {
     /// Whether this mobile client has resumed the thread and attached a live
     /// listener during the current store lifetime.
     pub is_resumed: bool,
+    /// How the most recent turn ended. Cleared when a turn starts; `None`
+    /// until a turn completes while this store is listening.
+    pub(crate) last_turn_outcome: Option<crate::source::TurnOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -293,6 +296,7 @@ impl ThreadSnapshot {
             older_turns_cursor: None,
             initial_turns_loaded: false,
             is_resumed: false,
+            last_turn_outcome: None,
         }
     }
 }

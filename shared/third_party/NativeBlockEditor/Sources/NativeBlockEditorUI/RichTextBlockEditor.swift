@@ -374,7 +374,9 @@ struct RichTextBlockEditor: UIViewRepresentable {
     let onOpenURL: (URL) -> Bool
     let onAskAboutSelection: (NSRange, String) -> Void
     let annotations: [NativeBlockEditorTextAnnotation]
-    let onOpenAnnotation: (NativeBlockEditorTextAnnotation) -> Void
+    let onTapAnnotations: (NativeBlockEditorAnnotationHit) -> Void
+    /// Names the VoiceOver action for one cluster of annotations and its passage.
+    let annotationActionName: (([NativeBlockEditorTextAnnotation], String) -> String)?
     let onSelectionChange: (NSRange) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -408,6 +410,7 @@ struct RichTextBlockEditor: UIViewRepresentable {
         configureKeyboardCallbacks(textView, coordinator: context.coordinator)
         configureLinkTap(textView, coordinator: context.coordinator)
         configureAnnotationTap(textView, coordinator: context.coordinator)
+        configureAnnotationAccessibility(textView, coordinator: context.coordinator)
         textView.typingAttributes = RichTextCodec.visualAttributes(
             for: [:],
             baseFont: textStyle.font,
@@ -440,21 +443,22 @@ struct RichTextBlockEditor: UIViewRepresentable {
         configureAnnotationTap(textView, coordinator: context.coordinator)
 
         let current = RichTextCodec.delta(from: textView.attributedText)
-        if current != delta.normalized()
+        let contentChanged = current != delta.normalized()
             || context.coordinator.renderedStyleSignature != textStyle.signature
-            || context.coordinator.renderedAnnotationSignature != annotationSignature
-            || context.coordinator.renderedAppearanceSignature != appearanceSignature(for: textView.traitCollection),
-            textView.markedTextRange == nil
-        {
-            let selection = textView.selectedRange
-            textView.attributedText = annotatedString(traits: textView.traitCollection)
-            let location = min(selection.location, textView.attributedText.length)
-            let length = min(selection.length, textView.attributedText.length - location)
-            textView.selectedRange = NSRange(location: location, length: length)
-            context.coordinator.renderedStyleSignature = textStyle.signature
-            context.coordinator.renderedAnnotationSignature = annotationSignature
-            context.coordinator.renderedAppearanceSignature = appearanceSignature(for: textView.traitCollection)
+            || context.coordinator.renderedAppearanceSignature != appearanceSignature(for: textView.traitCollection)
+        let annotationsChanged = context.coordinator.renderedAnnotationSignature != annotationSignature
+        // Restyling under a live selection would drop its handles and menu, so
+        // a highlight that changes then waits until the selection collapses.
+        let defersAnnotations = !contentChanged && annotationsChanged
+            && textView.isFirstResponder && textView.selectedRange.length > 0
+        if contentChanged || annotationsChanged, !defersAnnotations, textView.markedTextRange == nil {
+            context.coordinator.render(
+                in: textView,
+                fades: !contentChanged && !isEditable && textView.window != nil
+                    && !UIAccessibility.isReduceMotionEnabled
+            )
         }
+        configureAnnotationAccessibility(textView, coordinator: context.coordinator)
 
         if isEditable, textView.isFirstResponder {
             session.updateConfiguration(
@@ -510,22 +514,69 @@ struct RichTextBlockEditor: UIViewRepresentable {
     private func configureAnnotationTap(_ textView: UITextView, coordinator: Coordinator) {
         guard let textView = textView as? DocumentRichTextView else { return }
         if textView.annotationTapRecognizer == nil {
+            // A double-tap on a highlighted word selects it; it never opens
+            // the highlight, so the single tap waits for the double to fail.
+            let doubleTap = UITapGestureRecognizer(
+                target: coordinator,
+                action: #selector(Coordinator.ignoreAnnotationDoubleTap(_:))
+            )
+            doubleTap.numberOfTapsRequired = 2
+            doubleTap.delegate = coordinator
+            doubleTap.cancelsTouchesInView = false
+            doubleTap.delaysTouchesEnded = false
+            textView.addGestureRecognizer(doubleTap)
+            textView.annotationDoubleTapRecognizer = doubleTap
+
             let recognizer = UITapGestureRecognizer(
                 target: coordinator,
                 action: #selector(Coordinator.openAnnotation(_:))
             )
             recognizer.delegate = coordinator
             recognizer.cancelsTouchesInView = false
+            recognizer.require(toFail: doubleTap)
             textView.addGestureRecognizer(recognizer)
             textView.annotationTapRecognizer = recognizer
+        }
+        // Editing places the caret; highlights are only drawn, never opened.
+        textView.annotationTapRecognizer?.isEnabled = !isEditable
+        textView.annotationDoubleTapRecognizer?.isEnabled = !isEditable
+    }
+
+    /// One VoiceOver action per cluster of highlights, since a highlight can
+    /// only be tapped by sight.
+    private func configureAnnotationAccessibility(_ textView: UITextView, coordinator: Coordinator) {
+        guard !isEditable else {
+            textView.accessibilityCustomActions = nil
+            return
+        }
+        let text = textView.attributedText.string as NSString
+        let clusters = NativeBlockEditorAnnotationComposer.clusters(annotations, textLength: text.length)
+        textView.accessibilityCustomActions = clusters.isEmpty ? nil : clusters.map { cluster in
+            let start = cluster.map(\.range.location).min() ?? 0
+            let end = cluster.map { NSMaxRange($0.range) }.max() ?? start
+            let passage = text.substring(with: NSRange(location: start, length: end - start))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let quoted = passage.count > 40 ? String(passage.prefix(40)) + "…" : passage
+            let name = annotationActionName?(cluster, passage) ?? "Open “\(quoted)”"
+            return UIAccessibilityCustomAction(name: name) { [weak coordinator, weak textView] _ in
+                guard let coordinator, let textView else { return false }
+                return coordinator.openCluster(cluster, in: textView)
+            }
         }
     }
 
     private var annotationSignature: String {
+        // Editing draws every highlight as the same faint line, so a style
+        // change, such as a branch page finishing, must not redraw mid-typing.
         annotations
             .sorted { $0.id < $1.id }
-            .map { "\($0.id):\($0.range.location):\($0.range.length)" }
-            .joined(separator: "|")
+            .map { annotation in
+                let style = isEditable
+                    ? (annotation.style.isBranch ? "branch" : "discussion")
+                    : annotation.style.rawValue
+                return "\(annotation.id):\(annotation.range.location):\(annotation.range.length):\(style)"
+            }
+            .joined(separator: "|") + (isEditable ? "|editing" : "")
     }
 
     private func appearanceSignature(for traits: UITraitCollection) -> String {
@@ -539,21 +590,58 @@ struct RichTextBlockEditor: UIViewRepresentable {
                 style: textStyle.resolved(for: traits)
             )
         )
-        for annotation in annotations {
-            guard annotation.range.location >= 0,
-                  annotation.range.length > 0,
-                  NSMaxRange(annotation.range) <= output.length else { continue }
-            output.addAttributes(
-                [
-                    RichTextCodec.annotationIDKey: annotation.id,
-                    .backgroundColor: UIColor.systemBlue.withAlphaComponent(0.20),
-                    .underlineColor: UIColor.systemBlue.withAlphaComponent(0.65),
-                    .underlineStyle: NSUnderlineStyle.single.rawValue,
-                ],
-                range: annotation.range
-            )
+        let runs = NativeBlockEditorAnnotationComposer.runs(
+            for: annotations,
+            textLength: output.length,
+            isEditable: isEditable
+        )
+        for run in runs {
+            output.addAttributes(Self.attributes(for: run, traits: traits), range: run.range)
         }
         return output
+    }
+
+    /// Colors for one annotation run. The ID marks the run as annotated; taps
+    /// read the covering annotations from their ranges, not from this key.
+    private static func attributes(
+        for run: NativeBlockEditorAnnotationComposer.Run,
+        traits: UITraitCollection
+    ) -> [NSAttributedString.Key: Any] {
+        let token = run.token
+        let isDark = traits.userInterfaceStyle == .dark
+        let contrast: CGFloat = traits.accessibilityContrast == .high ? 1.5 : 1
+        let hue: UIColor = token.underlineHue == .branch ? .systemPurple : .systemBlue
+        var attributes: [NSAttributedString.Key: Any] = [RichTextCodec.annotationIDKey: run.primaryID]
+
+        let fillAlpha: CGFloat? = switch token.fill {
+        case .none: nil
+        case .branchNew: isDark ? 0.22 : 0.14
+        case .branch: isDark ? 0.10 : 0.06
+        case .discussion: 0.20
+        }
+        if let fillAlpha {
+            let color: UIColor = token.fill == .discussion ? .systemBlue : .systemPurple
+            let stacked: CGFloat = token.isStacked ? 0.04 : 0
+            attributes[.backgroundColor] = color.withAlphaComponent(min(1, (fillAlpha + stacked) * contrast))
+        }
+
+        let underlineAlpha: CGFloat
+        if token.isInert {
+            underlineAlpha = 0.35
+        } else if contrast > 1 {
+            underlineAlpha = 1
+        } else if token.underlineHue == .discussion {
+            underlineAlpha = 0.65
+        } else if token.underlinePattern == .dashed {
+            underlineAlpha = 0.6
+        } else {
+            underlineAlpha = token.isUnderlineStrong ? 0.8 : 0.45
+        }
+        var style: NSUnderlineStyle = token.isStacked && !token.isInert ? .double : .single
+        if token.underlinePattern == .dashed, !token.isInert { style.insert(.patternDash) }
+        attributes[.underlineStyle] = style.rawValue
+        attributes[.underlineColor] = hue.withAlphaComponent(underlineAlpha)
+        return attributes
     }
 
     func sizeThatFits(
@@ -581,6 +669,7 @@ struct RichTextBlockEditor: UIViewRepresentable {
         var handledFocusRequestID: UUID?
         var scheduledFocusRequestID: UUID?
         var pendingInsertion: (range: NSRange, attributes: [NSAttributedString.Key: Any])?
+        private var isRendering = false
 
         init(parent: RichTextBlockEditor) {
             self.parent = parent
@@ -606,6 +695,32 @@ struct RichTextBlockEditor: UIViewRepresentable {
                 defaultColor: parent.textStyle.color.resolvedColor(with: textView.traitCollection),
                 semanticStrikethrough: parent.textStyle.strikesText
             )
+            renderedAppearanceSignature = parent.appearanceSignature(for: textView.traitCollection)
+        }
+
+        /// Draws the block's text and highlights, keeping the selection.
+        func render(in textView: UITextView, fades: Bool) {
+            // Restoring the selection reports a selection change; that must
+            // not start another render.
+            guard !isRendering else { return }
+            isRendering = true
+            defer { isRendering = false }
+            let selection = textView.selectedRange
+            let apply = {
+                textView.attributedText = self.parent.annotatedString(traits: textView.traitCollection)
+                let location = min(selection.location, textView.attributedText.length)
+                let length = min(selection.length, textView.attributedText.length - location)
+                textView.selectedRange = NSRange(location: location, length: length)
+            }
+            if fades {
+                // A highlight changing state, such as a branch page finishing,
+                // dissolves in place instead of snapping.
+                UIView.transition(with: textView, duration: 0.25, options: .transitionCrossDissolve, animations: apply)
+            } else {
+                apply()
+            }
+            renderedStyleSignature = parent.textStyle.signature
+            renderedAnnotationSignature = parent.annotationSignature
             renderedAppearanceSignature = parent.appearanceSignature(for: textView.traitCollection)
         }
 
@@ -671,16 +786,73 @@ struct RichTextBlockEditor: UIViewRepresentable {
                   let characterIndex = characterIndex(
                     at: recognizer.location(in: textView),
                     in: textView
+                  ),
+                  let hit = hit(
+                    at: characterIndex,
+                    in: textView,
+                    isCommandClick: recognizer.modifierFlags.contains(.command)
                   )
             else { return }
-            guard let annotationID = textView.textStorage.attribute(
-                RichTextCodec.annotationIDKey,
-                at: characterIndex,
-                effectiveRange: nil
-            ) as? String,
-            let annotation = parent.annotations.first(where: { $0.id == annotationID })
-            else { return }
-            parent.onOpenAnnotation(annotation)
+            parent.onTapAnnotations(hit)
+        }
+
+        @objc func ignoreAnnotationDoubleTap(_ recognizer: UITapGestureRecognizer) {}
+
+        /// Opens one cluster of highlights for VoiceOver with every annotation
+        /// in it, since overlapping highlights need not share a character.
+        func openCluster(_ cluster: [NativeBlockEditorTextAnnotation], in textView: UITextView) -> Bool {
+            guard let primary = NativeBlockEditorAnnotationComposer.primary(of: cluster),
+                  NSMaxRange(primary.range) <= textView.textStorage.length else { return false }
+            parent.onTapAnnotations(NativeBlockEditorAnnotationHit(
+                annotations: cluster,
+                primary: primary,
+                blockID: primary.blockID,
+                path: parent.path,
+                blockText: textView.textStorage.string,
+                anchorRectInWindow: anchorRect(of: primary.range, at: primary.range.location, in: textView)
+            ))
+            return true
+        }
+
+        private func hit(
+            at characterIndex: Int,
+            in textView: UITextView,
+            isCommandClick: Bool
+        ) -> NativeBlockEditorAnnotationHit? {
+            let covering = NativeBlockEditorAnnotationComposer.annotations(
+                covering: characterIndex,
+                in: parent.annotations,
+                textLength: textView.textStorage.length
+            )
+            guard let primary = NativeBlockEditorAnnotationComposer.primary(of: covering) else { return nil }
+            return NativeBlockEditorAnnotationHit(
+                annotations: covering,
+                primary: primary,
+                blockID: primary.blockID,
+                path: parent.path,
+                blockText: textView.textStorage.string,
+                anchorRectInWindow: anchorRect(of: primary.range, at: characterIndex, in: textView),
+                isCommandClick: isCommandClick
+            )
+        }
+
+        /// The part of the passage on the tapped line, so a popover points at
+        /// the words that were tapped rather than the middle of a paragraph.
+        private func anchorRect(of range: NSRange, at characterIndex: Int, in textView: UITextView) -> CGRect {
+            let layoutManager = textView.layoutManager
+            let container = textView.textContainer
+            let glyphIndex = layoutManager.glyphIndexForCharacter(at: characterIndex)
+            var lineGlyphs = NSRange()
+            let lineRect = layoutManager.lineFragmentUsedRect(forGlyphAt: glyphIndex, effectiveRange: &lineGlyphs)
+            let passageGlyphs = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            let onLine = NSIntersectionRange(passageGlyphs, lineGlyphs)
+            let rect = onLine.length > 0
+                ? layoutManager.boundingRect(forGlyphRange: onLine, in: container)
+                : lineRect
+            return textView.convert(
+                rect.offsetBy(dx: textView.textContainerInset.left, dy: textView.textContainerInset.top),
+                to: nil
+            )
         }
 
         private func characterIndex(at point: CGPoint, in textView: UITextView) -> Int? {
@@ -722,14 +894,40 @@ struct RichTextBlockEditor: UIViewRepresentable {
                     effectiveRange: nil
                 ) != nil
             }
+            if gestureRecognizer === textView.annotationDoubleTapRecognizer {
+                // Any second tap counts, even one that drifts off the
+                // highlight, so a double-tap never falls back to opening it.
+                return !textView.isEditable
+            }
             if gestureRecognizer === textView.annotationTapRecognizer {
-                return textView.textStorage.attribute(
+                // A link inside a highlight is followed, not the highlight.
+                guard textView.textStorage.attribute(
                     RichTextCodec.annotationIDKey,
                     at: characterIndex,
                     effectiveRange: nil
-                ) != nil
+                ) != nil,
+                textView.textStorage.attribute(.link, at: characterIndex, effectiveRange: nil) == nil
+                else { return false }
+                return allowsAnnotationTap(in: textView)
             }
             return true
+        }
+
+        /// Checked again when the tap is recognized: a long press that ends
+        /// up selecting a highlighted word is a selection, not a tap.
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard let textView = gestureRecognizer.view as? DocumentRichTextView,
+                  gestureRecognizer === textView.annotationTapRecognizer else { return true }
+            return allowsAnnotationTap(in: textView)
+        }
+
+        /// A tap that clears a selection, or stops a scroll, is not a request
+        /// to open the highlight under it.
+        private func allowsAnnotationTap(in textView: DocumentRichTextView) -> Bool {
+            !textView.isEditable
+                && !DocumentRichTextView.hasLiveSelection(besides: textView)
+                && !(textView.isFirstResponder && textView.selectedRange.length > 0)
+                && !textView.isInMovingScrollView
         }
 
         func gestureRecognizer(
@@ -739,10 +937,19 @@ struct RichTextBlockEditor: UIViewRepresentable {
             guard let textView = gestureRecognizer.view as? DocumentRichTextView else {
                 return false
             }
+            if (gestureRecognizer === textView.annotationTapRecognizer
+                && otherGestureRecognizer === textView.annotationDoubleTapRecognizer)
+                || (gestureRecognizer === textView.annotationDoubleTapRecognizer
+                    && otherGestureRecognizer === textView.annotationTapRecognizer) {
+                // The single tap must wait for the double tap, not run beside it.
+                return false
+            }
             return gestureRecognizer === textView.linkTapRecognizer
                 || otherGestureRecognizer === textView.linkTapRecognizer
                 || gestureRecognizer === textView.annotationTapRecognizer
                 || otherGestureRecognizer === textView.annotationTapRecognizer
+                || gestureRecognizer === textView.annotationDoubleTapRecognizer
+                || otherGestureRecognizer === textView.annotationDoubleTapRecognizer
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
@@ -799,6 +1006,17 @@ struct RichTextBlockEditor: UIViewRepresentable {
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
+            (textView as? DocumentRichTextView)?.selectionDidChange()
+            // Catch up on highlights held back during a reading selection.
+            // While editing, a keystroke can land here before the text is
+            // committed, so redrawing then would undo it.
+            if !isRendering,
+               !textView.isEditable,
+               textView.selectedRange.length == 0,
+               renderedAnnotationSignature != parent.annotationSignature,
+               textView.markedTextRange == nil {
+                render(in: textView, fades: false)
+            }
             guard textView.isFirstResponder else { return }
             parent.session.selectionDidChange()
             parent.onSelectionChange(textView.selectedRange)
@@ -879,6 +1097,41 @@ private final class DocumentRichTextView: UITextView {
     var deleteBackwardAtEmptyHandler: (() -> Void)?
     weak var linkTapRecognizer: UITapGestureRecognizer?
     weak var annotationTapRecognizer: UITapGestureRecognizer?
+    weak var annotationDoubleTapRecognizer: UITapGestureRecognizer?
+
+    /// The block that last held a selection. A page is many text views, so a
+    /// tap in one block can be the tap that clears a selection in another.
+    private static weak var selectionOwner: DocumentRichTextView?
+
+    func selectionDidChange() {
+        if selectedRange.length > 0 {
+            Self.selectionOwner = self
+        } else if Self.selectionOwner === self {
+            Self.selectionOwner = nil
+        }
+    }
+
+    static func hasLiveSelection(besides view: DocumentRichTextView) -> Bool {
+        // Each window keeps its own selection; one in another window says
+        // nothing about this tap.
+        guard let owner = selectionOwner, owner !== view,
+              let window = view.window, owner.window === window else { return false }
+        return owner.isFirstResponder && owner.selectedRange.length > 0
+    }
+
+    /// Whether the scroll view around this block is being dragged or is still
+    /// gliding: a tap then stops the scroll and nothing else.
+    var isInMovingScrollView: Bool {
+        var view = superview
+        while let current = view {
+            if let scrollView = current as? UIScrollView, scrollView.isScrollEnabled,
+               scrollView.isDragging || scrollView.isDecelerating {
+                return true
+            }
+            view = current.superview
+        }
+        return false
+    }
 
     override func didMoveToWindow() {
         super.didMoveToWindow()

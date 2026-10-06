@@ -94,7 +94,8 @@ final class RichTextAppearanceTests: XCTestCase {
                 onFocusRequestHandled: {}, onReturn: { _ in }, onDeleteBackwardAtEmpty: {},
                 onCopy: { _ in false }, onCut: { _ in false }, onPaste: { _ in false },
                 onOpenURL: { _ in false }, onAskAboutSelection: { _, _ in },
-                annotations: [], onOpenAnnotation: { _ in }, onSelectionChange: { _ in }
+                annotations: [], onTapAnnotations: { _ in }, annotationActionName: nil,
+                onSelectionChange: { _ in }
             )
             controller.rootView = refreshed
             try await Task.sleep(for: .milliseconds(100))
@@ -117,7 +118,8 @@ final class RichTextAppearanceTests: XCTestCase {
             onFocusRequestHandled: {}, onReturn: { _ in }, onDeleteBackwardAtEmpty: {},
             onCopy: { _ in false }, onCut: { _ in false }, onPaste: { _ in false },
             onOpenURL: { _ in false }, onAskAboutSelection: { _, _ in },
-            annotations: [], onOpenAnnotation: { _ in }, onSelectionChange: { _ in }
+            annotations: [], onTapAnnotations: { _ in }, annotationActionName: nil,
+                onSelectionChange: { _ in }
         )
     }
 

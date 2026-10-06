@@ -237,6 +237,9 @@ final class TurnLiveActivityController {
         }()
         let model = thread.resolvedModel.isEmpty ? nil : thread.resolvedModel
         let lastTool: String? = {
+            if let activity = summary?.currentActivity {
+                return ContinuedTurnBannerFormatter.activityPhrase(activity, context: nil, limit: 48)
+            }
             if let label = summary?.lastToolLabel, !label.isEmpty {
                 return String(label.prefix(48))
             }

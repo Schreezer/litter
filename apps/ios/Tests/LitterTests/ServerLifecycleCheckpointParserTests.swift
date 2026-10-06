@@ -718,8 +718,11 @@ final class StrictUITestLaunchConfigurationTests: XCTestCase {
             [
                 "--ui-test-course-draft-recovery",
                 "--ui-test-course-reading",
+                "--ui-test-course-submission-recovery",
                 "--ui-test-starter-course",
                 "--ui-test-course-generation-control",
+                "--ui-test-course-learning-path",
+                "--ui-test-visualization-gallery",
                 "--ui-test-course-retry",
                 "--ui-test-course-save-recovery",
                 "--ui-test-course-chat-continuity",
@@ -732,6 +735,7 @@ final class StrictUITestLaunchConfigurationTests: XCTestCase {
             [
                 "--ui-test-dynamic-type-default",
                 "--ui-test-dynamic-type-ax3xl",
+                "--ui-test-learning-path-in-exploration",
                 "--ui-test-generation-recovery-acceptance-unknown",
                 "--ui-test-generation-recovery-accepted-reply-incomplete",
                 "--ui-test-open-settings",

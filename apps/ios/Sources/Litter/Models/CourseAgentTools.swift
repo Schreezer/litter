@@ -74,7 +74,8 @@ enum CourseAgentTools {
     }
 
     static func mcpToolDefinitions(
-        includePresentPlan: Bool = true
+        includePresentPlan: Bool = true,
+        includeCourseBash: Bool = true
     ) throws -> [CourseMCPToolDefinition] {
         var definitions: [CourseMCPToolDefinition] = []
         if includePresentPlan {
@@ -89,18 +90,20 @@ enum CourseAgentTools {
                 openWorld: false
             ))
         }
-        definitions.append(
-            CourseMCPToolDefinition(
-                name: courseBash,
-                description: """
-                Run a shell script on this iPhone against the live course folder at /workspace. Before the learner approves the latest protected course plan, /workspace is read-only so you may inspect deterministic source material but cannot alter course files. After approval it is read-write. The shell cannot navigate to sibling courses or unrelated app files, symbolic links are unsupported, and internet/network sockets are unavailable. Use normal commands such as find, grep, sed, awk, cat, cp, mv, mkdir, and rm. Commands may partially modify files after approval even when they exit nonzero, so inspect the workspace before retrying a failed mutation.
-                """,
-                inputSchema: addingWorkspaceID(to: courseBashSchema),
-                readOnly: false,
-                destructive: true,
-                openWorld: false
+        if includeCourseBash {
+            definitions.append(
+                CourseMCPToolDefinition(
+                    name: courseBash,
+                    description: """
+                    Run a shell script on this iPhone against the live course folder at /workspace. Before the learner approves the latest protected course plan, /workspace is read-only so you may inspect deterministic source material but cannot alter course files. After approval it is read-write. The shell cannot navigate to sibling courses or unrelated app files, symbolic links are unsupported, and internet/network sockets are unavailable. Use normal commands such as find, grep, sed, awk, cat, cp, mv, mkdir, and rm. Commands may partially modify files after approval even when they exit nonzero, so inspect the workspace before retrying a failed mutation.
+                    """,
+                    inputSchema: addingWorkspaceID(to: courseBashSchema),
+                    readOnly: false,
+                    destructive: true,
+                    openWorld: false
+                )
             )
-        )
+        }
         definitions.append(contentsOf: try NativeEditorMCPToolCatalog.tools.map { tool in
             let schemaData = try JSONEncoder().encode(tool.inputSchema)
             return CourseMCPToolDefinition(
@@ -286,6 +289,22 @@ enum CourseAgentTools {
         ]
     }
 
+    /// Plan levels spelled out as full schemas. Deeper levels share one
+    /// opaque node schema: hosted model providers reject tool schemas nested
+    /// more than 10 levels, and four fully typed levels reach 11. The plan
+    /// shape is unchanged; `CoursePlanHierarchyPolicy` validates every level
+    /// when the plan is presented.
+    static let typedPlanSchemaLevels = 2
+
+    /// Levels below `typedPlanSchemaLevels`: same fields as their parent,
+    /// described instead of nested.
+    private static func nestedPlanNodeSchema(depth: Int) -> [String: Any] {
+        [
+            "type": "object",
+            "description": "A level-\(depth) page with the same fields as its parent: id (globally unique stable ID), title (no ordinal prefix), role, and children (always present, an empty array for pages). Role is one of subchapter, lesson, module, or explainer; only a subchapter has children, 1 to \(CoursePlanHierarchyPolicy.maximumDirectChildren) of them. At most \(CoursePlanHierarchyPolicy.maximumDepth) levels in total, so level-\(CoursePlanHierarchyPolicy.maximumDepth) pages are lesson, module, or explainer with children [].",
+        ]
+    }
+
     private static func planNodeSchema(depth: Int) -> [String: Any] {
         let children: [String: Any]
         if depth < CoursePlanHierarchyPolicy.maximumDepth {
@@ -293,7 +312,9 @@ enum CourseAgentTools {
                 "type": "array",
                 "minItems": depth == 1 ? 1 : 0,
                 "maxItems": CoursePlanHierarchyPolicy.maximumDirectChildren,
-                "items": planNodeSchema(depth: depth + 1),
+                "items": depth < typedPlanSchemaLevels
+                    ? planNodeSchema(depth: depth + 1)
+                    : nestedPlanNodeSchema(depth: depth + 1),
             ]
         } else {
             children = [

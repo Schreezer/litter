@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Learnfold mark">
-  <rect width="64" height="64" rx="15" fill="#4B3CF0"/>
-  <path d="M17 15v34l18-7V25z" fill="#FFFAE8"/>
-  <path d="M35 25v17l17-7z" fill="#D7FF45"/>
-  <path d="M17 49l18-7 8 7z" fill="#171349"/>
+  <rect width="64" height="64" rx="15" fill="#0A84FF"/>
+  <path d="M17 15v34l18-7V25z" fill="#FFFFFF"/>
+  <path d="M35 25v17l17-7z" fill="#BFDFFF"/>
+  <path d="M17 49l18-7 8 7z" fill="#003A8C"/>
 </svg>

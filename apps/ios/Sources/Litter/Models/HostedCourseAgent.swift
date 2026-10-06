@@ -1,5 +1,12 @@
 import Foundation
 import Security
+import CryptoKit
+
+/// A portable locator, never a credential. The secret stays in iCloud Keychain.
+struct HostedCourseIdentityBinding: Codable, Equatable, Sendable {
+    let serviceBaseURL: String
+    let ownerSubject: String
+}
 
 /// Transient presentation of a Hosted request, never persisted as runtime state.
 struct HostedReplyProgress: Equatable {
@@ -25,19 +32,34 @@ struct HostedCourseAgentStoredMessage: Equatable, Sendable {
         case agent
     }
 
+    /// Think's message id. For learner messages it is the optimistic id the
+    /// phone sent, so a restored transcript proves which sends arrived.
+    let id: String?
     let role: Role
     let text: String
+
+    init(id: String? = nil, role: Role, text: String) {
+        self.id = id
+        self.role = role
+        self.text = text
+    }
 }
 
 @MainActor
 protocol HostedCourseAgentRuntime: AnyObject {
     func availability() -> HostedCourseAgentAvailability
+    func identityBinding() throws -> HostedCourseIdentityBinding?
+    func configureSession(sessionID: UUID, binding: HostedCourseIdentityBinding?) throws
+    func recoverInterruptedSession(sessionID: UUID, workspaceID: String, courseDirectory: URL) async throws -> Bool
     func restoredMessages(sessionID: UUID) async throws -> [HostedCourseAgentStoredMessage]
+    func review(sessionID: UUID, workspaceID: String, prompt: String) async throws -> String
     func send(
         sessionID: UUID,
         workspaceID: String,
         courseDirectory: URL,
         prompt: String,
+        messageID: UUID?,
+        role: CourseAgentThreadRole,
         onRecoveringChanged: @escaping @MainActor (Bool) -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
@@ -45,19 +67,38 @@ protocol HostedCourseAgentRuntime: AnyObject {
     func cancel(sessionID: UUID)
 }
 
+extension HostedCourseAgentRuntime {
+    func identityBinding() throws -> HostedCourseIdentityBinding? { nil }
+    func configureSession(sessionID: UUID, binding: HostedCourseIdentityBinding?) throws {}
+    func recoverInterruptedSession(sessionID: UUID, workspaceID: String, courseDirectory: URL) async throws -> Bool { false }
+
+    func review(sessionID: UUID, workspaceID: String, prompt: String) async throws -> String {
+        throw CourseAssessmentReviewRuntimeError.unavailable(
+            "This Hosted runtime does not support exercise review."
+        )
+    }
+}
+
 @MainActor
 final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
     static let modelID = "muse-spark-1.3-contributor"
+    // Each Mac window owns a runtime instance. Native work must remain owned
+    // across all of them so opening another window cannot abort a live tool.
+    private static var processActiveSessions: [UUID: UUID] = [:]
 
     private let baseURL: String?
     private let accessToken: String?
+    private let clientFactory: (() throws -> HostedAgentClient)?
     private var activeTasks: [UUID: Task<HostedAgentTurnResult, Error>] = [:]
     private var activeClients: [UUID: HostedAgentClient] = [:]
+    private var sessionBindings: [UUID: HostedCourseIdentityBinding] = [:]
 
     init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        bundle: Bundle = .main
+        bundle: Bundle = .main,
+        clientFactory: (() throws -> HostedAgentClient)? = nil
     ) {
+        self.clientFactory = clientFactory
         baseURL = Self.configurationValue(
             environmentKey: "LEARNFOLD_HOSTED_AGENT_URL",
             bundleKey: "LearnfoldHostedAgentURL",
@@ -88,13 +129,67 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
     }
 
     func restoredMessages(sessionID: UUID) async throws -> [HostedCourseAgentStoredMessage] {
-        try await client().loadMessages(sessionId: sessionID.uuidString.lowercased()).compactMap {
+        try await client(sessionID: sessionID).loadMessages(sessionId: sessionID.uuidString.lowercased()).compactMap {
             switch $0.role {
-            case "user": .init(role: .learner, text: $0.text)
-            case "assistant": .init(role: .agent, text: $0.text)
+            case "user": .init(id: $0.id, role: .learner, text: $0.text)
+            case "assistant": .init(id: $0.id, role: .agent, text: $0.text)
             default: nil
             }
         }
+    }
+
+    func recoverInterruptedSession(sessionID: UUID, workspaceID: String, courseDirectory: URL) async throws -> Bool {
+        guard Self.processActiveSessions[sessionID] == nil else { return false }
+        let ownership = try claimSession(sessionID)
+        defer { releaseSession(sessionID, ownership: ownership) }
+        let client = try client(sessionID: sessionID)
+        let session = try await client.loadSession(sessionId: sessionID.uuidString.lowercased())
+        guard session.active, session.originatingDevice, session.waitingForTools else { return false }
+        let databaseURL = courseDirectory.appendingPathComponent(".course/course-library.sqlite")
+        guard FileManager.default.fileExists(atPath: databaseURL.path) else {
+            throw HostedCourseAgentRuntimeError.unavailable(
+                "Open and sync this course's native pages on its original device before recovering its interrupted Hosted task."
+            )
+        }
+        let repository = try await CourseDocumentRegistry.shared.repository(
+            workspaceID: workspaceID, databaseURL: databaseURL, rootTitle: "Course"
+        )
+        _ = try await repository.flushPendingUserEdits()
+        let pages = try await repository.workspaceSnapshot()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let receipt = SHA256.hash(data: try encoder.encode(pages)).map { String(format: "%02x", $0) }.joined()
+        guard Self.processActiveSessions[sessionID] == ownership, activeTasks[sessionID] == nil else { return false }
+        return try await client.recoverInterruptedSession(
+            sessionId: sessionID.uuidString.lowercased(), workspaceId: workspaceID,
+            refreshedPagesReceipt: receipt
+        )
+    }
+
+    /// Reviews one submitted answer in its own session. No course editor tools
+    /// or callbacks are available, and no visible discussion is reused.
+    func review(sessionID: UUID, workspaceID: String, prompt: String) async throws -> String {
+        let ownership = try claimSession(sessionID)
+        defer { releaseSession(sessionID, ownership: ownership) }
+        let client = try client(sessionID: sessionID)
+        let task = Task {
+            try await client.send(
+                sessionId: sessionID.uuidString.lowercased(),
+                workspaceId: workspaceID,
+                prompt: prompt,
+                messageId: nil,
+                tools: [],
+                toolHandler: HostedAssessmentReviewToolHandler(),
+                listener: HostedAssessmentReviewEventListener()
+            )
+        }
+        activeClients[sessionID] = client
+        activeTasks[sessionID] = task
+        defer {
+            activeTasks[sessionID] = nil
+            activeClients[sessionID] = nil
+        }
+        return try await task.value.responseText
     }
 
     func send(
@@ -102,11 +197,19 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
         workspaceID: String,
         courseDirectory: URL,
         prompt: String,
+        messageID: UUID?,
+        role: CourseAgentThreadRole,
         onRecoveringChanged: @escaping @MainActor (Bool) -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor (CourseBrief) async throws -> Void
     ) async throws {
-        let definitions = try CourseAgentTools.mcpToolDefinitions().map { definition in
+        let ownership = try claimSession(sessionID)
+        defer { releaseSession(sessionID, ownership: ownership) }
+        // The hosted service reads a missing plan tool as a discussion inside
+        // an existing course and swaps in its no-replanning instructions.
+        let definitions = try CourseAgentTools.mcpToolDefinitions(
+            includePresentPlan: role == .course
+        ).map { definition in
             let schema = try JSONSerialization.data(
                 withJSONObject: definition.inputSchema,
                 options: [.sortedKeys]
@@ -126,12 +229,13 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
             onPartialResponse: onPartialResponse,
             onRecoveringChanged: onRecoveringChanged
         )
-        let client = try client()
+        let client = try client(sessionID: sessionID)
         let task = Task {
             try await client.send(
                 sessionId: sessionID.uuidString.lowercased(),
                 workspaceId: workspaceID,
                 prompt: prompt,
+                messageId: messageID?.uuidString.lowercased(),
                 tools: definitions,
                 toolHandler: handler,
                 listener: listener
@@ -163,17 +267,69 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
         activeClients[sessionID] = nil
     }
 
-    private func client() throws -> HostedAgentClient {
+    private func claimSession(_ sessionID: UUID) throws -> UUID {
+        guard Self.processActiveSessions[sessionID] == nil else {
+            throw HostedCourseAgentRuntimeError.unavailable(
+                "This Hosted conversation is already working in another Learnfold window. Wait for that task to finish before continuing here."
+            )
+        }
+        let ownership = UUID()
+        Self.processActiveSessions[sessionID] = ownership
+        return ownership
+    }
+
+    private func releaseSession(_ sessionID: UUID, ownership: UUID) {
+        if Self.processActiveSessions[sessionID] == ownership { Self.processActiveSessions[sessionID] = nil }
+    }
+
+    func identityBinding() throws -> HostedCourseIdentityBinding? {
         guard let baseURL else {
             throw HostedCourseAgentRuntimeError.unavailable(availability().reason)
         }
+        let ownerSubject: String
         if let accessToken {
-            return try HostedAgentClient(baseUrl: baseURL, accessToken: accessToken)
+            ownerSubject = "access-\(HostedGuestIdentity.fingerprint(accessToken))"
+        } else {
+            ownerSubject = try HostedGuestIdentity.identity(serviceURL: baseURL).ownerSubject
         }
-        return try HostedAgentClient.guest(
-            baseUrl: baseURL,
-            guestSecret: HostedGuestIdentity.loadOrCreate(serviceURL: baseURL)
-        )
+        return .init(serviceBaseURL: baseURL, ownerSubject: ownerSubject)
+    }
+
+    func configureSession(sessionID: UUID, binding: HostedCourseIdentityBinding?) throws {
+        // Install the locator before resolving it so a delayed credential can
+        // never make a subsequent retry fall back to a fresh guest identity.
+        sessionBindings[sessionID] = binding
+        if binding != nil { _ = try client(sessionID: sessionID) }
+    }
+
+    private func client(sessionID: UUID) throws -> HostedAgentClient {
+        guard let baseURL else {
+            throw HostedCourseAgentRuntimeError.unavailable(availability().reason)
+        }
+        if let clientFactory { return try clientFactory() }
+        let binding = sessionBindings[sessionID]
+        if let binding, binding.serviceBaseURL != baseURL {
+            throw HostedCourseAgentRuntimeError.unavailable(
+                "This conversation uses a different Hosted service. Reconnect that service to continue its saved history."
+            )
+        }
+        let client: HostedAgentClient
+        if let accessToken {
+            if let binding, binding.ownerSubject != "access-\(HostedGuestIdentity.fingerprint(accessToken))" {
+                throw HostedCourseAgentRuntimeError.unavailable(
+                    "This conversation belongs to a different Hosted account. Reconnect its original account to continue."
+                )
+            }
+            client = try HostedAgentClient(baseUrl: baseURL, accessToken: accessToken)
+        } else {
+            let identity = try HostedGuestIdentity.identity(
+                serviceURL: baseURL,
+                ownerSubject: binding?.ownerSubject
+            )
+            client = try HostedAgentClient.guest(baseUrl: baseURL, guestSecret: identity.secret)
+        }
+        try client.setOriginId(originId: HostedGuestIdentity.deviceOriginID())
+        return client
     }
 
     private static func configurationValue(
@@ -190,42 +346,194 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
     }
 }
 
+private final class HostedAssessmentReviewToolHandler: HostedAgentToolHandler, Sendable {
+    func executeHostedTool(invocation: HostedAgentToolInvocation) -> HostedAgentToolResult {
+        HostedAgentToolResult(
+            success: false,
+            output: "{}",
+            errorMessage: "Exercise review has no tools. Return the review directly."
+        )
+    }
+}
+
+private final class HostedAssessmentReviewEventListener: HostedAgentEventListener, Sendable {
+    func onResponseDelta(delta: String) {}
+    func onRecoveringChanged(recovering: Bool) {}
+}
+
 /// Platform persistence only. Token minting and authentication stay in Rust.
-enum HostedGuestIdentity {
-    static func loadOrCreate(serviceURL: String) throws -> String {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "com.chirag.learnfold.hosted-guest",
-            kSecAttrAccount as String: serviceURL,
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query.merging([
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]) { _, new in new } as CFDictionary, &item)
-        if status == errSecSuccess, let data = item as? Data,
-           let secret = String(data: data, encoding: .utf8), secret.count == 64 {
-            return secret
+/// Per-owner entries let two devices keep their earlier identities side by side.
+struct HostedGuestIdentityCredential {
+    let ownerSubject: String
+    let secret: String
+}
+
+protocol HostedGuestIdentityStorage {
+    func read(service: String, account: String, synchronizable: Bool) throws -> Data?
+    func insert(_ data: Data, service: String, account: String, synchronizable: Bool) throws
+}
+
+struct HostedGuestIdentityRepository {
+    static let legacyService = "com.chirag.learnfold.hosted-guest"
+    static let identityService = "com.chirag.learnfold.hosted-guest.identities"
+    static let preferenceService = "com.chirag.learnfold.hosted-guest.preferred"
+
+    let storage: any HostedGuestIdentityStorage
+    var makeSecret: () throws -> String = HostedGuestIdentity.randomSecret
+
+    func identity(serviceURL: String, ownerSubject: String? = nil) throws -> HostedGuestIdentityCredential {
+        let serviceKey = HostedGuestIdentity.fingerprint(serviceURL)
+        if let ownerSubject {
+            guard ownerSubject.range(of: "^guest-[0-9a-f]{64}$", options: .regularExpression) != nil else {
+                throw HostedCourseAgentRuntimeError.unavailable("This saved Hosted conversation has an invalid account binding.")
+            }
+            if let data = try storage.read(
+                service: Self.identityService, account: "\(serviceKey)|\(ownerSubject)", synchronizable: true
+            ) {
+                return try credential(data, expectedSubject: ownerSubject)
+            }
+            // A local course predating synchronization still owns its original
+            // device secret. Promote it without changing the hosted namespace.
+            if let legacy = try legacyIdentity(serviceURL: serviceURL), legacy.ownerSubject == ownerSubject {
+                try promote(legacy, serviceKey: serviceKey)
+                return legacy
+            }
+            throw HostedCourseAgentRuntimeError.unavailable(
+                "Waiting for this conversation's iCloud Keychain identity. Enable iCloud Keychain on both devices, unlock them, and retry. Its saved history will remain in the original Hosted account."
+            )
         }
-        guard status == errSecItemNotFound else {
-            throw keychainError(status == errSecSuccess ? errSecDecode : status)
+
+        if let legacy = try legacyIdentity(serviceURL: serviceURL) {
+            try promote(legacy, serviceKey: serviceKey)
+            return legacy
         }
-        var bytes = [UInt8](repeating: 0, count: 32)
-        let randomStatus = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        guard randomStatus == errSecSuccess else { throw keychainError(randomStatus) }
-        let secret = bytes.map { String(format: "%02x", $0) }.joined()
-        let saved = SecItemAdd(query.merging([
-            kSecValueData as String: Data(secret.utf8),
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-        ]) { _, new in new } as CFDictionary, nil)
-        if saved == errSecDuplicateItem { return try loadOrCreate(serviceURL: serviceURL) }
-        guard saved == errSecSuccess else { throw keychainError(saved) }
-        return secret
+        if let preference = try storage.read(
+            service: Self.preferenceService, account: serviceKey, synchronizable: true
+        ) {
+            guard let subject = String(data: preference, encoding: .utf8) else {
+                throw HostedCourseAgentRuntimeError.unavailable("Couldn't read your saved Hosted account binding.")
+            }
+            // A preference can arrive before its secret. This must wait rather
+            // than silently open a new account and empty conversation.
+            return try identity(serviceURL: serviceURL, ownerSubject: subject)
+        }
+        let secret = try makeSecret()
+        let created = try credential(Data(secret.utf8), expectedSubject: nil)
+        try promote(created, serviceKey: serviceKey)
+        // Insert-only preference: concurrent installs may discover different
+        // legacy accounts, but never overwrite their other owner entries.
+        if let preference = try storage.read(
+            service: Self.preferenceService, account: serviceKey, synchronizable: true
+        ), let subject = String(data: preference, encoding: .utf8), subject != created.ownerSubject {
+            return try identity(serviceURL: serviceURL, ownerSubject: subject)
+        }
+        return created
     }
 
-    private static func keychainError(_ status: OSStatus) -> NSError {
+    private func legacyIdentity(serviceURL: String) throws -> HostedGuestIdentityCredential? {
+        guard let data = try storage.read(
+            service: Self.legacyService, account: serviceURL, synchronizable: false
+        ) else { return nil }
+        return try credential(data, expectedSubject: nil)
+    }
+
+    private func credential(_ data: Data, expectedSubject: String?) throws -> HostedGuestIdentityCredential {
+        guard let secret = String(data: data, encoding: .utf8),
+              secret.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else {
+            throw HostedCourseAgentRuntimeError.unavailable("Couldn't read your Hosted identity. Unlock your device and retry.")
+        }
+        let subject = "guest-\(HostedGuestIdentity.fingerprint(secret))"
+        guard expectedSubject == nil || expectedSubject == subject else {
+            throw HostedCourseAgentRuntimeError.unavailable("The Hosted credential doesn't match this conversation's original account.")
+        }
+        return .init(ownerSubject: subject, secret: secret)
+    }
+
+    private func promote(_ identity: HostedGuestIdentityCredential, serviceKey: String) throws {
+        try storage.insert(
+            Data(identity.secret.utf8), service: Self.identityService,
+            account: "\(serviceKey)|\(identity.ownerSubject)", synchronizable: true
+        )
+        try storage.insert(
+            Data(identity.ownerSubject.utf8), service: Self.preferenceService,
+            account: serviceKey, synchronizable: true
+        )
+    }
+}
+
+enum HostedGuestIdentity {
+    static func identity(serviceURL: String, ownerSubject: String? = nil) throws -> HostedGuestIdentityCredential {
+        try HostedGuestIdentityRepository(storage: HostedGuestKeychainStorage()).identity(
+            serviceURL: serviceURL, ownerSubject: ownerSubject
+        )
+    }
+
+    static func loadOrCreate(serviceURL: String) throws -> String {
+        try identity(serviceURL: serviceURL).secret
+    }
+
+    static func fingerprint(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func deviceOriginID(defaults: UserDefaults = .standard) -> String {
+        let key = "learnfold.hosted.deviceOriginID"
+        if let value = defaults.string(forKey: key), UUID(uuidString: value) != nil { return value }
+        let value = UUID().uuidString.lowercased()
+        defaults.set(value, forKey: key)
+        return value
+    }
+
+    static func randomSecret() throws -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard status == errSecSuccess else { throw HostedGuestKeychainStorage.error(status) }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private struct HostedGuestKeychainStorage: HostedGuestIdentityStorage {
+    func read(service: String, account: String, synchronizable: Bool) throws -> Data? {
+        var item: CFTypeRef?
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: synchronizable,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = item as? Data else {
+            throw Self.error(status == errSecSuccess ? errSecDecode : status)
+        }
+        return data
+    }
+
+    func insert(_ data: Data, service: String, account: String, synchronizable: Bool) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: synchronizable,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+            kSecValueData as String: data,
+        ]
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess || status == errSecDuplicateItem else { throw Self.error(status) }
+        // Never overwrite a credential selected by a portable owner locator.
+        if status == errSecDuplicateItem {
+            guard try read(service: service, account: account, synchronizable: synchronizable) == data
+                    || service == HostedGuestIdentityRepository.preferenceService else {
+                throw HostedCourseAgentRuntimeError.unavailable("Your Hosted identity could not be safely restored. Unlock your device and retry.")
+            }
+        }
+    }
+
+    static func error(_ status: OSStatus) -> NSError {
         NSError(domain: NSOSStatusErrorDomain, code: Int(status), userInfo: [
-            NSLocalizedDescriptionKey: "Couldn't access your Hosted guest identity. Please unlock your device and try again.",
+            NSLocalizedDescriptionKey: "Couldn't access your Hosted identity. Unlock your device and check that iCloud Keychain is enabled, then retry.",
         ])
     }
 }

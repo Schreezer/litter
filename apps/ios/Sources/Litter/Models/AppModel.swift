@@ -533,6 +533,15 @@ final class AppModel {
     }
 
     func loginLocalChatGPTAccount(serverId: String) async throws {
+        #if targetEnvironment(macCatalyst)
+        if LitterPlatform.isDirectDistMac, serverId == LocalCodexBootstrap.serverId {
+            guard let server = snapshot?.serverSnapshot(for: serverId),
+                  !server.requiresOpenaiAuth || server.account != nil else {
+                throw installedMacCodexLoginError()
+            }
+            return
+        }
+        #endif
         guard let server = snapshot?.serverSnapshot(for: serverId) else {
             throw LocalAccountLoginFlowError.localServerUnavailable
         }
@@ -557,6 +566,13 @@ final class AppModel {
     }
 
     func loginLocalChatGPTAccountOnThisDevice() async throws {
+        #if targetEnvironment(macCatalyst)
+        if LitterPlatform.isDirectDistMac {
+            let serverID = try await LocalCodexBootstrap.shared.ensureConnected(appModel: self)
+            try await loginLocalChatGPTAccount(serverId: serverID)
+            return
+        }
+        #endif
         if snapshot?.servers.first(where: \.isLocal) == nil {
             await refreshSnapshot()
         }
@@ -588,6 +604,14 @@ final class AppModel {
         guard server.isLocal else {
             return true
         }
+        #if targetEnvironment(macCatalyst)
+        if LitterPlatform.isDirectDistMac, serverId == LocalCodexBootstrap.serverId {
+            guard !server.requiresOpenaiAuth || server.account != nil else {
+                throw installedMacCodexLoginError()
+            }
+            return true
+        }
+        #endif
         let preferredAuth = await preferredStoredLocalAuth()
         if preferredAuth.prefersAPIKey {
             if case .apiKey? = server.account { return true }
@@ -636,6 +660,11 @@ final class AppModel {
 
     @discardableResult
     private func restoreStoredLocalAuthIfNeeded(serverId: String, reason: String) async -> Bool {
+        #if targetEnvironment(macCatalyst)
+        if LitterPlatform.isDirectDistMac, serverId == LocalCodexBootstrap.serverId {
+            return false
+        }
+        #endif
         guard let server = snapshot?.serverSnapshot(for: serverId), server.isLocal else {
             return false
         }
@@ -678,6 +707,12 @@ final class AppModel {
     }
 
     func restartLocalServer() async throws {
+        #if targetEnvironment(macCatalyst)
+        if LitterPlatform.isDirectDistMac {
+            try await LocalCodexBootstrap.shared.restart(appModel: self)
+            return
+        }
+        #endif
         let currentLocal = snapshot?.servers.first(where: \.isLocal)
         let serverId = currentLocal?.serverId ?? "local"
         let displayName = resolvedLocalServerDisplayName()
@@ -693,6 +728,11 @@ final class AppModel {
     }
 
     func restoreStoredLocalAuthState(serverId: String) async {
+        #if targetEnvironment(macCatalyst)
+        if LitterPlatform.isDirectDistMac, serverId == LocalCodexBootstrap.serverId {
+            return
+        }
+        #endif
         let explicitPreference = localAuthPreference
         let storedApiKey: String?
         if let rawApiKey = await loadStoredLocalApiKey() {
@@ -774,6 +814,9 @@ final class AppModel {
     }
 
     func restoreMissingLocalAuthStateIfNeeded() async {
+        #if targetEnvironment(macCatalyst)
+        if LitterPlatform.isDirectDistMac { return }
+        #endif
         guard let snapshot else { return }
         let preferredAuth = await preferredStoredLocalAuth()
         let localServerIds = snapshot.servers
@@ -790,6 +833,14 @@ final class AppModel {
         }
         await refreshSnapshot()
     }
+
+    #if targetEnvironment(macCatalyst)
+    private func installedMacCodexLoginError() -> NSError {
+        NSError(domain: "Learnfold.LocalCodex", code: 2, userInfo: [
+            NSLocalizedDescriptionKey: "Sign in to your installed Codex with `codex login`, then reconnect in Learnfold."
+        ])
+    }
+    #endif
 
     private func loadStoredLocalApiKey() async -> String? {
         do {
@@ -2254,6 +2305,7 @@ final class AppModel {
         key: ThreadKey,
         payload: AppComposerPayload,
         backgroundAgentName: String = "Codex",
+        backgroundContext: ContinuedTurnContext? = nil,
         keepsBackgroundAliveAcrossTurns: Bool = false,
         mayCreateBackgroundContinuation: Bool
     ) async throws -> AppTurnSubmissionReceipt {
@@ -2261,7 +2313,12 @@ final class AppModel {
             AppRuntimeController.shared.beginUserInitiatedTurn(
                 key: key,
                 appModel: self,
-                agentName: backgroundAgentName,
+                context: backgroundTurnContext(
+                    backgroundContext,
+                    agentName: backgroundAgentName,
+                    key: key,
+                    payload: payload
+                ),
                 keepsAliveAcrossTurns: keepsBackgroundAliveAcrossTurns
             )
         } else {
@@ -2284,6 +2341,25 @@ final class AppModel {
             lastError = error.localizedDescription
             throw error
         }
+    }
+
+    /// Callers without a specific job get a generic banner named by the
+    /// thread's explicit title or the learner's first typed line.
+    private func backgroundTurnContext(
+        _ context: ContinuedTurnContext?,
+        agentName: String,
+        key: ThreadKey,
+        payload: AppComposerPayload
+    ) -> ContinuedTurnContext {
+        var resolved = context ?? ContinuedTurnContext(
+            agentName: agentName,
+            intent: .generic(title: ContinuedTurnContext.genericTitle(
+                threadTitle: threadSnapshot(for: key)?.info.title,
+                typedText: payload.text
+            ))
+        )
+        resolved.agentName = agentName
+        return resolved
     }
 
     func hydrateThreadPermissions(for key: ThreadKey, appState: AppState) async -> ThreadKey? {

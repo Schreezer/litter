@@ -125,6 +125,7 @@ actor CourseDocumentRepository {
 
     private let service: NativeEditorMCPService
     private let courseRoot: URL
+    private var continuationControlDirectory: URL
     private let pendingEditsURL: URL
     private let autosaveDelay: Duration
     private let schedulesCloudSync: Bool
@@ -141,6 +142,7 @@ actor CourseDocumentRepository {
 #if DEBUG
     private var debugFlushFailures: [Duration] = []
     private var debugSuccessfulFlushDelays: [Duration] = []
+    private var debugContinuationApplyInterleaving: (@Sendable () async throws -> Void)?
 #endif
 
     private init(
@@ -155,6 +157,8 @@ actor CourseDocumentRepository {
         self.workspaceID = workspaceID
         self.service = service
         self.courseRoot = courseRoot
+        continuationControlDirectory = AppleCourseApprovalPolicy
+            .protectedMetadataDirectory(courseDirectory: courseRoot).deletingLastPathComponent()
         self.pendingEditsURL = pendingEditsURL
         self.autosaveDelay = autosaveDelay
         self.schedulesCloudSync = schedulesCloudSync
@@ -393,8 +397,28 @@ actor CourseDocumentRepository {
             workspace: try await workspaceSnapshot(),
             generationID: generationID,
             previousGenerationID: previousGenerationID,
-            version: version
+            version: version,
+            continuation: CourseContinuationSyncStore.export(
+                courseDirectory: courseRoot,
+                controlDirectory: continuationControlDirectory
+            )
         )
+    }
+
+    func configureContinuationControlDirectory(_ directory: URL) {
+        continuationControlDirectory = directory
+    }
+
+#if DEBUG
+    func configureDebugContinuationApplyInterleaving(_ operation: @escaping @Sendable () async throws -> Void) {
+        debugContinuationApplyInterleaving = operation
+    }
+#endif
+
+    /// Metadata writers have no SQLite mutation receipt. Queue by the complete
+    /// generation checksum after saving bookmarks, transcripts or practice.
+    func continuationDidChange() {
+        scheduleCloudSync()
     }
 
     func pendingSyncMutationReceipts(limit: Int = 256) async throws -> [LibraryMutationReceipt] {
@@ -414,17 +438,29 @@ actor CourseDocumentRepository {
         _ remoteSnapshot: CourseSyncWorkspaceSnapshot,
         baseSnapshot: CourseSyncWorkspaceSnapshot
     ) async throws -> CourseSyncRemoteApplyResult {
+        try await CourseWorkspaceSecurityGate.shared.withExclusiveAccess(workspaceID: workspaceID) {
+            try await self.applyRemoteSyncSnapshotWhileHoldingSecurityGate(remoteSnapshot, baseSnapshot: baseSnapshot)
+        }
+    }
+
+    private func applyRemoteSyncSnapshotWhileHoldingSecurityGate(
+        _ remoteSnapshot: CourseSyncWorkspaceSnapshot,
+        baseSnapshot: CourseSyncWorkspaceSnapshot
+    ) async throws -> CourseSyncRemoteApplyResult {
         guard remoteSnapshot.manifest.workspaceID == workspaceID,
               baseSnapshot.manifest.workspaceID == workspaceID else {
             throw CourseCloudSyncRepositoryError.workspaceMismatch
         }
+        _ = try remoteSnapshot.validatedWorkspace()
+        _ = try baseSnapshot.validatedWorkspace()
         try await flushPendingUserEdits()
         for attempt in 0..<4 {
             let versionedWorkspace = try await service.workspaceSnapshotWithGeneration()
             let localSnapshot = try CourseSyncWorkspaceSnapshot(
                 workspaceID: workspaceID,
                 workspace: versionedWorkspace.workspace,
-                generationID: "local-comparison"
+                generationID: "local-comparison",
+                continuation: CourseContinuationSyncStore.export(courseDirectory: courseRoot, controlDirectory: continuationControlDirectory)
             )
 
             if localSnapshot.checksum == remoteSnapshot.checksum {
@@ -441,6 +477,12 @@ actor CourseDocumentRepository {
             }
 
             let merged: PageWorkspace
+            let mergedContinuation = try CourseSyncContinuationMerger.merge(
+                base: baseSnapshot.continuation,
+                local: localSnapshot.continuation,
+                remote: remoteSnapshot.continuation
+            )
+            try mergedContinuation?.validate(workspaceID: workspaceID)
             if localSnapshot.checksum == baseSnapshot.checksum {
                 merged = try remoteSnapshot.validatedWorkspace()
             } else {
@@ -459,6 +501,18 @@ actor CourseDocumentRepository {
             } catch LibraryStoreError.workspaceGenerationConflict where attempt < 3 {
                 continue
             }
+#if DEBUG
+            if let interleaving = debugContinuationApplyInterleaving {
+                debugContinuationApplyInterleaving = nil
+                try await interleaving()
+            }
+#endif
+            let appliedContinuation = try CourseContinuationSyncStore.applyMergingConcurrentChanges(
+                mergedContinuation,
+                replacing: localSnapshot.continuation,
+                courseDirectory: courseRoot,
+                controlDirectory: continuationControlDirectory
+            )
             latestSnapshots.removeAll()
             let mergedChecksums = Dictionary(
                 uniqueKeysWithValues: try merged.pages.values.map {
@@ -478,7 +532,8 @@ actor CourseDocumentRepository {
                 workspace: merged,
                 generationID: remoteSnapshot.manifest.generationID,
                 previousGenerationID: remoteSnapshot.manifest.previousGenerationID,
-                version: localSnapshot.manifest.version.merged(with: remoteSnapshot.manifest.version)
+                version: localSnapshot.manifest.version.merged(with: remoteSnapshot.manifest.version),
+                continuation: appliedContinuation
             )
             return CourseSyncRemoteApplyResult(
                 changedPageIDs: changedPageIDs,
@@ -494,6 +549,15 @@ actor CourseDocumentRepository {
         _ remoteSnapshot: CourseSyncWorkspaceSnapshot,
         expectedLocalChecksum: String
     ) async throws {
+        try await CourseWorkspaceSecurityGate.shared.withExclusiveAccess(workspaceID: workspaceID) {
+            try await self.materializeRemoteSyncSnapshotWhileHoldingSecurityGate(remoteSnapshot, expectedLocalChecksum: expectedLocalChecksum)
+        }
+    }
+
+    private func materializeRemoteSyncSnapshotWhileHoldingSecurityGate(
+        _ remoteSnapshot: CourseSyncWorkspaceSnapshot,
+        expectedLocalChecksum: String
+    ) async throws {
         guard remoteSnapshot.manifest.workspaceID == workspaceID else {
             throw CourseCloudSyncRepositoryError.workspaceMismatch
         }
@@ -502,7 +566,8 @@ actor CourseDocumentRepository {
         let localSnapshot = try CourseSyncWorkspaceSnapshot(
             workspaceID: workspaceID,
             workspace: versionedWorkspace.workspace,
-            generationID: "materialization-check"
+            generationID: "materialization-check",
+            continuation: CourseContinuationSyncStore.export(courseDirectory: courseRoot, controlDirectory: continuationControlDirectory)
         )
         guard localSnapshot.checksum == expectedLocalChecksum else {
             throw CourseCloudSyncRepositoryError.localWorkspaceChanged
@@ -515,6 +580,12 @@ actor CourseDocumentRepository {
         } catch LibraryStoreError.workspaceGenerationConflict {
             throw CourseCloudSyncRepositoryError.localWorkspaceChanged
         }
+        _ = try CourseContinuationSyncStore.applyMergingConcurrentChanges(
+            remoteSnapshot.continuation,
+            replacing: localSnapshot.continuation,
+            courseDirectory: courseRoot,
+            controlDirectory: continuationControlDirectory
+        )
         latestSnapshots.removeAll()
         publish(pageID: nil, replacesDocument: true)
     }
@@ -1015,6 +1086,7 @@ actor CourseDocumentRepository {
             ),
             options: .atomic
         )
+        scheduleCloudSync()
     }
 
     func approvePlan(_ plan: CourseBrief) async throws {
@@ -1066,6 +1138,7 @@ actor CourseDocumentRepository {
             withIntermediateDirectories: true
         )
         try data.write(to: protectedApprovedURL, options: .atomic)
+        scheduleCloudSync()
     }
 
     private static func planNotApprovedResult() -> NativeEditorMCPToolResult {
@@ -1270,7 +1343,10 @@ actor CourseDocumentRepository {
             role: role.flatMap(CourseLearningNode.Role.init(rawValue:)),
             pageID: page.id,
             children: children,
-            originQuestion: page.document.root.data["course_origin_question"]?.stringValue
+            originQuestion: page.document.root.data["course_origin_question"]?.stringValue,
+            originAnchor: CourseExplorationAnchor(
+                propertyValue: page.document.root.data["course_origin_anchor"]?.stringValue
+            )
         )
     }
 }

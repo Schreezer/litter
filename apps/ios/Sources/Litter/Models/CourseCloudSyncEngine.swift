@@ -1,6 +1,9 @@
 import CloudKit
 import CryptoKit
 import Foundation
+#if targetEnvironment(macCatalyst)
+import Darwin
+#endif
 
 enum CourseCloudRecordType {
     static let workspaceGeneration = "LFWorkspaceGenerationV1"
@@ -32,6 +35,16 @@ enum CourseCloudSyncAvailability: Equatable, Sendable {
     case missingEntitlement
     case noAccount
     case failed(String)
+}
+
+enum CourseCloudSyncFailurePolicy {
+    static func isWorkspaceSpecific(_ error: Error) -> Bool {
+        error is CourseCloudSyncModelError
+            || error is CourseCloudSyncRepositoryError
+            || error is DecodingError
+            || error is EncodingError
+            || (error as NSError).domain == NSCocoaErrorDomain
+    }
 }
 
 enum CourseCloudSyncEngineError: LocalizedError {
@@ -75,10 +88,33 @@ enum CourseCloudEntitlement {
     static var isRuntimeCloudKitAvailable: Bool {
         #if targetEnvironment(simulator)
         false
+        #elseif targetEnvironment(macCatalyst)
+        // A local Catalyst build can advertise iCloud in Info.plist while its
+        // ad-hoc signature has no CloudKit entitlement. CKContainer raises an
+        // Objective-C exception in that case. Read the process signature first.
+        signedProcessHasCloudKitEntitlement()
         #else
         true
         #endif
     }
+
+    #if targetEnvironment(macCatalyst)
+    private static func signedProcessHasCloudKitEntitlement() -> Bool {
+        guard let security = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY) else { return false }
+        defer { dlclose(security) }
+        typealias CreateTask = @convention(c) (CFAllocator?) -> Unmanaged<CFTypeRef>?
+        typealias CopyEntitlement = @convention(c) (CFTypeRef, CFString, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> Unmanaged<CFTypeRef>?
+        guard let createSymbol = dlsym(security, "SecTaskCreateFromSelf"),
+              let copySymbol = dlsym(security, "SecTaskCopyValueForEntitlement") else { return false }
+        let create = unsafeBitCast(createSymbol, to: CreateTask.self)
+        let copy = unsafeBitCast(copySymbol, to: CopyEntitlement.self)
+        guard let task = create(nil)?.takeRetainedValue(),
+              let containers = copy(task, "com.apple.developer.icloud-container-identifiers" as CFString, nil)?.takeRetainedValue() as? [String],
+              containers.contains(containerIdentifier),
+              let services = copy(task, "com.apple.developer.icloud-services" as CFString, nil)?.takeRetainedValue() as? [String] else { return false }
+        return services.contains("CloudKit")
+    }
+    #endif
 
     static var isEnabled: Bool {
         Bundle.main.object(forInfoDictionaryKey: "LearnfoldCourseCloudSyncEnabled") as? Bool == true
@@ -107,6 +143,7 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
     private var bufferedCreatedAssetPaths: [String] = []
     private var fetchedBatchFailed = false
     private var workspacesBeingQueued: Set<String> = []
+    private var workspacesNeedingAnotherQueue: Set<String> = []
     private var delegateEventDepth = 0
     private var engineEpoch: UInt64 = 0
     private var lifecycleGeneration: UInt64 = 0
@@ -117,6 +154,19 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
     private var deferredSend: DeferredEngineContext?
     private var deferredEngineWorkerScheduled = false
     private(set) var availability: CourseCloudSyncAvailability = .missingEntitlement
+    private(set) var workspaceErrors: [String: String] = [:]
+
+    func workspaceError(workspaceID: String) -> String? {
+        workspaceErrors[workspaceID]
+    }
+
+    func recordWorkspaceQueueFailure(_ error: Error, workspaceID: String) {
+        if CourseCloudSyncFailurePolicy.isWorkspaceSpecific(error) {
+            workspaceErrors[workspaceID] = error.localizedDescription
+        } else {
+            availability = .failed(error.localizedDescription)
+        }
+    }
 
     init(
         container: CKContainer? = nil,
@@ -261,6 +311,21 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
         repository: CourseDocumentRepository,
         title: String? = nil
     ) async throws {
+        do {
+            try await queueWorkspaceGenerationContent(repository: repository, title: title)
+            workspaceErrors.removeValue(forKey: repository.workspaceID)
+        } catch {
+            if CourseCloudSyncFailurePolicy.isWorkspaceSpecific(error) {
+                workspaceErrors[repository.workspaceID] = error.localizedDescription
+            }
+            throw error
+        }
+    }
+
+    private func queueWorkspaceGenerationContent(
+        repository: CourseDocumentRepository,
+        title: String?
+    ) async throws {
         guard repository.allowsCloudSync else { return }
         guard let engine, let accountID, let stateStore else {
             throw CourseCloudSyncEngineError.notStarted
@@ -304,10 +369,11 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
             ancestorChecksum: ancestorChecksum
         )
         let receiptSeed = mutationReceipts.map(\.id).sorted().joined(separator: "\u{0}")
+        let causalSeed = try CourseSyncChecksum.value(for: mutationVersion.resultingVector)
         let generationID = String(
             Self.sha256(
                 Data(
-                    "\(workspaceID)\u{0}\(draft.checksum)\u{0}\(receiptSeed)\u{0}\(CourseCloudSyncSchema.version)".utf8
+                    "\(workspaceID)\u{0}\(draft.checksum)\u{0}\(receiptSeed)\u{0}\(causalSeed)\u{0}\(CourseCloudSyncSchema.version)".utf8
                 )
             ).prefix(32)
         )
@@ -320,6 +386,9 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
             ?? snapshot.items.first(where: { $0.id == snapshot.manifest.rootPageID })?.title
             ?? "Course"
         let payload = try Self.encoder.encode(snapshot)
+        guard payload.count <= 50 * 1024 * 1024 else {
+            throw CourseCloudSyncModelError.invalidContinuation("The complete course generation exceeds the 50 MB sync asset limit.")
+        }
         let generationBaseName = CourseSyncRecordName.generation(
             workspaceID: workspaceID,
             generationID: generationID
@@ -450,11 +519,40 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
     ) async {
         guard repository.allowsCloudSync, availability == .available else { return }
         let workspaceID = repository.workspaceID
-        guard !workspacesBeingQueued.contains(workspaceID) else { return }
+        guard !workspacesBeingQueued.contains(workspaceID) else {
+            workspacesNeedingAnotherQueue.insert(workspaceID)
+            return
+        }
         workspacesBeingQueued.insert(workspaceID)
-        defer { workspacesBeingQueued.remove(workspaceID) }
+        defer {
+            workspacesBeingQueued.remove(workspaceID)
+            if workspacesNeedingAnotherQueue.remove(workspaceID) != nil {
+                Task { await self.queueRepositoryChangesIfNeeded(repository: repository) }
+            }
+        }
         do {
-            guard !(try await repository.pendingSyncMutationReceipts()).isEmpty else { return }
+            guard let accountID, let stateStore else { return }
+            let draft = try await repository.exportSyncSnapshot(generationID: "metadata-change-probe")
+            let pending = try await stateStore.pendingOutbox(
+                accountID: accountID,
+                recordName: CourseSyncRecordName.course(workspaceID: workspaceID)
+            )
+            let pendingChecksum = try pending.flatMap { entry -> String? in
+                guard let payload = entry.payload else { return nil }
+                return try Self.decoder.decode(CourseCloudRecordEnvelope.self, from: payload)
+                    .fields["checksum"]
+            }
+            if pendingChecksum == draft.checksum {
+                workspaceErrors.removeValue(forKey: workspaceID)
+                return
+            }
+            let accepted = try await stateStore.cloudHead(accountID: accountID, workspaceID: workspaceID)
+            if pending == nil, accepted?.head.checksum == draft.checksum {
+                let receipts = try await repository.pendingSyncMutationReceipts(limit: 10_000)
+                try await repository.acknowledgeSyncMutationReceipts(ids: receipts.map(\.id))
+                workspaceErrors.removeValue(forKey: workspaceID)
+                return
+            }
             try await queueWorkspaceGeneration(repository: repository)
         } catch CourseCloudSyncEngineError.staleEngine,
                 CourseCloudSyncEngineError.accountQuarantined,
@@ -462,7 +560,7 @@ actor CourseCloudSyncEngine: CKSyncEngineDelegate {
             // A workspace owned by another iCloud account remains local and
             // must not disable sync for unrelated courses.
         } catch {
-            availability = .failed(error.localizedDescription)
+            recordWorkspaceQueueFailure(error, workspaceID: workspaceID)
         }
     }
 
@@ -1522,10 +1620,16 @@ struct CourseCloudFetchedRecordMetadata: Codable, Equatable, Sendable {
 final class CourseCloudSyncApplyBridge {
     static let shared = CourseCloudSyncApplyBridge()
 
-    private weak var store: CourseExperienceStore?
+    private final class StoreReference {
+        weak var store: CourseExperienceStore?
+        init(_ store: CourseExperienceStore) { self.store = store }
+    }
+
+    private var stores: [StoreReference] = []
 
     func register(store: CourseExperienceStore) {
-        self.store = store
+        stores.removeAll { $0.store == nil || $0.store === store }
+        stores.append(StoreReference(store))
         Task {
             await CourseCloudSyncEngine.shared.applyPendingFetchedChanges()
         }
@@ -1536,7 +1640,8 @@ final class CourseCloudSyncApplyBridge {
         base: CourseSyncWorkspaceSnapshot?,
         title: String
     ) async throws -> CourseDocumentRepository {
-        guard let store else { throw CourseCloudSyncEngineError.notStarted }
+        stores.removeAll { $0.store == nil }
+        guard let store = stores.last?.store else { throw CourseCloudSyncEngineError.notStarted }
         let workspaceID = snapshot.manifest.workspaceID
         let databaseURL = store.courseDatabaseURL(workspaceID: workspaceID)
         let existedBeforeSync = FileManager.default.fileExists(atPath: databaseURL.path)
@@ -1545,6 +1650,7 @@ final class CourseCloudSyncApplyBridge {
             databaseURL: databaseURL,
             rootTitle: title
         )
+        await repository.configureContinuationControlDirectory(store.courseControlDirectory(workspaceID: workspaceID))
 
         if let base {
             _ = try await repository.applyRemoteSyncSnapshot(snapshot, baseSnapshot: base)
@@ -1561,7 +1667,14 @@ final class CourseCloudSyncApplyBridge {
                 throw CourseCloudSyncEngineError.missingMergeBase(workspaceID)
             }
         }
-        await store.recoverReadyCourses()
+        // Each window observes its own Swift shell over the same persisted
+        // course. Refresh every registered shell that owns this directory.
+        for reference in stores {
+            guard let windowStore = reference.store,
+                  windowStore.courseDatabaseURL(workspaceID: workspaceID).standardizedFileURL == databaseURL.standardizedFileURL else { continue }
+            await windowStore.importCourseContinuation(workspaceID: workspaceID)
+            await windowStore.recoverReadyCourses()
+        }
         return repository
     }
 }

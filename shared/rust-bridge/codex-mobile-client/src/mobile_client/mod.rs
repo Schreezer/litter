@@ -14,9 +14,9 @@ use crate::alleycat::{
 use crate::discovery::{DiscoveredServer, DiscoveryConfig, DiscoveryService, MdnsSeed};
 use crate::session::connection::InProcessConfig;
 use crate::session::connection::{
-    RemoteSessionExtras, RuntimeRemoteSessionResource, ServerConfig, ServerEvent, ServerSession,
-    SlingshotReconnectTransport, SshReconnectTransport, connect_remote_client_over_slingshot,
-    remote_connect_args,
+    RemoteSessionExtras, RuntimeRemoteSessionResource, ServerConfig, ServerConnectionKind,
+    ServerEvent, ServerSession, SlingshotReconnectTransport, SshReconnectTransport,
+    connect_remote_client_over_slingshot, remote_connect_args,
 };
 use crate::session::events::{EventProcessor, UiEvent};
 use crate::slingshot_url::build_slingshot_connection_url;
@@ -1401,6 +1401,11 @@ impl MobileClient {
         config: ServerConfig,
         in_process: InProcessConfig,
     ) -> Result<String, TransportError> {
+        if config.connection_kind() != ServerConnectionKind::EmbeddedLocal {
+            return Err(TransportError::ConnectionFailed(
+                "embedded Codex cannot connect to an external server endpoint".to_string(),
+            ));
+        }
         let server_id = config.server_id.clone();
         if self.existing_active_session(server_id.as_str()).is_some() {
             info!("MobileClient: reusing existing local server session {server_id}");
@@ -1426,7 +1431,16 @@ impl MobileClient {
     /// Returns the `server_id` from the config on success.
     pub async fn connect_remote(&self, config: ServerConfig) -> Result<String, TransportError> {
         let server_id = config.server_id.clone();
-        if self.existing_active_session(server_id.as_str()).is_some() {
+        if self
+            .existing_active_session(server_id.as_str())
+            .is_some_and(|session| {
+                session.config().connection_kind() == config.connection_kind()
+                    && session.config().host == config.host
+                    && session.config().port == config.port
+                    && session.config().websocket_url == config.websocket_url
+                    && session.config().tls == config.tls
+            })
+        {
             info!("MobileClient: reusing existing remote server session {server_id}");
             return Ok(server_id);
         }
@@ -1439,9 +1453,43 @@ impl MobileClient {
             .insert(server_id.clone(), Arc::clone(&session));
         self.spawn_event_reader(server_id.clone(), Arc::clone(&session));
         self.spawn_health_reader(server_id.clone(), Arc::clone(&session));
-        self.spawn_post_connect_warmup(server_id.clone(), session);
+        if session.config().connection_kind() != ServerConnectionKind::HostLocal {
+            self.spawn_post_connect_warmup(server_id.clone(), session);
+        }
 
         info!("MobileClient: connected remote server {server_id}");
+        Ok(server_id)
+    }
+
+    /// Use installed host Codex while preserving local workspace semantics.
+    pub async fn connect_host_local(&self, config: ServerConfig) -> Result<String, TransportError> {
+        config.validate_host_local()?;
+        let server_id = self.connect_remote(config).await?;
+        let session = self
+            .get_session(&server_id)
+            .map_err(|_| TransportError::Disconnected)?;
+        // A host-local connection is not ready for course startup until its
+        // existing native account has been read into the canonical store.
+        // Detached warmup allowed Swift to mistake an unhydrated account for
+        // a signed-out installed Codex.
+        if let Err(error) = refresh_account_from_app_server(
+            Arc::clone(&session),
+            Arc::clone(&self.app_store),
+            Arc::clone(&self.sessions),
+            &server_id,
+        )
+        .await
+        {
+            if session_is_current(&self.sessions, &server_id, &session) {
+                self.disconnect_server(&server_id);
+            }
+            return Err(TransportError::ConnectionFailed(format!(
+                "failed to read installed Codex account: {error}"
+            )));
+        }
+        if !session_is_current(&self.sessions, &server_id, &session) {
+            return Err(TransportError::Disconnected);
+        }
         Ok(server_id)
     }
 
@@ -2968,6 +3016,14 @@ impl MobileClient {
         target.active_turn_id = None;
         reconcile_active_turn(Some(&existing), &mut target, &response.data);
         let active_turn_cleared = was_active && target.active_turn_id.is_none();
+        // The target is a copy of the local snapshot, so its status still
+        // says running; nothing in the turn list is.
+        if active_turn_cleared
+            && matches!(target.info.status, ThreadSummaryStatus::Active)
+            && active_turn_id_from_turns(&response.data).is_none()
+        {
+            target.info.status = ThreadSummaryStatus::Idle;
+        }
         if target.active_turn_id != existing.active_turn_id
             || target.info.status != existing.info.status
         {

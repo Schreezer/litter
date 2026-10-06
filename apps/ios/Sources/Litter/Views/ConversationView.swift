@@ -401,9 +401,15 @@ struct ConversationView: View {
 private extension AppThreadSnapshot {
     var serverId: String { key.serverId }
     var isSubagent: Bool {
-        info.parentThreadId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            && ((info.agentNickname?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-                || (info.agentRole?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false))
+        // Spelled out with locals: the chained optional form crashes the
+        // Swift 6.4 optimizer (SemanticARCOpts) in Release builds.
+        func hasText(_ value: String?) -> Bool {
+            guard let value else { return false }
+            return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let info = info
+        guard hasText(info.parentThreadId) else { return false }
+        return hasText(info.agentNickname) || hasText(info.agentRole)
     }
 
     var agentDisplayLabel: String? {
