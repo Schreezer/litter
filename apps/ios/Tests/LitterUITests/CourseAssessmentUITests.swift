@@ -323,8 +323,13 @@ final class CourseAssessmentUITests: XCTestCase {
         let reader = app.scrollViews.firstMatch
         XCTAssertTrue(reader.exists, app.debugDescription)
         XCTAssertTrue(hasFiniteArea(reader.frame), app.debugDescription)
-        if down { reader.swipeDown() }
-        else { reader.swipeUp() }
+        // A short drag at the reader's edge avoids nested text views and
+        // keeps small answer cards from overshooting the visible viewport.
+        let upper = reader.coordinate(withNormalizedOffset: CGVector(dx: 0.94, dy: 0.38))
+        let lower = reader.coordinate(withNormalizedOffset: CGVector(dx: 0.94, dy: 0.68))
+        let start = down ? upper : lower
+        let end = down ? lower : upper
+        start.press(forDuration: 0.05, thenDragTo: end)
     }
 
     @MainActor
