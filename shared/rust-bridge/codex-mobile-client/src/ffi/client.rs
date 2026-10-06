@@ -2828,6 +2828,7 @@ fn assessment_review_thread_params(
     upstream::ThreadStartParams {
         model,
         model_provider: None,
+        project_id: None,
         allow_provider_model_fallback: false,
         service_tier: None,
         cwd: Some("/".to_string()),
@@ -2940,6 +2941,10 @@ async fn perform_target_structured_response(
                         thread_id: id.clone(),
                         client_user_message_id: None,
                         input: vec![upstream::UserInput::Text { text: prompt.to_string(), text_elements: Vec::new() }],
+                        turn_trigger: None,
+                        tool_output: None,
+                        cyber_access_program: None,
+                        service_tier_for_turn: None,
                         responsesapi_client_metadata: None,
                         additional_context: None,
                         cwd: None,
