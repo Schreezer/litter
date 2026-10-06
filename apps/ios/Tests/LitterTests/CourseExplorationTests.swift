@@ -1,6 +1,9 @@
 import NativeEditorMCP
 import XCTest
 @testable import Litter
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 @MainActor
 final class CourseExplorationTests: XCTestCase {
@@ -188,6 +191,8 @@ final class CourseExplorationTests: XCTestCase {
         XCTAssertTrue(prompt.contains("It forks from the page ‘A’ (page ID: page-a)."))
         XCTAssertTrue(prompt.contains("zoom out"))
         XCTAssertTrue(prompt.contains("a specific properties.title"))
+        XCTAssertTrue(prompt.contains("learnfold_generate_lesson instead, use that tool, pass that specific title as its title argument"),
+                      "Apple runtimes name the page through the lesson tool.")
         XCTAssertTrue(prompt.contains("never create other pages"))
 
         let fallback = CourseExperienceStore.explorationGenerationPrompt(for: node, request: nil)
@@ -390,6 +395,191 @@ final class CourseExplorationTests: XCTestCase {
         XCTAssertFalse(CourseExplorationPolicy.isExplorationNode(id: "explore-x", role: .lesson))
         XCTAssertFalse(CourseExplorationPolicy.isExplorationNode(id: "why-bey", role: .explainer))
     }
+
+    func testAppleLessonTitleNamesOnlyExplorations() {
+        var plan = CourseReadingUITestHarness.approvablePlan(title: "Fork")
+        let exploration = PreparedCourseLessonTarget(
+            nodeID: "explore-abc123", title: "Deeper into Fork", pageID: "p", revision: 1,
+            courseRole: "explainer"
+        )
+        XCTAssertEqual(
+            AppleCourseLessonTitlePolicy.savedTitle(
+                "  Why the challenge\nmust be random ", target: exploration, approvedPlan: plan
+            ),
+            "Why the challenge must be random"
+        )
+        let tooLong = String(repeating: "a", count: CoursePlanHierarchyPolicy.maximumNodeTitleLength + 1)
+        for unusable in ["", "  \n ", tooLong] {
+            XCTAssertNil(
+                AppleCourseLessonTitlePolicy.savedTitle(unusable, target: exploration, approvedPlan: plan),
+                "An empty or overlong title keeps the placeholder."
+            )
+        }
+        XCTAssertNil(
+            AppleCourseLessonTitlePolicy.savedTitle("A new name", target: exploration, approvedPlan: nil),
+            "Without the approved plan Learnfold cannot prove the page is unplanned."
+        )
+
+        let planned = PreparedCourseLessonTarget(
+            nodeID: "foundation-practice", title: "Practice the Core Foundation", pageID: "p",
+            revision: 1, courseRole: "lesson"
+        )
+        XCTAssertNil(
+            AppleCourseLessonTitlePolicy.savedTitle("A new name", target: planned, approvedPlan: plan),
+            "A planned lesson keeps its approved title."
+        )
+
+        plan.learningPath?[0].children.append(CourseLearningNode(
+            id: "explore-planned", title: "A planned explainer", kind: .markdown,
+            status: .pendingGeneration, role: .explainer
+        ))
+        let plannedExplainer = PreparedCourseLessonTarget(
+            nodeID: "explore-planned", title: "A planned explainer", pageID: "p", revision: 1,
+            courseRole: "explainer"
+        )
+        XCTAssertNil(
+            AppleCourseLessonTitlePolicy.savedTitle("A new name", target: plannedExplainer, approvedPlan: plan),
+            "A page in the approved plan is never renamed, whatever its ID looks like."
+        )
+    }
+
+    func testAppleLessonContentDecodesAnOptionalTitle() throws {
+        let titled = try JSONDecoder().decode(
+            AppleCourseGeneratedLessonContent.self,
+            from: Data(#"{"title":"Why randomness matters","explanation":"E","example":"X","exercise":"Q"}"#.utf8)
+        )
+        XCTAssertEqual(titled.title, "Why randomness matters")
+        let untitled = try JSONDecoder().decode(
+            AppleCourseGeneratedLessonContent.self,
+            from: Data(#"{"explanation":"E","example":"X","exercise":"Q","visualization_html":""}"#.utf8)
+        )
+        XCTAssertEqual(untitled.title, "")
+    }
+
+    #if canImport(FoundationModels)
+    /// Drives the real Apple lesson tool against an approved course shell, as
+    /// a background generation does: the target comes from the persisted
+    /// current-lesson file and the write goes through the native editor.
+    func testAppleLessonToolSavesExplorationTitlesAndKeepsPlannedTitles() async throws {
+        guard #available(iOS 26.0, *) else {
+            throw XCTSkip("Foundation Models tools require iOS 26 or later.")
+        }
+        let suite = "CourseExplorationAppleTitle.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        // The Apple tools resolve courses under Documents/Apps/Courses.
+        let coursesRoot = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Apps", isDirectory: true)
+            .appendingPathComponent("Courses", isDirectory: true)
+        let workspaceID = "apple-exploration-title-\(UUID().uuidString.lowercased())"
+        let workspaceURL = coursesRoot.appendingPathComponent(workspaceID, isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: workspaceURL)
+            try? FileManager.default.removeItem(
+                at: AppleCourseApprovalPolicy.protectedMetadataDirectory(courseDirectory: workspaceURL)
+            )
+        }
+        let course = LearningCourse(
+            id: workspaceID, title: "Fork", subtitle: "", accentHex: "007AFF", progress: 0,
+            lessonCount: 1, duration: "", status: .ready, workspaceID: workspaceID,
+            agentRuntimeKind: CourseAgentProvider.appleOnDevice
+        )
+        let store = CourseExperienceStore(defaults: defaults, coursesRootURL: coursesRoot)
+        let repository = try await store.documentRepository(for: course)
+        let plan = CourseReadingUITestHarness.approvablePlan(title: "Fork")
+        try await repository.presentPlan(plan)
+        try await repository.approvePlan(plan)
+        // Persists the first planned lesson as the current Apple target.
+        let plannedTarget = try await store.prepareApprovedCourseShell(brief: plan, workspaceID: workspaceID)
+
+        func generate(_ arguments: [String: Any]) async throws -> String {
+            let tools = try AppleCourseToolFactory.tools(
+                providerID: CourseAgentProvider.appleOnDevice,
+                workspaceID: workspaceID,
+                mode: .generatingLesson,
+                lessonValidationRetryGate: AppleCourseLessonValidationRetryGate(),
+                onCoursePlan: { _ in XCTFail("Lesson generation never presents a plan.") }
+            )
+            let tool = try XCTUnwrap(tools.first { $0.name == "learnfold_generate_lesson" })
+            let json = String(decoding: try JSONSerialization.data(withJSONObject: arguments), as: UTF8.self)
+            return try await Self.callAppleTool(tool, argumentsJSON: json)
+        }
+        let lesson: [String: Any] = [
+            "explanation": "A random challenge stops a prover from preparing an answer in advance.",
+            "example": "Flip a coin before each round and ask for the matching proof.",
+            "exercise": "Explain what a cheating prover gains from a predictable challenge.",
+            "visualization_html": "",
+        ]
+
+        // A planned lesson keeps its approved title even when the model names it.
+        var renamedLesson = lesson
+        renamedLesson["title"] = "A title the model made up"
+        let plannedResult = try await generate(renamedLesson)
+        XCTAssertTrue(AppleCourseLessonToolResultPolicy.isAccepted(plannedResult), plannedResult)
+        let plannedPage = try await repository.pageSnapshot(id: plannedTarget.pageID)
+        XCTAssertEqual(plannedPage.title, "Practice the Core Foundation")
+        XCTAssertTrue(CourseExperienceStore.generatedLessonIsReady(plannedPage))
+
+        // An exploration takes the specific title the model chose.
+        let request = CourseExplorationRequest(
+            parentPageID: plannedTarget.pageID, parentTitle: plannedPage.title, direction: .deeper
+        )
+        let named = try await store.forkExploration(request, in: course)
+        XCTAssertEqual(named.title, request.placeholderTitle)
+        try await store.persistAppleGenerationTarget(for: named, workspaceID: workspaceID)
+        var titledLesson = lesson
+        titledLesson["title"] = "  Why the challenge must be random "
+        let namedResult = try await generate(titledLesson)
+        XCTAssertTrue(AppleCourseLessonToolResultPolicy.isAccepted(namedResult), namedResult)
+        let namedPage = try await repository.pageSnapshot(id: try XCTUnwrap(named.pageID))
+        XCTAssertEqual(namedPage.title, "Why the challenge must be random")
+        XCTAssertTrue(CourseExperienceStore.generatedLessonIsReady(namedPage))
+        XCTAssertEqual(namedPage.document.root.data["course_node_id"]?.stringValue, named.id)
+        XCTAssertEqual(namedPage.document.root.data["course_role"]?.stringValue, "explainer")
+
+        // Rewriting a finished exploration keeps the title it already has.
+        try await store.persistAppleGenerationTarget(for: named, workspaceID: workspaceID)
+        var retitledLesson = lesson
+        retitledLesson["title"] = "A later rename"
+        let rewriteResult = try await generate(retitledLesson)
+        XCTAssertTrue(AppleCourseLessonToolResultPolicy.isAccepted(rewriteResult), rewriteResult)
+        let rewrittenPage = try await repository.pageSnapshot(id: try XCTUnwrap(named.pageID))
+        XCTAssertEqual(rewrittenPage.title, "Why the challenge must be random")
+        XCTAssertTrue(CourseExperienceStore.generatedLessonIsReady(rewrittenPage))
+
+        // Without a usable title the exploration keeps its placeholder.
+        for title in [nil, "   "] as [String?] {
+            let unnamed = try await store.forkExploration(request, in: course)
+            try await store.persistAppleGenerationTarget(for: unnamed, workspaceID: workspaceID)
+            var untitledLesson = lesson
+            if let title { untitledLesson["title"] = title }
+            let unnamedResult = try await generate(untitledLesson)
+            XCTAssertTrue(AppleCourseLessonToolResultPolicy.isAccepted(unnamedResult), unnamedResult)
+            let unnamedPage = try await repository.pageSnapshot(id: try XCTUnwrap(unnamed.pageID))
+            XCTAssertEqual(unnamedPage.title, request.placeholderTitle)
+            XCTAssertTrue(CourseExperienceStore.generatedLessonIsReady(unnamedPage))
+        }
+
+        let outline = try await repository.outline()
+        XCTAssertEqual(
+            CourseExplorationMap.node(withID: named.id, in: outline.learningPages)?.title,
+            "Why the challenge must be random"
+        )
+        XCTAssertEqual(
+            CourseExplorationMap.node(withID: plannedTarget.nodeID, in: outline.learningPages)?.title,
+            "Practice the Core Foundation"
+        )
+    }
+
+    @available(iOS 26.0, *)
+    nonisolated private static func callAppleTool<T: Tool>(
+        _ tool: T,
+        argumentsJSON: String
+    ) async throws -> String {
+        let output = try await tool.call(arguments: try T.Arguments(GeneratedContent(json: argumentsJSON)))
+        return try XCTUnwrap(output as? String)
+    }
+    #endif
 
     // MARK: - Fixtures
 

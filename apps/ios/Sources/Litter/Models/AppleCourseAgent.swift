@@ -509,11 +509,17 @@ enum AppleCoursePlanValidator {
         let namedNarrativeFields = [
             ("summary", brief.summary),
             ("outcome", brief.outcome),
-            ("starting_point", brief.startingPoint),
-            ("focus_gap", brief.focusGap),
         ]
         if let field = namedNarrativeFields.first(where: { !isNaturalLanguage($0.1) })?.0 {
             return "\(field) must be natural language of at least two words, not a serialized schema fragment"
+        }
+        // A learner's level or gap is often one honest word, such as "beginner".
+        let learnerFields = [
+            ("starting_point", brief.startingPoint),
+            ("focus_gap", brief.focusGap),
+        ]
+        if let field = learnerFields.first(where: { !isNaturalLanguage($0.1, minimumWords: 1) })?.0 {
+            return "\(field) must be natural language, not a serialized schema fragment"
         }
         if !isNaturalLanguage(brief.estimatedDuration, minimumWords: 1) {
             return "estimated_duration must be natural language, not a serialized schema fragment"
@@ -569,22 +575,44 @@ struct AppleCourseGeneratedLessonContent: Decodable, Equatable, Sendable {
     let example: String
     let exercise: String
     let visualizationHTML: String
+    /// The model's name for an exploration page. Planned pages ignore it.
+    let title: String
+    /// One multiple-choice understanding check. Learnfold writes the reserved
+    /// assessment fence itself, because small models garble its JSON.
+    let checkQuestion: String
+    let checkOptions: [String]
+    let checkAnswer: String
+    let checkExplanation: String
 
     init(
         explanation: String,
         example: String,
         exercise: String,
-        visualizationHTML: String = ""
+        visualizationHTML: String = "",
+        title: String = "",
+        checkQuestion: String = "",
+        checkOptions: [String] = [],
+        checkAnswer: String = "",
+        checkExplanation: String = ""
     ) {
         self.explanation = explanation
         self.example = example
         self.exercise = exercise
         self.visualizationHTML = visualizationHTML
+        self.title = title
+        self.checkQuestion = checkQuestion
+        self.checkOptions = checkOptions
+        self.checkAnswer = checkAnswer
+        self.checkExplanation = checkExplanation
     }
 
     private enum CodingKeys: String, CodingKey {
-        case explanation, example, exercise
+        case explanation, example, exercise, title
         case visualizationHTML = "visualization_html"
+        case checkQuestion = "check_question"
+        case checkOptions = "check_options"
+        case checkAnswer = "check_answer"
+        case checkExplanation = "check_explanation"
     }
 
     init(from decoder: Decoder) throws {
@@ -596,6 +624,45 @@ struct AppleCourseGeneratedLessonContent: Decodable, Equatable, Sendable {
             String.self,
             forKey: .visualizationHTML
         ) ?? ""
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        checkQuestion = try container.decodeIfPresent(String.self, forKey: .checkQuestion) ?? ""
+        checkOptions = try container.decodeIfPresent([String].self, forKey: .checkOptions) ?? []
+        checkAnswer = try container.decodeIfPresent(String.self, forKey: .checkAnswer) ?? ""
+        checkExplanation = try container.decodeIfPresent(
+            String.self,
+            forKey: .checkExplanation
+        ) ?? ""
+    }
+}
+
+/// Explorations are named by the agent that writes them, as on every other
+/// runtime. Planned pages keep the title the learner approved.
+enum AppleCourseLessonTitlePolicy {
+    static func savedTitle(
+        _ proposedTitle: String,
+        target: PreparedCourseLessonTarget,
+        approvedPlan: CourseBrief?
+    ) -> String? {
+        let role = target.courseRole.flatMap {
+            CourseLearningNode.Role(
+                rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            )
+        }
+        guard CourseExplorationPolicy.isExplorationNode(id: target.nodeID, role: role),
+              let approvedPlan,
+              !CoursePlanHierarchyPolicy.outlineEntries(for: approvedPlan)
+                  .contains(where: { $0.id == target.nodeID }) else {
+            return nil
+        }
+        let title = proposedTitle
+            .split(whereSeparator: \.isNewline)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces)
+        guard !title.isEmpty,
+              title.count <= CoursePlanHierarchyPolicy.maximumNodeTitleLength else {
+            return nil
+        }
+        return title
     }
 }
 
@@ -1085,8 +1152,120 @@ enum AppleCourseLessonContentPolicy {
 
         ## Exercise
 
-        \(content.exercise)
+        \(AppleCourseLessonCheckPolicy.exerciseProse(content.exercise))
+        \(AppleCourseLessonCheckPolicy.assessmentFence(for: content).map { "\n\($0)" } ?? "")
         """
+    }
+}
+
+/// On-device lesson turns only write one page through a structured tool,
+/// whose field descriptions carry the page format and assessment rules.
+/// The full course-agent instructions would not leave room for the lesson
+/// inside the on-device context window.
+enum AppleCourseLessonTurnPolicy {
+    static func writesOnlyLessons(providerID: String, toolMode: AppleCourseToolMode) -> Bool {
+        providerID == CourseAgentProvider.appleOnDevice
+            && (toolMode == .generatingLesson || toolMode == .appendingLesson)
+    }
+
+    static let instructions = """
+    You are Learnfold’s course agent, writing one page of an approved course for a curious \
+    learner on a phone. Be accurate, concrete, and concise, and fit the learner’s level. The \
+    approved plan is only a suggested route: an exploration page may follow any rabbit hole. \
+    Fill every field of the lesson tool as its description asks. When dynamic behavior, \
+    spatial relationships, a process, or changing values would be easier to understand \
+    visually, put one compact self-contained HTML/CSS/JavaScript visualization in \
+    visualization_html that fits a phone width and uses no network requests or external \
+    resources; return an empty string when prose is clearer. Never claim a page was saved \
+    until the tool returns success.
+    """
+
+    /// The lesson tool's exercise and check fields already carry the
+    /// assessment rules, so on-device turns drop the prompt's long copy.
+    static func prompt(
+        _ learnerPrompt: String,
+        providerID: String,
+        toolMode: AppleCourseToolMode
+    ) -> String {
+        guard writesOnlyLessons(providerID: providerID, toolMode: toolMode) else {
+            return learnerPrompt
+        }
+        return learnerPrompt.replacingOccurrences(
+            of: CourseAssessmentAuthoring.authoringInstructions,
+            with: ""
+        )
+    }
+}
+
+/// Builds the lesson's understanding check from plain structured fields.
+enum AppleCourseLessonCheckPolicy {
+    static let checkID = "understanding-check"
+
+    /// The model sometimes writes its own check as JSON in the exercise text;
+    /// drop that rather than show raw data, since the check has its own fields.
+    static func exerciseProse(_ exercise: String) -> String {
+        let trimmed = exercise.trimmingCharacters(in: .whitespacesAndNewlines)
+        let looksLikeData = trimmed.hasPrefix("{")
+            || trimmed.hasPrefix("[")
+            || trimmed.contains("```")
+            || trimmed.contains("\"version\"")
+            || trimmed.contains("&quot;")
+        return looksLikeData ? "" : trimmed
+    }
+
+    static func assessmentFence(for content: AppleCourseGeneratedLessonContent) -> String? {
+        func clean(_ text: String) -> String {
+            text.split(whereSeparator: \.isNewline).joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        func normalized(_ text: String) -> String {
+            clean(text).lowercased().trimmingCharacters(in: .punctuationCharacters)
+        }
+        let question = clean(content.checkQuestion)
+        let explanation = clean(content.checkExplanation)
+        var options: [String] = []
+        for option in content.checkOptions.map(clean) where !option.isEmpty
+            && !options.contains(where: { normalized($0) == normalized(option) }) {
+            options.append(option)
+        }
+        options = Array(options.prefix(5))
+        guard !question.isEmpty, !explanation.isEmpty, options.count >= 2 else { return nil }
+        let answer = clean(content.checkAnswer)
+        func containedIndex() -> Int? {
+            let key = normalized(answer)
+            guard !key.isEmpty else { return nil }
+            let matches = options.indices.filter {
+                let option = normalized(options[$0])
+                return option.contains(key) || key.contains(option)
+            }
+            return matches.count == 1 ? matches[0] : nil
+        }
+        let answerIndex = options.firstIndex { normalized($0) == normalized(answer) }
+            // Small models sometimes paraphrase the choice a little, or answer
+            // with its number or letter.
+            ?? (answer.count > 1 ? containedIndex() : nil)
+            ?? Int(answer).flatMap { (1...options.count).contains($0) ? $0 - 1 : nil }
+            ?? answer.uppercased().first.flatMap { letter in
+                answer.count == 1 ? "ABCDE".firstIndex(of: letter)
+                    .map { "ABCDE".distance(from: "ABCDE".startIndex, to: $0) }
+                    .flatMap { $0 < options.count ? $0 : nil } : nil
+            }
+        guard let answerIndex else { return nil }
+        let object: [String: Any] = [
+            "version": 1,
+            "id": checkID,
+            "kind": "multiple_choice",
+            "title": "Check your understanding",
+            "prompt": question,
+            "options": options.enumerated().map { ["id": "option-\($0.offset + 1)", "text": $0.element] },
+            "answer": ["option_id": "option-\(answerIndex + 1)", "explanation": explanation],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+            return nil
+        }
+        let body = String(decoding: data, as: UTF8.self)
+        guard parseCourseAssessmentBlock(body: body).assessment != nil else { return nil }
+        return "```learnfold-assessment\n\(body)\n```"
     }
 }
 
@@ -1111,6 +1290,15 @@ enum AppleCourseGenerationSchemaOrdering {
         "chapters",
         "arguments_json",
         "plan",
+        // Lesson fields, in the order a teacher writes them.
+        "explanation",
+        "example",
+        "exercise",
+        "check_question",
+        "check_options",
+        "check_answer",
+        "check_explanation",
+        "visualization_html",
     ]
 
     static func orderedKeys(in properties: [String: [String: Any]]) -> [String] {
@@ -2486,14 +2674,28 @@ enum AppleCourseGroupedPlanProjection {
             throw invalid("the requested turn requires exactly \(exactTotalNodes) total nodes")
         }
 
-        var seenIDs: Set<String> = []
-        func claimID(_ id: String) throws {
-            guard seenIDs.insert(id).inserted else {
+        // A first plan's nodes must also avoid the plan ID and the reserved
+        // context pages, so those count as taken from the start.
+        var seenIDs: Set<String> = grouped.revision == 1
+            ? CoursePlanHierarchyPolicy.reservedContextNodeIDs.union([grouped.planID])
+            : []
+        func claimID(_ id: String) throws -> String {
+            if seenIDs.insert(id).inserted { return id }
+            // A first plan has no earlier IDs to keep stable, so a repeated ID
+            // is the model's slip: the later node gets its own. Revisions must
+            // keep their IDs, so they still reject it.
+            guard grouped.revision == 1 else {
                 throw invalid("the grouped plan contains a duplicate stable node ID")
+            }
+            var suffix = 2
+            while true {
+                let candidate = "\(id.prefix(120))-\(suffix)"
+                if seenIDs.insert(candidate).inserted { return candidate }
+                suffix += 1
             }
         }
         func projectLeaf(_ leaf: AppleCourseGroupedLeaf) throws -> CourseLearningNode {
-            try claimID(leaf.id)
+            let id = try claimID(leaf.id)
             guard
                 !leaf.role.isFolder,
                 contract.allowedLeafRoles.contains(leaf.role)
@@ -2501,7 +2703,7 @@ enum AppleCourseGroupedPlanProjection {
                 throw invalid("leaf nodes must use lesson, module, or explainer role")
             }
             return CourseLearningNode(
-                id: leaf.id,
+                id: id,
                 title: leaf.title,
                 kind: .markdown,
                 status: .pendingGeneration,
@@ -2516,9 +2718,9 @@ enum AppleCourseGroupedPlanProjection {
                 guard contract.allowedChildVariants.contains(.leaf), !role.isFolder else {
                     throw invalid("chapter leaves must use lesson, module, or explainer role")
                 }
-                try claimID(child.id)
+                let id = try claimID(child.id)
                 return CourseLearningNode(
-                    id: child.id,
+                    id: id,
                     title: child.title,
                     kind: .markdown,
                     status: .pendingGeneration,
@@ -2536,9 +2738,9 @@ enum AppleCourseGroupedPlanProjection {
                         "every subchapter needs \(contract.minimumSubchapterChildren) to \(contract.maximumSubchapterChildren) leaf children"
                     )
                 }
-                try claimID(child.id)
+                let id = try claimID(child.id)
                 return CourseLearningNode(
-                    id: child.id,
+                    id: id,
                     title: child.title,
                     kind: .folder,
                     status: .pendingGeneration,
@@ -2563,15 +2765,15 @@ enum AppleCourseGroupedPlanProjection {
                     "every chapter needs \(contract.minimumChapterChildren) to \(contract.maximumChapterChildren) direct children"
                 )
             }
-            try claimID(chapter.id)
+            let chapterID = try claimID(chapter.id)
             chapters.append(CourseChapter(
-                id: chapter.id,
+                id: chapterID,
                 title: chapter.title,
                 objective: chapter.objective,
                 deliverables: chapter.deliverables
             ))
             learningPath.append(CourseLearningNode(
-                id: chapter.id,
+                id: chapterID,
                 title: chapter.title,
                 kind: .folder,
                 status: .pendingGeneration,
@@ -3454,9 +3656,17 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                 let toolModeChanged = state.toolMode.map { $0 != toolMode } ?? false
                 let contextIsFull: Bool
                 let planningContractChanged: Bool
+                var dropsPreviousPageWrite = false
                 if providerChanged || toolModeChanged {
                     contextIsFull = false
                     planningContractChanged = false
+                } else if AppleCourseLessonTurnPolicy.writesOnlyLessons(providerID: providerID, toolMode: toolMode) {
+                    // Each on-device page write is self-contained. Carrying the
+                    // previous write's tool call makes the small model copy
+                    // that page instead of writing the new one.
+                    contextIsFull = false
+                    planningContractChanged = false
+                    dropsPreviousPageWrite = true
                 } else if
                     providerID == CourseAgentProvider.appleOnDevice,
                     toolMode == .planning
@@ -3559,6 +3769,10 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     state.compactedSummary = summary
                     state.transcript = nil
                     preselectedPlanningProfile = nil
+                    liveSessionStore().sessions[sessionID] = nil
+                    try saveState(state, sessionID: sessionID, workspaceID: workspaceID)
+                } else if dropsPreviousPageWrite {
+                    state.transcript = nil
                     liveSessionStore().sessions[sessionID] = nil
                     try saveState(state, sessionID: sessionID, workspaceID: workspaceID)
                 }
@@ -4917,7 +5131,7 @@ private extension SystemAppleCourseAgentRuntime {
     }
 
     static func instructions(
-        providerID _: String,
+        providerID: String,
         workspaceID: String? = nil,
         compactedSummary: String?,
         toolMode: AppleCourseToolMode,
@@ -4973,7 +5187,9 @@ private extension SystemAppleCourseAgentRuntime {
             """
         }
         let baseInstructions = """
-        \(appleInstructions)
+        \(AppleCourseLessonTurnPolicy.writesOnlyLessons(providerID: providerID, toolMode: toolMode)
+            ? AppleCourseLessonTurnPolicy.instructions
+            : appleInstructions)
 
         \(toolInstructions)
         """
@@ -5161,8 +5377,7 @@ private extension SystemAppleCourseAgentRuntime {
         semantic controls and an aria-live result, fit a phone width, make the first frame useful, \
         and use no network requests, external resources, external links, host bridges, infinite \
         animation, Markdown fences, or html, head, or body tags. Return an empty string when prose, \
-        a table, or a formula is clearer. Give every generated lesson two or three short \
-        follow_up_questions a curious learner might ask next about that lesson. \
+        a table, or a formula is clearer. \
         \(CourseAssessmentAuthoring.authoringInstructions)
         \(courseHierarchyInstructions) For a selected-passage question, \
         autonomously choose the \
@@ -5177,7 +5392,7 @@ private extension SystemAppleCourseAgentRuntime {
 
     static func runtimePrompt(
         for learnerPrompt: String,
-        providerID _: String,
+        providerID: String,
         toolMode: AppleCourseToolMode,
         planningProfile: AppleCoursePlanningProfile = .full,
         planningContract: AppleCoursePlanningSchemaContract? = nil
@@ -5192,7 +5407,11 @@ private extension SystemAppleCourseAgentRuntime {
         case .discussion, .editing:
             return learnerPrompt
         case .generatingLesson, .appendingLesson:
-            return learnerPrompt
+            return AppleCourseLessonTurnPolicy.prompt(
+                learnerPrompt,
+                providerID: providerID,
+                toolMode: toolMode
+            )
         case .full:
             return """
             \(learnerPrompt)
@@ -5471,11 +5690,17 @@ enum AppleCourseToolFactory {
                     workspaceID: workspaceID,
                     boundTarget: lessonTarget
                 )
+                let approvedPlan = AppleCourseApprovalPolicy.approvedPlan(
+                    courseDirectory: courseDirectory(workspaceID: workspaceID)
+                )
                 let binding = AppleCourseLessonSemanticRequirementPolicy.binding(
-                    approvedPlan: AppleCourseApprovalPolicy.approvedPlan(
-                        courseDirectory: courseDirectory(workspaceID: workspaceID)
-                    ),
+                    approvedPlan: approvedPlan,
                     target: target
+                )
+                let title = AppleCourseLessonTitlePolicy.savedTitle(
+                    generated.title,
+                    target: target,
+                    approvedPlan: approvedPlan
                 )
                 let validationKey = lessonValidationKey(target: target)
                 return try await lessonValidationBoundary.invoke(
@@ -5492,7 +5717,8 @@ enum AppleCourseToolFactory {
                                 exampleKind: validationContext.exampleKind
                             ),
                             mode: "replace",
-                            markGenerated: true
+                            markGenerated: true,
+                            title: title
                         ),
                         workspaceID: workspaceID,
                         target: target,
@@ -5559,7 +5785,7 @@ enum AppleCourseToolFactory {
                 stage: .decode,
                 diagnosticReason: error.localizedDescription
             )
-            logRejectedTopology(nil, stage: rejection.stage, profile: profile)
+            logRejectedTopology(nil, stage: rejection.stage, profile: profile, reason: rejection.diagnosticReason)
             throw AppleCourseAgentError.toolFailed(rejection.userMessage)
         }
         if let issue = profile.issue(in: grouped) {
@@ -5567,7 +5793,7 @@ enum AppleCourseToolFactory {
                 stage: .profile,
                 diagnosticReason: issue
             )
-            logRejectedTopology(grouped.topology, stage: rejection.stage, profile: profile)
+            logRejectedTopology(grouped.topology, stage: rejection.stage, profile: profile, reason: rejection.diagnosticReason)
             throw AppleCourseAgentError.toolFailed(rejection.userMessage)
         }
 
@@ -5582,7 +5808,7 @@ enum AppleCourseToolFactory {
                 stage: .projection,
                 diagnosticReason: error.localizedDescription
             )
-            logRejectedTopology(grouped.topology, stage: rejection.stage, profile: profile)
+            logRejectedTopology(grouped.topology, stage: rejection.stage, profile: profile, reason: rejection.diagnosticReason)
             throw AppleCourseAgentError.toolFailed(rejection.userMessage)
         }
 
@@ -5599,7 +5825,7 @@ enum AppleCourseToolFactory {
                 stage: .transition,
                 diagnosticReason: error.localizedDescription
             )
-            logRejectedTopology(grouped.topology, stage: rejection.stage, profile: profile)
+            logRejectedTopology(grouped.topology, stage: rejection.stage, profile: profile, reason: rejection.diagnosticReason)
             throw AppleCourseAgentError.toolFailed(rejection.userMessage)
         }
     }
@@ -5607,7 +5833,8 @@ enum AppleCourseToolFactory {
     private static func logRejectedTopology(
         _ topology: AppleCourseGroupedTopology?,
         stage: AppleCoursePlanningRejectionStage,
-        profile: AppleCoursePlanningProfile
+        profile: AppleCoursePlanningProfile,
+        reason: String? = nil
     ) {
         var fields = topology?.redactedLogFields ?? [
             "topology_root_count": -1,
@@ -5619,6 +5846,8 @@ enum AppleCourseToolFactory {
         ]
         fields["planning_profile"] = profile.rawValue
         fields["rejection_stage"] = stage.rawValue
+        // Validator reasons are fixed rule text, so they are safe to log.
+        if let reason { fields["rejection_reason"] = reason }
         LLog.warn(
             "AppleCourseAgent",
             "course plan rejected before presentation",
@@ -5649,6 +5878,8 @@ enum AppleCourseToolFactory {
         let markdown: String
         let mode: String
         let markGenerated: Bool
+        /// Saved with the generated status; only explorations carry one.
+        let title: String?
     }
 
     static func appendLessonSection(
@@ -5675,7 +5906,8 @@ enum AppleCourseToolFactory {
                     \(body)
                     """,
                     mode: "append",
-                    markGenerated: false
+                    markGenerated: false,
+                    title: nil
                 ),
                 workspaceID: workspaceID,
                 target: target,
@@ -5767,6 +5999,12 @@ enum AppleCourseToolFactory {
             "course_role": target.courseRole ?? "lesson",
         ]
         properties["generation_status"] = "generated"
+        // Only a fresh placeholder takes the model's name, so rewriting a
+        // finished exploration never discards a title the learner kept or set.
+        if let title = write.title,
+           fetchResult.generationStatus == CourseLearningNode.GenerationStatus.pendingGeneration.rawValue {
+            properties["title"] = title
+        }
         let finalResult = try await executeRawEditorAction(
             operation: "native-editor-update-page",
             arguments: [
@@ -5797,6 +6035,7 @@ enum AppleCourseToolFactory {
         let pageID: String?
         let courseNodeID: String?
         let courseRole: String?
+        let generationStatus: String?
     }
 
     private static func executeRawEditorAction(
@@ -5824,7 +6063,8 @@ enum AppleCourseToolFactory {
             revision: revision,
             pageID: object?["id"] as? String,
             courseNodeID: courseMetadata?["node_id"] as? String,
-            courseRole: courseMetadata?["role"] as? String
+            courseRole: courseMetadata?["role"] as? String,
+            generationStatus: courseMetadata?["generation_status"] as? String
         )
     }
 
@@ -5942,13 +6182,18 @@ enum AppleCourseToolFactory {
         )
     }
 
-    private static func generateLessonSpec(
+    static func generateLessonSpec(
         exampleKind: CourseLessonExampleKind
     ) throws -> AppDynamicToolSpec {
         let root: [String: Any] = [
             "type": "object",
             "additionalProperties": false,
             "properties": [
+                "title": [
+                    "type": "string",
+                    "maxLength": CoursePlanHierarchyPolicy.maximumNodeTitleLength,
+                    "description": "A short, specific title naming the idea this page teaches. For a planned lesson, repeat its planned title; it is kept as approved.",
+                ],
                 "explanation": [
                     "type": "string",
                     "description": "Concise beginner explanation of the lesson concept. Use short two- or three-sentence paragraphs separated by blank lines; omit the Explanation heading because Learnfold adds it.",
@@ -5962,7 +6207,26 @@ enum AppleCourseToolFactory {
                 ],
                 "exercise": [
                     "type": "string",
-                    "description": CourseAssessmentAuthoring.exerciseSchemaDescription,
+                    "description": "One short practice task in plain prose that applies this page. No JSON, code fences, or answer key.",
+                ],
+                "check_question": [
+                    "type": "string",
+                    "description": "One multiple-choice quiz question about an idea this page explains. Ask about the subject itself, never about the learner.",
+                ],
+                "check_options": [
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 4,
+                    "items": ["type": "string"],
+                    "description": "Two to four distinct answer choices in plain text.",
+                ],
+                "check_answer": [
+                    "type": "string",
+                    "description": "The exact text of the one correct choice.",
+                ],
+                "check_explanation": [
+                    "type": "string",
+                    "description": "One or two sentences explaining why that choice is correct, using this page.",
                 ],
                 "visualization_html": [
                     "type": "string",
@@ -5970,9 +6234,14 @@ enum AppleCourseToolFactory {
                 ],
             ],
             "required": [
+                "title",
                 "explanation",
                 "example",
                 "exercise",
+                "check_question",
+                "check_options",
+                "check_answer",
+                "check_explanation",
                 "visualization_html",
             ],
         ]

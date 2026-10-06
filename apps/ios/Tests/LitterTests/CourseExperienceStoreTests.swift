@@ -3719,12 +3719,23 @@ final class CourseExperienceStoreTests: XCTestCase {
             ]
         )
 
+        // One honest word is a fine learner level or gap.
+        XCTAssertNil(AppleCoursePlanValidator.issue(in: plan))
+        plan.startingPoint = "beginner"
+        XCTAssertNil(AppleCoursePlanValidator.issue(in: plan))
+
+        plan.focusGap = ",title:"
         XCTAssertEqual(
             AppleCoursePlanValidator.issue(in: plan),
-            "focus_gap must be natural language of at least two words, not a serialized schema fragment"
+            "focus_gap must be natural language, not a serialized schema fragment"
         )
-
         plan.focusGap = "Needs rigorous convexity math."
+        plan.summary = "Bonds"
+        XCTAssertEqual(
+            AppleCoursePlanValidator.issue(in: plan),
+            "summary must be natural language of at least two words, not a serialized schema fragment"
+        )
+        plan.summary = "Analyst-level bond math."
         XCTAssertNil(AppleCoursePlanValidator.issue(in: plan))
 
         plan.chapters[0].deliverables = [",title:"]
@@ -4953,6 +4964,81 @@ final class CourseExperienceStoreTests: XCTestCase {
         }
     }
 
+    func testAppleLessonCheckIsBuiltFromPlainFieldsAndValidated() throws {
+        func content(answer: String, exercise: String = "Explain it in your own words.") -> AppleCourseGeneratedLessonContent {
+            AppleCourseGeneratedLessonContent(
+                explanation: "Memory cells remember a pathogen.",
+                example: "A booster refreshes that memory.",
+                exercise: exercise,
+                checkQuestion: "What do memory cells do?",
+                checkOptions: ["Remember a pathogen", "Digest food", "Remember a pathogen "],
+                checkAnswer: answer,
+                checkExplanation: "The page says memory cells remember a pathogen."
+            )
+        }
+        for answer in ["remember a pathogen.", "1", "A", "They remember a pathogen"] {
+            let fence = try XCTUnwrap(AppleCourseLessonCheckPolicy.assessmentFence(for: content(answer: answer)), answer)
+            let body = fence
+                .replacingOccurrences(of: "```learnfold-assessment\n", with: "")
+                .replacingOccurrences(of: "\n```", with: "")
+            let assessment = try XCTUnwrap(parseCourseAssessmentBlock(body: body).assessment)
+            XCTAssertEqual(assessment.options.map(\.text), ["Remember a pathogen", "Digest food"])
+            XCTAssertEqual(assessment.answer?.optionId, "option-1")
+        }
+        XCTAssertNil(AppleCourseLessonCheckPolicy.assessmentFence(for: content(answer: "Something else")))
+        XCTAssertNil(AppleCourseLessonCheckPolicy.assessmentFence(for: content(answer: "C")))
+
+        // Raw data the model put in the exercise never reaches the page.
+        let markdown = AppleCourseLessonContentPolicy.markdown(
+            content: content(answer: "B", exercise: "{&quot;version&quot;:1}"),
+            exampleKind: .topicDemonstration
+        )
+        XCTAssertFalse(markdown.contains("&quot;"))
+        XCTAssertTrue(markdown.contains("```learnfold-assessment"))
+        XCTAssertTrue(markdown.contains("\"option_id\":\"option-2\""))
+    }
+
+    func testAppleFirstPlanRenamesNodesThatReuseThePlanID() throws {
+        let plan = makeGroupedHierarchyPlan()
+        let chapter = try XCTUnwrap(plan.chapters.first)
+        let collided = AppleCourseGroupedPlan(
+            planID: chapter.id, revision: 1,
+            structureVersion: plan.structureVersion, title: plan.title,
+            summary: plan.summary, outcome: plan.outcome,
+            startingPoint: "beginner", focusGap: "curiosity-driven",
+            estimatedDuration: plan.estimatedDuration, chapters: plan.chapters
+        )
+        let brief = try AppleCourseGroupedPlanProjection.project(collided)
+        XCTAssertEqual(brief.chapters.first?.id, "\(chapter.id)-2")
+        XCTAssertNil(AppleCoursePlanValidator.issue(in: brief, requiresTypedHierarchy: true))
+    }
+
+    func testAppleOnDeviceLessonTurnsStayInsideTheContextWindow() {
+        let prompt = """
+        Generate the page.
+
+        \(CourseAssessmentAuthoring.authoringInstructions)
+        """
+        let onDevice = AppleCourseLessonTurnPolicy.prompt(
+            prompt, providerID: CourseAgentProvider.appleOnDevice, toolMode: .generatingLesson
+        )
+        XCTAssertFalse(onDevice.contains("learnfold-assessment"))
+        XCTAssertTrue(onDevice.contains("Generate the page."))
+        XCTAssertEqual(
+            AppleCourseLessonTurnPolicy.prompt(
+                prompt, providerID: CourseAgentProvider.applePrivateCloud, toolMode: .generatingLesson
+            ),
+            prompt
+        )
+        XCTAssertEqual(
+            AppleCourseLessonTurnPolicy.prompt(
+                prompt, providerID: CourseAgentProvider.appleOnDevice, toolMode: .editing
+            ),
+            prompt
+        )
+        XCTAssertLessThan(AppleCourseLessonTurnPolicy.instructions.count, 1_000)
+    }
+
     func testAppleGroupedPlanningProjectionRejectsDuplicateRolesFanoutAndEmptyFolders() {
         let duplicateChapter = AppleCourseGroupedChapter(
             id: "core-foundations",
@@ -4964,8 +5050,22 @@ final class CourseExperienceStoreTests: XCTestCase {
                 .leaf(id: "duplicate", title: "Two", role: .module),
             ]
         )
+        // A first plan renames the repeat; a revision must keep stable IDs.
+        let firstPlan = makeGroupedHierarchyPlan(chapters: [duplicateChapter])
+        XCTAssertEqual(firstPlan.revision, 1)
+        XCTAssertEqual(
+            try AppleCourseGroupedPlanProjection.project(firstPlan)
+                .plannedLearningPath.first?.children.map(\.id),
+            ["duplicate", "duplicate-2"]
+        )
         assertGroupedProjectionFails(
-            makeGroupedHierarchyPlan(chapters: [duplicateChapter]),
+            AppleCourseGroupedPlan(
+                planID: firstPlan.planID, revision: 2,
+                structureVersion: firstPlan.structureVersion, title: firstPlan.title,
+                summary: firstPlan.summary, outcome: firstPlan.outcome,
+                startingPoint: firstPlan.startingPoint, focusGap: firstPlan.focusGap,
+                estimatedDuration: firstPlan.estimatedDuration, chapters: firstPlan.chapters
+            ),
             containing: "duplicate stable node ID"
         )
 
@@ -5828,6 +5928,36 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertEqual(store.messages.first?.text, "Explain actor isolation.")
         XCTAssertEqual(store.messages.last?.text, "A streamed Apple response.")
         XCTAssertEqual(runtime.lastProviderID, CourseAgentProvider.appleOnDevice)
+    }
+
+    func testAppleFailureAfterAcceptanceShowsItsCauseAndFreesTheComposer() async throws {
+        let defaults = try makeDefaults()
+        let coursesRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FailedAppleTurn-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: coursesRoot) }
+        let runtime = TestAppleCourseAgentRuntime()
+        runtime.failureAfterAcceptance = AppleCourseAgentError.toolFailed(
+            "This request cannot fit Apple On-Device’s safe context budget."
+        )
+        let store = CourseExperienceStore(
+            defaults: defaults,
+            environment: ["SNAPPY_RESET_ONBOARDING": "1"],
+            appleRuntime: runtime,
+            coursesRootURL: coursesRoot
+        )
+        let appModel = AppModel()
+        await store.connectLocalAgent(appModel: appModel, agentID: CourseAgentProvider.appleOnDevice)
+        store.beginNewCourse()
+
+        XCTAssertTrue(store.sendMessage("Explain actor isolation.", appModel: appModel, appState: AppState()))
+        for _ in 0..<200 where !runtime.sendStarted || store.isAgentRequestPending {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        // The turn ran on this device, so nothing is left to recover remotely.
+        XCTAssertEqual(store.agentError, "This request cannot fit Apple On-Device’s safe context budget.")
+        XCTAssertNil(store.mainSubmissionRecoveryState)
+        XCTAssertTrue(store.sendMessage("Try again, shorter.", appModel: appModel, appState: AppState()))
     }
 
     func testAcceptedAppleSendRemainsAcceptedReplyIncompleteUntilHydrationCompletes() async throws {
@@ -19995,6 +20125,7 @@ private final class TestAppleCourseAgentRuntime: AppleCourseAgentRuntime {
     var lastLessonTarget: PreparedCourseLessonTarget?
     var restored: [AppleCourseAgentStoredMessage] = []
     var failsBeforeAcceptance = false
+    var failureAfterAcceptance: Error?
     var suspendsSend = false
     var suspendsRestore = false
     private(set) var sendStarted = false
@@ -20044,6 +20175,9 @@ private final class TestAppleCourseAgentRuntime: AppleCourseAgentRuntime {
             )
         }
         onAccepted()
+        if let failureAfterAcceptance {
+            throw failureAfterAcceptance
+        }
         while suspendsSend {
             try Task.checkCancellation()
             try await Task.sleep(for: .milliseconds(10))

@@ -1386,3 +1386,554 @@ final class LitterUITests: XCTestCase {
         return false
     }
 }
+
+/// Live, unscripted end-to-end QA pass against the real Apple On-Device
+/// Foundation Models runtime. Not part of CI: model turns are slow and
+/// nondeterministic, so every step records screenshots and soft-fails.
+/// Run with LEARNFOLD_LIVE_APPLE_QA=1 in the test environment
+/// (TEST_RUNNER_LEARNFOLD_LIVE_APPLE_QA=1 on the xcodebuild command line).
+final class AppleOnDeviceLiveQAUITests: XCTestCase {
+    private var step = 0
+    private var notes: [String] = []
+
+    override func setUpWithError() throws {
+        continueAfterFailure = true
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["LEARNFOLD_LIVE_APPLE_QA"] == "1",
+            "Live Apple On-Device QA only runs when LEARNFOLD_LIVE_APPLE_QA=1"
+        )
+    }
+
+    override func tearDown() {
+        let attachment = XCTAttachment(string: notes.joined(separator: "\n"))
+        attachment.name = "zz-qa-notes"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        super.tearDown()
+    }
+
+    @MainActor
+    func testLiveAppleOnDeviceCourseAndExplorations() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
+        app.launchEnvironment["SNAPPY_RESET_ONBOARDING"] = "1"
+        // A freshly created simulator may report Apple Intelligence as not
+        // enabled even when the host model can serve requests; this only
+        // overrides the picker's availability probe, not the model itself.
+        if ProcessInfo.processInfo.environment["LEARNFOLD_LIVE_APPLE_QA_FORCE_ON_DEVICE"] == "1" {
+            app.launchEnvironment["SNAPPY_APPLE_ON_DEVICE_AVAILABLE"] = "1"
+            note("Forcing SNAPPY_APPLE_ON_DEVICE_AVAILABLE=1")
+        }
+        app.launch()
+        dismissSystemAlerts()
+
+        // 1. Onboarding and agent picker.
+        let intro = app.buttons["learnfold-intro-continue"]
+        if intro.waitForExistence(timeout: 20) {
+            snap("intro", app)
+            _ = waitHittable(intro, 10)
+            intro.tap()
+        } else {
+            note("No intro screen appeared within 20s")
+        }
+        sleep(2)
+        snap("after-intro", app)
+        if app.staticTexts["Ready to start learning"].exists {
+            note("Agent setup showed 'Ready to start learning' default; tapping Change agent")
+            let change = app.buttons["course-agent-change"]
+            if waitHittable(change, 5) { change.tap() }
+            sleep(1)
+        }
+        let onDevice = byID("course-agent-option-apple-on-device", app)
+        if !onDevice.waitForExistence(timeout: 15) {
+            note("BUG? SNAPPY_RESET_ONBOARDING=1 did not show intro/agent setup; library shown instead. Using Course Settings to pick Apple On-Device.")
+            snap("no-onboarding-library", app)
+            attachHierarchy("no-onboarding-hierarchy", app)
+            let menu = app.buttons["Course agent menu"]
+            XCTAssertTrue(waitHittable(menu, 10), "Course agent menu missing")
+            menu.tap()
+            let setting = byID("course-settings-agent-apple-on-device", app)
+            XCTAssertTrue(setting.waitForExistence(timeout: 10), "Settings on-device option missing")
+            _ = scrollToHittable(setting, app)
+            note("Settings on-device label=\(setting.label) value=\(String(describing: setting.value)) enabled=\(setting.isEnabled)")
+            snap("course-settings", app)
+            setting.tap()
+            sleep(1)
+            snap("course-settings-on-device", app)
+            let save = byID("course-settings-save", app)
+            if waitHittable(save, 5) { save.tap() } else {
+                let done = app.navigationBars.buttons["Done"]
+                if done.exists { done.tap() }
+            }
+            sleep(2)
+            snap("after-course-settings", app)
+            return try createCourseAndExplore(app)
+        }
+        note("On-device option value=\(String(describing: onDevice.value)) enabled=\(onDevice.isEnabled) label=\(onDevice.label)")
+        snap("agent-picker", app)
+        _ = scrollToHittable(onDevice, app)
+        onDevice.tap()
+        sleep(1)
+        snap("agent-picker-on-device-selected", app)
+        note("On-device after tap value=\(String(describing: onDevice.value))")
+        guard onDevice.isEnabled else {
+            attachHierarchy("on-device-unavailable", app)
+            XCTFail("Apple On-Device unavailable: \(onDevice.label)")
+            return
+        }
+        let connect = byID("course-agent-connect", app)
+        XCTAssertTrue(scrollToHittable(connect, app))
+        note("Connect label: \(connect.label)")
+        connect.tap()
+
+        try createCourseAndExplore(app)
+    }
+
+    @MainActor
+    private func createCourseAndExplore(_ app: XCUIApplication) throws {
+        // 2. Course creation chat.
+        let newCourse = byID("new-course-button", app)
+        XCTAssertTrue(newCourse.waitForExistence(timeout: 20), "Library never appeared")
+        sleep(2)
+        snap("library", app)
+        _ = waitHittable(newCourse, 10)
+        newCourse.tap()
+        let composer = byID("course-chat-composer", app)
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        sleep(1)
+        snap("new-course-chat", app)
+        send("Make me a short beginner course on how vaccines train the immune system.", app)
+        snap("request-sent", app)
+
+        var built = false
+        var replies = 0
+        var lastSnap = Date()
+        let deadline = Date().addingTimeInterval(12 * 60)
+        var idleSince: Date?
+        while Date() < deadline {
+            let build = byID("build-course-button", app)
+            if build.exists && build.isEnabled {
+                sleep(1)
+                snap("plan-card-visible", app)
+                attachHierarchy("plan-card-hierarchy", app)
+                _ = scrollToHittable(build, app)
+                snap("plan-card-build-button", app)
+                build.tap()
+                built = true
+                break
+            }
+            let agentError = byID("course-agent-error", app)
+            if agentError.exists {
+                let message = byID("course-agent-error.message", app)
+                note("BUG? agent error card in course chat: \(message.exists ? message.label : agentError.label)")
+                snap("chat-agent-error", app)
+                attachHierarchy("chat-agent-error-hierarchy", app)
+                break
+            }
+            let options = byID("course-chat-question-options", app)
+            let working = byID("course-chat-stop", app).exists
+            if !working && options.exists {
+                snap("question-options-\(replies)", app)
+                let first = app.buttons["course-chat-question-option-0"]
+                if waitHittable(first, 5) {
+                    note("Answering option: \(first.label)")
+                    first.tap()
+                    replies += 1
+                    idleSince = nil
+                    sleep(3)
+                    continue
+                }
+            }
+            if working {
+                idleSince = nil
+            } else if idleSince == nil {
+                idleSince = Date()
+            } else if let since = idleSince, Date().timeIntervalSince(since) > 20, !options.exists {
+                snap("agent-idle-no-plan-\(replies)", app)
+                attachHierarchy("agent-idle-hierarchy-\(replies)", app)
+                if replies >= 5 { note("Gave up after \(replies) replies with no plan card"); break }
+                send(replies < 2
+                     ? "I'm a complete beginner with no biology background. About 30 minutes total is fine. Please go ahead and propose the course plan."
+                     : "Please show me the course plan now so I can approve it.", app)
+                replies += 1
+                idleSince = nil
+            }
+            if Date().timeIntervalSince(lastSnap) > 30 {
+                snap("chat-progress", app)
+                lastSnap = Date()
+            }
+            sleep(2)
+        }
+        guard built else {
+            snap("no-plan-final", app)
+            attachHierarchy("no-plan-final-hierarchy", app)
+            XCTFail("Never reached an approvable plan card")
+            return
+        }
+
+        // 3. Building and first lesson.
+        let openCourse = byID("course-building-open-course", app)
+        let buildDeadline = Date().addingTimeInterval(10 * 60)
+        lastSnap = .distantPast
+        while Date() < buildDeadline && !openCourse.exists {
+            if Date().timeIntervalSince(lastSnap) > 20 {
+                let state = byID("course-building-state", app)
+                note("Building state value=\(String(describing: state.exists ? state.value : "absent"))")
+                snap("building", app)
+                lastSnap = Date()
+            }
+            if byID("course-building-error", app).exists {
+                snap("building-error", app)
+                attachHierarchy("building-error-hierarchy", app)
+                XCTFail("Building error shown")
+                return
+            }
+            if byID("course-continue", app).exists || pageTitle(app).exists { break }
+            sleep(3)
+        }
+        snap("building-done", app)
+        if openCourse.exists {
+            _ = waitHittable(openCourse, 10)
+            openCourse.tap()
+        }
+        let start = byID("course-continue", app)
+        if start.waitForExistence(timeout: 20) {
+            sleep(2)
+            snap("course-detail", app)
+            attachHierarchy("course-detail-hierarchy", app)
+            note("Continue button label: \(start.label)")
+            _ = scrollToHittable(start, app)
+            start.tap()
+        }
+        let title = pageTitle(app)
+        XCTAssertTrue(title.waitForExistence(timeout: 180), "First lesson never opened")
+        sleep(2)
+        note("Lesson 1 title: \(title.label) id=\(title.identifier)")
+        let lessonOneTitle = title.label
+        let lessonOneID = title.identifier
+        snap("lesson-1-top", app)
+        attachHierarchy("lesson-1-hierarchy", app)
+        let deeper = byID("course-explore-deeper", app)
+        for i in 0..<15 where !(deeper.exists && deeper.isHittable) {
+            app.swipeUp()
+            snap("lesson-1-scroll-\(i)", app)
+        }
+
+        // 4. Go deeper.
+        guard waitHittable(deeper, 10) else {
+            attachHierarchy("no-deeper-door", app)
+            XCTFail("Go deeper door not reachable")
+            return
+        }
+        snap("where-next-doors", app)
+        deeper.tap()
+        let explorationTitle = waitForExploration(named: "deeper", app: app, parentTitle: lessonOneTitle)
+
+        // Map check from the exploration.
+        if let explorationTitle {
+            checkTitle(explorationTitle, kind: "deeper", parent: lessonOneTitle)
+            readPage("deeper", app)
+
+            // 5a. Own question from inside the exploration (nested fork).
+            let field = byID("course-explore-question-field", app)
+            if scrollToHittable(field, app) {
+                field.tap()
+                field.typeText("Why do some vaccines need booster shots?")
+                snap("nested-question-typed", app)
+                let submit = byID("course-explore-question-submit", app)
+                if waitHittable(submit, 5) { submit.tap() } else { field.typeText("\n") }
+                if let nested = waitForExploration(named: "nested-question", app: app, parentTitle: explorationTitle) {
+                    checkTitle(nested, kind: "question", parent: explorationTitle)
+                    readPage("nested-question", app)
+                }
+            } else {
+                note("Question field not reachable in exploration")
+            }
+        }
+
+        // Learn map.
+        openLearnMap(app)
+
+        // 5b. Selected-passage Explore on lesson 1.
+        let lessonRow = app.buttons.containing(NSPredicate(format: "label CONTAINS %@", lessonOneTitle)).firstMatch
+        if scrollToHittable(lessonRow, app) {
+            lessonRow.tap()
+        } else if byID("course-continue", app).exists {
+            byID("course-continue", app).tap()
+        }
+        let lessonOne = app.staticTexts[lessonOneID]
+        if lessonOne.waitForExistence(timeout: 30) {
+            sleep(2)
+            snap("back-on-lesson-1", app)
+            let paragraph = app.textViews.firstMatch
+            if waitHittable(paragraph, 10) {
+                paragraph.coordinate(withNormalizedOffset: .zero)
+                    .withOffset(CGVector(dx: 40, dy: 12)).press(forDuration: 1.2)
+                sleep(1)
+                snap("passage-selected", app)
+                let explore = byID("course-page-explore-selection", app)
+                if waitHittable(explore, 10) {
+                    explore.tap()
+                    let field = byID("course-explore-prompt-field", app)
+                    if field.waitForExistence(timeout: 10) {
+                        snap("explore-passage-prompt", app)
+                        let how = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'course-explore-intent-'")).firstMatch
+                        if how.exists { how.tap() }
+                        snap("explore-passage-intent", app)
+                        byID("course-explore-prompt-submit", app).tap()
+                        if let passageTitle = waitForExploration(named: "passage", app: app, parentTitle: lessonOneTitle) {
+                            checkTitle(passageTitle, kind: "passage", parent: lessonOneTitle)
+                            readPage("passage", app)
+                        }
+                    } else {
+                        note("Explore prompt sheet did not appear")
+                        snap("explore-passage-no-prompt", app)
+                    }
+                } else {
+                    note("Explore selection button never hittable")
+                    attachHierarchy("passage-selection-hierarchy", app)
+                }
+            }
+        } else {
+            note("Could not get back to lesson 1 from map")
+            snap("lesson-1-return-failed", app)
+        }
+        openLearnMap(app)
+    }
+
+    /// Inspects (and if needed enables) Apple Intelligence in the simulator's
+    /// Settings app so FoundationModels assets become available.
+    @MainActor
+    func testPrepareSimulatorAppleIntelligence() throws {
+        let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
+        settings.terminate()
+        settings.launch()
+        sleep(3)
+        snap("settings-root", settings)
+        attachHierarchy("settings-root-hierarchy", settings)
+        let candidates = ["Apple Intelligence & Siri", "Apple Intelligence", "Siri"]
+        var opened = false
+        for _ in 0..<6 where !opened {
+            for name in candidates {
+                let cell = settings.cells.containing(NSPredicate(format: "label BEGINSWITH %@", name)).firstMatch
+                let button = settings.buttons.containing(NSPredicate(format: "label BEGINSWITH %@", name)).firstMatch
+                let target = cell.exists ? cell : button
+                if target.exists && target.isHittable {
+                    note("Opening settings row: \(target.label)")
+                    target.tap()
+                    opened = true
+                    break
+                }
+            }
+            if !opened { settings.swipeUp() }
+        }
+        sleep(3)
+        snap("settings-ai-page", settings)
+        attachHierarchy("settings-ai-hierarchy", settings)
+        let switches = settings.switches.allElementsBoundByIndex
+        note("Switches: \(switches.map { "\($0.label)=\(String(describing: $0.value))" })")
+        if let ai = switches.first(where: { $0.label.contains("Apple Intelligence") }),
+           (ai.value as? String) == "0" {
+            ai.tap()
+            sleep(3)
+            snap("settings-ai-toggled", settings)
+            attachHierarchy("settings-ai-toggled-hierarchy", settings)
+            for label in ["Turn On Apple Intelligence", "Continue", "Turn On", "Not Now"] {
+                let b = settings.buttons[label]
+                if b.waitForExistence(timeout: 3) && label != "Not Now" {
+                    b.tap(); sleep(3); snap("settings-ai-after-\(label)", settings)
+                }
+            }
+        }
+        sleep(5)
+        snap("settings-ai-final", settings)
+        attachHierarchy("settings-ai-final-hierarchy", settings)
+    }
+
+    // MARK: - Steps
+
+    @MainActor
+    private func waitForExploration(named name: String, app: XCUIApplication, parentTitle: String) -> String? {
+        let pill = byID("course-exploration-pill", app)
+        let action = byID("course-exploration-pill-action", app)
+        let deadline = Date().addingTimeInterval(6 * 60)
+        var last = Date.distantPast
+        let started = Date()
+        var seenPill = false
+        while Date() < deadline {
+            if pill.exists { seenPill = true }
+            if Date().timeIntervalSince(last) > 15 {
+                let pillText = pill.exists
+                    ? pill.staticTexts.allElementsBoundByIndex.map(\.label).joined(separator: " | ")
+                    : "no pill"
+                let status = byID("course-exploration-status", app)
+                let error = byID("course-exploration-error", app)
+                note("[\(name)] t=\(Int(Date().timeIntervalSince(started)))s pill=\(pillText) status=\(status.exists ? status.label : "-") error=\(error.exists ? error.label : "-") action=\(action.exists ? action.label : "-")")
+                snap("\(name)-waiting", app)
+                last = Date()
+            }
+            if action.exists && action.label == "Open" { break }
+            if action.exists && action.label != "Open" && Date().timeIntervalSince(started) > 10 {
+                note("[\(name)] pill action is '\(action.label)' (not Open)")
+                snap("\(name)-pill-nonopen-action", app)
+                attachHierarchy("\(name)-pill-hierarchy", app)
+                if action.label.lowercased().contains("retry") { return nil }
+            }
+            if !seenPill, Date().timeIntervalSince(started) > 30,
+               byID("course-exploration-error", app).exists {
+                note("[\(name)] exploration error without pill")
+                snap("\(name)-error", app)
+                return nil
+            }
+            sleep(2)
+        }
+        guard action.exists, action.label == "Open" else {
+            note("[\(name)] never became openable in 6 min")
+            snap("\(name)-timeout", app)
+            attachHierarchy("\(name)-timeout-hierarchy", app)
+            return nil
+        }
+        note("[\(name)] ready after \(Int(Date().timeIntervalSince(started)))s; pill: \(pill.staticTexts.allElementsBoundByIndex.map(\.label).joined(separator: " | "))")
+        snap("\(name)-ready", app)
+        action.tap()
+        sleep(3)
+        let titles = app.staticTexts.matching(NSPredicate(format: "identifier BEGINSWITH 'course-page-title-'"))
+            .allElementsBoundByIndex.filter { $0.label != parentTitle }
+        snap("\(name)-opened", app)
+        attachHierarchy("\(name)-opened-hierarchy", app)
+        let t = titles.first?.label ?? pageTitle(app).label
+        note("[\(name)] opened page title: \(t)")
+        return t
+    }
+
+    @MainActor
+    private func checkTitle(_ title: String, kind: String, parent: String) {
+        let placeholderPrefixes = ["Deeper into", "Beside ", "The bigger picture around", "Exploring ", "Tying the threads"]
+        if placeholderPrefixes.contains(where: { title.hasPrefix($0) })
+            || title.hasSuffix("?") || title.contains("\u{201C}") {
+            note("BUG? [\(kind)] title looks like a placeholder: '\(title)' (parent '\(parent)')")
+        }
+        if title.isEmpty { note("BUG? [\(kind)] empty exploration title") }
+    }
+
+    @MainActor
+    private func readPage(_ name: String, _ app: XCUIApplication) {
+        for i in 0..<8 {
+            app.swipeUp()
+            snap("\(name)-read-\(i)", app)
+            if byID("course-where-next", app).exists && byID("course-explore-question-field", app).isHittable { break }
+        }
+        let body = app.textViews.allElementsBoundByIndex.map { ($0.value as? String) ?? "" }.joined(separator: "\n")
+        let leak = ["{\"", "\"name\":", "tool_call", "```json", "<tool", "arguments"].filter { body.contains($0) }
+        if !leak.isEmpty { note("BUG? [\(name)] page text contains raw markers \(leak)") }
+        note("[\(name)] page text chars=\(body.count) first200=\(body.prefix(200).replacingOccurrences(of: "\n", with: " / "))")
+    }
+
+    @MainActor
+    private func openLearnMap(_ app: XCUIApplication) {
+        for i in 0..<5 {
+            if byID("course-learning-tree", app).exists || byID("course-goals", app).exists { break }
+            let back = app.navigationBars.buttons.element(boundBy: 0)
+            if back.exists && back.isHittable { back.tap() } else { break }
+            sleep(2)
+            snap("map-nav-back-\(i)", app)
+        }
+        sleep(2)
+        snap("learn-map", app)
+        attachHierarchy("learn-map-hierarchy", app)
+        let branches = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'course-branch-'"))
+            .allElementsBoundByIndex.map { "\($0.identifier): \($0.label)" }
+        note("Learn map branches: \(branches)")
+        for i in 0..<4 {
+            app.swipeUp()
+            snap("learn-map-scroll-\(i)", app)
+        }
+        for _ in 0..<4 { app.swipeDown() }
+    }
+
+    // MARK: - Helpers
+
+    /// Cloned simulators can carry an Apple Account verification prompt.
+    @MainActor
+    private func dismissSystemAlerts() {
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        for _ in 0..<3 {
+            let notNow = springboard.buttons["Not Now"]
+            if notNow.waitForExistence(timeout: 4) {
+                note("Dismissing system alert: \(springboard.alerts.firstMatch.label)")
+                notNow.tap()
+            } else {
+                return
+            }
+        }
+    }
+
+    @MainActor
+    private func send(_ text: String, _ app: XCUIApplication) {
+        let composer = byID("course-chat-composer", app)
+        guard composer.waitForExistence(timeout: 10) else { note("composer missing"); return }
+        composer.tap()
+        sleep(1)
+        let focused = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
+        guard focused.waitForExistence(timeout: 5) else {
+            note("BUG? composer did not take keyboard focus (enabled=\(composer.isEnabled)); cannot send: \(text)")
+            snap("composer-not-focusable", app)
+            attachHierarchy("composer-not-focusable-hierarchy", app)
+            return
+        }
+        composer.typeText(text)
+        let sendButton = byID("course-chat-send", app)
+        if waitHittable(sendButton, 10) { sendButton.tap() } else { note("send button not hittable"); composer.typeText("\n") }
+        note("Sent: \(text)")
+        sleep(2)
+    }
+
+    @MainActor
+    private func pageTitle(_ app: XCUIApplication) -> XCUIElement {
+        app.staticTexts.matching(NSPredicate(format: "identifier BEGINSWITH 'course-page-title-'")).firstMatch
+    }
+
+    @MainActor
+    private func byID(_ id: String, _ app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any).matching(identifier: id).firstMatch
+    }
+
+    @MainActor
+    private func waitHittable(_ element: XCUIElement, _ timeout: TimeInterval) -> Bool {
+        XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true"), object: element
+        )], timeout: timeout) == .completed
+    }
+
+    @MainActor
+    private func scrollToHittable(_ element: XCUIElement, _ app: XCUIApplication) -> Bool {
+        for _ in 0..<12 {
+            if element.exists && element.isHittable { return true }
+            app.swipeUp()
+        }
+        return element.exists && element.isHittable
+    }
+
+    private func note(_ text: String) {
+        notes.append("[step \(step)] \(text)")
+        print("QA-NOTE: \(text)")
+    }
+
+    @MainActor
+    private func snap(_ name: String, _ app: XCUIApplication) {
+        step += 1
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = String(format: "%03d-%@", step, name)
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    @MainActor
+    private func attachHierarchy(_ name: String, _ app: XCUIApplication) {
+        let attachment = XCTAttachment(string: app.debugDescription)
+        attachment.name = String(format: "%03d-%@", step, name)
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+}

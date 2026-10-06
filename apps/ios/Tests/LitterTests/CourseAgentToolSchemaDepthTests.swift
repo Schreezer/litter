@@ -31,6 +31,50 @@ final class CourseAgentToolSchemaDepthTests: XCTestCase {
         }
     }
 
+    func testAppleLessonToolTitleAndCheckAreRequiredShallowAndBounded() throws {
+        #if canImport(FoundationModels)
+        guard #available(iOS 26.0, *) else {
+            throw XCTSkip("Foundation Models tools require iOS 26 or later.")
+        }
+        for kind in [
+            CourseLessonExampleKind.topicDemonstration,
+            .runnableCode(languageOrFramework: "Swift"),
+        ] {
+            let spec = try AppleCourseToolFactory.generateLessonSpec(exampleKind: kind)
+            let schema = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: Data(spec.inputSchemaJson.utf8)) as? [String: Any]
+            )
+            XCTAssertLessThanOrEqual(Self.schemaDepth(schema), Self.maximumSchemaDepth)
+            let title = try XCTUnwrap((schema["properties"] as? [String: Any])?["title"] as? [String: Any])
+            XCTAssertEqual(title["type"] as? String, "string")
+            XCTAssertEqual(title["maxLength"] as? Int, CoursePlanHierarchyPolicy.maximumNodeTitleLength)
+            // Small models skip optional fields, so every field is required;
+            // planned lessons ignore the title they repeat.
+            let required = Set(schema["required"] as? [String] ?? [])
+            XCTAssertTrue(required.isSuperset(of: [
+                "title", "explanation", "example", "exercise",
+                "check_question", "check_options", "check_answer", "check_explanation",
+            ]))
+            let options = try XCTUnwrap((schema["properties"] as? [String: Any])?["check_options"] as? [String: Any])
+            XCTAssertEqual(options["minItems"] as? Int, 2)
+            XCTAssertEqual(options["maxItems"] as? Int, 4)
+        }
+        // The model writes fields in schema order: teach first, then check.
+        let properties = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(
+                with: Data(try AppleCourseToolFactory.generateLessonSpec(exampleKind: .topicDemonstration)
+                    .inputSchemaJson.utf8)
+            ) as? [String: Any])?["properties"] as? [String: [String: Any]]
+        )
+        XCTAssertEqual(AppleCourseGenerationSchemaOrdering.orderedKeys(in: properties), [
+            "title", "explanation", "example", "exercise", "check_question",
+            "check_options", "check_answer", "check_explanation", "visualization_html",
+        ])
+        #else
+        throw XCTSkip("Foundation Models is unavailable.")
+        #endif
+    }
+
     func testPlanSchemaStillDescribesTheFourLevelHierarchy() throws {
         let schema = CourseAgentTools.planInputSchemaObject()
         let properties = try XCTUnwrap(schema["properties"] as? [String: Any])

@@ -7869,7 +7869,7 @@ final class CourseExperienceStore {
         let instruction = """
         Generate only the existing exploration page ‘\(node.title)’ (node ID: \(node.id)). Its native editor page ID is \(pageID).\(parent) The learner forked it from the Learn screen to follow their curiosity, so work autonomously without asking for confirmation unless blocked. Learnfold already created this page; it is not a planned lesson.
         \(guidance)
-        Use native-editor-fetch to reread the learner-profile, course-design, agent-notes, the page it forks from, and this exact page. Write a complete, self-contained lesson that picks up where the parent page left off and fits the learner's level; do not repeat the parent page. Fetch this exact page immediately before changing it, pass its latest revision as expected_revision, and save the complete content, properties.generation_status=generated, and a specific properties.title that names the idea it explores together in the same native-editor-update-page call. If your runtime exposes learnfold_generate_lesson instead, use that tool and wait for its successful saved result. If using allow_async, poll native-editor-get-async-task until the mutation completes. Fetch the exact page again and verify both the content and generation_status=generated before reporting completion. Never report success from a chat reply alone. Update only this page: never create other pages, and never change the root, context pages, the planned chapters and lessons, or any other page. Never create Markdown lesson files.
+        Use native-editor-fetch to reread the learner-profile, course-design, agent-notes, the page it forks from, and this exact page. Write a complete, self-contained lesson that picks up where the parent page left off and fits the learner's level; do not repeat the parent page. Fetch this exact page immediately before changing it, pass its latest revision as expected_revision, and save the complete content, properties.generation_status=generated, and a specific properties.title that names the idea it explores together in the same native-editor-update-page call. If your runtime exposes learnfold_generate_lesson instead, use that tool, pass that specific title as its title argument, and wait for its successful saved result. If using allow_async, poll native-editor-get-async-task until the mutation completes. Fetch the exact page again and verify both the content and generation_status=generated before reporting completion. Never report success from a chat reply alone. Update only this page: never create other pages, and never change the root, context pages, the planned chapters and lessons, or any other page. Never create Markdown lesson files.
         """
         return CourseAgentInternalPromptPolicy.wrap(
             """
@@ -11449,7 +11449,14 @@ final class CourseExperienceStore {
                     events: [.turnSettled(outcome: Self.appleTurnFailureOutcome(error, runtimeID: runtimeID))]
                 )
             }
+            // Apple turns run on this device, so an error after acceptance is
+            // final: no reply is waiting anywhere to recover, and the learner's
+            // message is already in the local transcript. Leave the composer
+            // free so they can simply try again.
+            let appleTurnFailedLocally = CourseAgentProvider.isApple(runtimeID) && turnWasAccepted
             let recoveryState: CourseAgentSubmissionRecoveryState? = if !isLearnerSubmission {
+                nil
+            } else if appleTurnFailedLocally {
                 nil
             } else if turnWasAccepted {
                 .acceptedReplyIncomplete
@@ -11466,6 +11473,12 @@ final class CourseExperienceStore {
                     for: selectionDiscussionID,
                     matching: attempt.id
                 )
+                if appleTurnFailedLocally {
+                    clearPendingOutboundSubmission(
+                        selectionDiscussionID: selectionDiscussionID,
+                        matching: attempt.id
+                    )
+                }
             }
             guard !Task.isCancelled,
                   discussionWorkspaceIsAvailable(
@@ -11509,8 +11522,7 @@ final class CourseExperienceStore {
                     && !turnDispatchStarted
                     ? Self.hostedAgentFailureMessage(error)
                 : CourseAgentProvider.isApple(runtimeID)
-                    && !turnWasAccepted
-                    && !turnDispatchStarted
+                    && (turnWasAccepted || !turnDispatchStarted)
                     ? Self.appleAgentFailureMessage(
                         error,
                         agentName: runtimeID.displayLabel

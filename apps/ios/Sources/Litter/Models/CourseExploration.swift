@@ -123,7 +123,7 @@ struct CourseExplorationRequest: Equatable, Sendable {
             let titles = exploredTitles.prefix(12).map { "- \($0)" }.joined(separator: "\n")
             lines.append(direction == .synthesis
                 ? "Explorations to connect:\n\(titles)"
-                : "Earlier explorations in this course. When one is closely related, name it in one sentence so the learner can connect the two:\n\(titles)")
+                : "Earlier explorations in this course. Give this page a title that differs from all of them. When one is closely related, name it in one sentence so the learner can connect the two:\n\(titles)")
         }
         return lines.joined(separator: "\n")
     }
