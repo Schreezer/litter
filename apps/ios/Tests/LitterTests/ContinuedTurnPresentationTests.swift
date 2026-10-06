@@ -168,7 +168,7 @@ final class ContinuedTurnPresentationTests: XCTestCase {
         XCTAssertEqual(banner.subtitle, "Needs your approval")
     }
 
-    func testCompletedLessonIsReady() {
+    func testCompletedTurnDoesNotVerifyLessonReadiness() {
         let result = Formatter.finished(
             context: lesson,
             activity: activity(.responding, isRunning: false, written: 1),
@@ -176,7 +176,7 @@ final class ContinuedTurnPresentationTests: XCTestCase {
         )
         XCTAssertEqual(
             result.banner,
-            ContinuedTurnBanner(title: "“Light Reactions” is ready", subtitle: "Open Learnfold to start the lesson")
+            ContinuedTurnBanner(title: "Codex finished", subtitle: "Open Learnfold to check “Light Reactions”")
         )
         XCTAssertTrue(result.success)
     }
@@ -429,7 +429,7 @@ final class ContinuedTurnPresentationTests: XCTestCase {
         XCTAssertTrue(finished(lesson, .completed)
             == (ContinuedTurnBanner(title: "Codex finished", subtitle: "Open Learnfold to check “Light Reactions”"), true))
         XCTAssertTrue(finished(exploration, written: 1, .completed)
-            == (ContinuedTurnBanner(title: "Codex finished", subtitle: "Open Learnfold to check “Why leaves look green”"), true))
+            == (ContinuedTurnBanner(title: "Codex finished", subtitle: "Open Learnfold to check “Why leaves look g…”"), true))
         XCTAssertTrue(finished(question, .completed)
             == (ContinuedTurnBanner(title: "Your answer is ready", subtitle: "About “Chlorophyll basics”"), true))
         XCTAssertTrue(finished(courseChat, .completed)

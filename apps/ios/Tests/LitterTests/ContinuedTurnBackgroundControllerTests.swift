@@ -585,7 +585,8 @@ final class ContinuedTurnBackgroundControllerTests: XCTestCase {
 
         clock += ContinuedTurnBackgroundController.outcomeGrace
         controller.handleSnapshot(idle)
-        XCTAssertEqual(task.completions, [true])
+        XCTAssertEqual(task.completions, [false])
+        XCTAssertEqual(task.titles.last?.title, "Status unconfirmed")
     }
 
     func testInterruptedOutcomeShowsStoppedCopy() async throws {
