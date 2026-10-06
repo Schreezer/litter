@@ -117,7 +117,7 @@ enum ContinuedTurnBannerFormatter {
     }
 
     /// The final banner and the value for `setTaskCompleted(success:)`. A
-    /// missing outcome is treated as completed.
+    /// missing outcome remains unconfirmed; inactivity is not success.
     static func finished(
         context: ContinuedTurnContext,
         activity: AppTurnActivity?,
@@ -136,7 +136,12 @@ enum ContinuedTurnBannerFormatter {
                 subtitle: String(localized: "Pick it up again in Learnfold")
             )
             return (banner, false)
-        case .some(.completed), .none:
+        case .none:
+            return (ContinuedTurnBanner(
+                title: String(localized: "Status unconfirmed"),
+                subtitle: String(localized: "Open Learnfold to check the result")
+            ), false)
+        case .some(.completed):
             return (completedBanner(context, activity: activity), true)
         }
     }
@@ -399,22 +404,12 @@ enum ContinuedTurnBannerFormatter {
         activity: AppTurnActivity?
     ) -> ContinuedTurnBanner {
         let agent = agentName(context)
-        let wrotePage = (activity?.coursePagesWritten ?? 0) >= 1
         switch context.intent {
         case .writeLesson, .exploreTopic:
             let isExploration = context.intent.isExploration
             let title = cleanedTitle(context.intent.pageTitle)
-            if wrotePage {
-                let bannerTitle = title.map { title in
-                    sentence(title, limit: titleLimit) { String(localized: "“\($0)” is ready") }
-                } ?? (isExploration
-                    ? String(localized: "Your new page is ready")
-                    : String(localized: "Your lesson is ready"))
-                let subtitle = isExploration
-                    ? String(localized: "Open Learnfold to read it")
-                    : String(localized: "Open Learnfold to start the lesson")
-                return ContinuedTurnBanner(title: bannerTitle, subtitle: subtitle)
-            }
+            // Tool activity can include writes to notes or other pages. Only
+            // the course reader verifies the target content and generated status.
             let subtitle = title.map { title in
                 sentence(title, limit: subtitleLimit) { String(localized: "Open Learnfold to check “\($0)”") }
             } ?? (isExploration

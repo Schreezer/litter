@@ -4976,7 +4976,7 @@ final class CourseExperienceStoreTests: XCTestCase {
                 checkExplanation: "The page says memory cells remember a pathogen."
             )
         }
-        for answer in ["remember a pathogen.", "1", "A", "They remember a pathogen"] {
+        for answer in ["remember a pathogen.", "1", "A"] {
             let fence = try XCTUnwrap(AppleCourseLessonCheckPolicy.assessmentFence(for: content(answer: answer)), answer)
             let body = fence
                 .replacingOccurrences(of: "```learnfold-assessment\n", with: "")
@@ -4986,6 +4986,9 @@ final class CourseExperienceStoreTests: XCTestCase {
             XCTAssertEqual(assessment.answer?.optionId, "option-1")
         }
         XCTAssertNil(AppleCourseLessonCheckPolicy.assessmentFence(for: content(answer: "Something else")))
+        for answer in ["Do not digest food", "They remember a pathogen", "Remember", "Remember a pathogen or digest food"] {
+            XCTAssertNil(AppleCourseLessonCheckPolicy.assessmentFence(for: content(answer: answer)), answer)
+        }
         XCTAssertNil(AppleCourseLessonCheckPolicy.assessmentFence(for: content(answer: "C")))
 
         // Raw data the model put in the exercise never reaches the page.

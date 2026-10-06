@@ -429,7 +429,7 @@ final class ContinuedTurnPresentationTests: XCTestCase {
         XCTAssertTrue(finished(lesson, .completed)
             == (ContinuedTurnBanner(title: "Codex finished", subtitle: "Open Learnfold to check “Light Reactions”"), true))
         XCTAssertTrue(finished(exploration, written: 1, .completed)
-            == (ContinuedTurnBanner(title: "“Why leaves look green” is ready", subtitle: "Open Learnfold to read it"), true))
+            == (ContinuedTurnBanner(title: "Codex finished", subtitle: "Open Learnfold to check “Why leaves look green”"), true))
         XCTAssertTrue(finished(question, .completed)
             == (ContinuedTurnBanner(title: "Your answer is ready", subtitle: "About “Chlorophyll basics”"), true))
         XCTAssertTrue(finished(courseChat, .completed)
@@ -437,7 +437,7 @@ final class ContinuedTurnPresentationTests: XCTestCase {
         XCTAssertTrue(finished(generic, .completed)
             == (ContinuedTurnBanner(title: "Codex finished", subtitle: "Fix flaky login test"), true))
         XCTAssertTrue(finished(lesson, written: 1, nil)
-            == (ContinuedTurnBanner(title: "“Light Reactions” is ready", subtitle: "Open Learnfold to start the lesson"), true))
+            == (ContinuedTurnBanner(title: "Status unconfirmed", subtitle: "Open Learnfold to check the result"), false))
         XCTAssertTrue(finished(lesson, .interrupted)
             == (ContinuedTurnBanner(title: "Stopped “Light Reactions”", subtitle: "Pick it up again in Learnfold"), false))
         XCTAssertTrue(finished(question, .failed(message: "boom"))
@@ -449,7 +449,25 @@ final class ContinuedTurnPresentationTests: XCTestCase {
         XCTAssertTrue(finished(ContinuedTurnContext(agentName: "Hermes", intent: .generic(title: nil)), .completed)
             == (ContinuedTurnBanner(title: "Hermes finished", subtitle: "Your task is ready"), true))
         XCTAssertTrue(finished(ContinuedTurnContext(agentName: "Codex", intent: .writeLesson(title: nil, pageID: nil)), written: 1, .completed)
-            == (ContinuedTurnBanner(title: "Your lesson is ready", subtitle: "Open Learnfold to start the lesson"), true))
+            == (ContinuedTurnBanner(title: "Codex finished", subtitle: "Open Learnfold to check the lesson"), true))
+    }
+
+    func testUnrelatedPageWriteCannotAnnounceTheTargetLessonReady() {
+        let result = Formatter.finished(
+            context: lesson,
+            activity: activity(.writingCoursePage, isRunning: false, pageId: "page-notes", written: 1),
+            outcome: .completed
+        )
+        XCTAssertEqual(result.banner.title, "Codex finished")
+        XCTAssertEqual(result.banner.subtitle, "Open Learnfold to check “Light Reactions”")
+        XCTAssertTrue(result.success, "The turn completed, but its target lesson is not verified.")
+    }
+
+    func testMissingOutcomeDoesNotAnnounceAnAnswerReady() {
+        let result = Formatter.finished(context: question, activity: nil, outcome: nil)
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(result.banner.title, "Status unconfirmed")
+        XCTAssertEqual(result.banner.subtitle, "Open Learnfold to check the result")
     }
 
     // MARK: - Titles
@@ -631,7 +649,7 @@ final class ContinuedTurnPresentationTests: XCTestCase {
                 activity: activity(.responding, isRunning: false, written: 1),
                 outcome: .completed
             ).banner.title,
-            "“Chlorophyll” is ready"
+            "Codex finished"
         )
 
         let typed = request(question: "Does this explain autumn colours?", passage: "Chlorophyll")

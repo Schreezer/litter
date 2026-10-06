@@ -470,12 +470,12 @@ final class ContinuedTurnBackgroundControllerTests: XCTestCase {
         controller.handleSnapshot(snapshot)
 
         XCTAssertEqual(task.completions, [true])
-        XCTAssertEqual(task.titles.last?.title, "“Light Reactions” is ready")
-        XCTAssertEqual(task.titles.last?.subtitle, "Open Learnfold to start the lesson")
+        XCTAssertEqual(task.titles.last?.title, "Codex finished")
+        XCTAssertEqual(task.titles.last?.subtitle, "Open Learnfold to check “Light Reactions”")
         XCTAssertEqual(task.progress.fractionCompleted, 1)
     }
 
-    func testMissingOutcomeIsTreatedAsCompletedAfterTheGrace() async throws {
+    func testMissingOutcomeRemainsUnconfirmedAfterTheGrace() async throws {
         guard #available(iOS 26.0, *) else {
             throw XCTSkip("BGContinuedProcessingTask requires iOS 26")
         }
@@ -506,9 +506,9 @@ final class ContinuedTurnBackgroundControllerTests: XCTestCase {
         clock += ContinuedTurnBackgroundController.outcomeGrace
         controller.handleSnapshot(snapshot)
 
-        XCTAssertEqual(task.completions, [true])
-        XCTAssertEqual(task.titles.last?.title, "Codex finished")
-        XCTAssertEqual(task.titles.last?.subtitle, "Fix flaky login test")
+        XCTAssertEqual(task.completions, [false])
+        XCTAssertEqual(task.titles.last?.title, "Status unconfirmed")
+        XCTAssertEqual(task.titles.last?.subtitle, "Open Learnfold to check the result")
     }
 
     /// Upstream marks the thread idle before turn/completed reports the

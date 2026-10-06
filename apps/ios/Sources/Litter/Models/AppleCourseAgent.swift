@@ -1231,19 +1231,9 @@ enum AppleCourseLessonCheckPolicy {
         options = Array(options.prefix(5))
         guard !question.isEmpty, !explanation.isEmpty, options.count >= 2 else { return nil }
         let answer = clean(content.checkAnswer)
-        func containedIndex() -> Int? {
-            let key = normalized(answer)
-            guard !key.isEmpty else { return nil }
-            let matches = options.indices.filter {
-                let option = normalized(options[$0])
-                return option.contains(key) || key.contains(option)
-            }
-            return matches.count == 1 ? matches[0] : nil
-        }
         let answerIndex = options.firstIndex { normalized($0) == normalized(answer) }
-            // Small models sometimes paraphrase the choice a little, or answer
-            // with its number or letter.
-            ?? (answer.count > 1 ? containedIndex() : nil)
+            // Accept explicit choice numbers or letters, but never infer a
+            // grading key from a paraphrase or a negated choice.
             ?? Int(answer).flatMap { (1...options.count).contains($0) ? $0 - 1 : nil }
             ?? answer.uppercased().first.flatMap { letter in
                 answer.count == 1 ? "ABCDE".firstIndex(of: letter)

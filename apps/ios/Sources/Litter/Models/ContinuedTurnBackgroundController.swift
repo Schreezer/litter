@@ -71,7 +71,7 @@ extension BGTaskScheduler: ContinuedProcessingTaskScheduling {
 /// follows Rust's typed `currentActivity`. The final banner and success flag
 /// come from the summary's `lastTurnOutcome`. Upstream marks a thread idle
 /// just before it reports how the turn ended, so an idle thread without an
-/// outcome gets a short grace before it reads as completed.
+/// outcome gets a short grace before its status is reported as unconfirmed.
 @available(iOS 26.0, *)
 @MainActor
 final class ContinuedTurnBackgroundController: ContinuedTurnBackgroundControlling {
@@ -119,8 +119,8 @@ final class ContinuedTurnBackgroundController: ContinuedTurnBackgroundControllin
     /// applies anything that was skipped.
     private static let progressInterval: TimeInterval = 2
     private static let bannerInterval: TimeInterval = 2
-    /// How long an idle thread may wait for its turn outcome before the turn
-    /// is treated as completed.
+    /// How long an idle thread may wait for its turn outcome before the task
+    /// ends with an unconfirmed result.
     static let outcomeGrace: TimeInterval = 3
 
     private let scheduler: any ContinuedProcessingTaskScheduling
