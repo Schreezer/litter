@@ -4008,6 +4008,22 @@ mod tests {
 
     #[tokio::test]
     async fn provider_credential_probe_has_bounded_transport_timeout() {
+        // Native TLS initializes synchronously when the first client is built.
+        // Prime it with a real local request so this checks the transport budget,
+        // not the host's certificate-store initialization time.
+        let (ready_url, ready_requests, ready_server) =
+            spawn_http_response_server(empty_http_response("200 OK"), Duration::ZERO);
+        probe_openai_compatible_credentials_request(
+            &ready_url,
+            "initialization-only-test-secret",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("initialize local provider transport");
+        ready_requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initialization request recorded");
+        ready_server.join().expect("initialization server exits");
         let (base_url, requests, server) =
             spawn_http_response_server(empty_http_response("200 OK"), Duration::from_millis(200));
         let started = Instant::now();
