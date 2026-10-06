@@ -294,13 +294,32 @@ enum CourseLearningPathResolver {
     }
 
     /// Several pages can be written at once: the course agent's page plus
-    /// any explorations their own agents are writing.
+    /// any explorations their own agents are writing. An exploration whose
+    /// write stopped in an earlier launch has no writer left, so it reads as
+    /// unwritten instead of "Writing…" forever.
     static func overlayGeneratingStatus(
         in nodes: [CourseLearningNode],
         targetNodeIDs: Set<String>
     ) -> [CourseLearningNode] {
-        guard !targetNodeIDs.isEmpty else { return nodes }
-        return nodes.map { overlayGeneratingStatus(in: $0, targetNodeIDs: targetNodeIDs).node }
+        let settled = settlingStoppedExplorations(in: nodes, writerNodeIDs: targetNodeIDs)
+        guard !targetNodeIDs.isEmpty else { return settled }
+        return settled.map { overlayGeneratingStatus(in: $0, targetNodeIDs: targetNodeIDs).node }
+    }
+
+    private static func settlingStoppedExplorations(
+        in nodes: [CourseLearningNode],
+        writerNodeIDs: Set<String>
+    ) -> [CourseLearningNode] {
+        nodes.map { node in
+            var result = node
+            if CourseExplorationMap.isExploration(node),
+               node.status == .generating || node.status == .partiallyGenerated,
+               !writerNodeIDs.contains(node.id) {
+                result.status = .pendingGeneration
+            }
+            result.children = settlingStoppedExplorations(in: node.children, writerNodeIDs: writerNodeIDs)
+            return result
+        }
     }
 
     private static func overlayGeneratingStatus(

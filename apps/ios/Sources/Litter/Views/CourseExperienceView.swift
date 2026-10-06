@@ -3516,7 +3516,11 @@ private struct CourseDetailView: View {
                 resumeNode: resumeNode,
                 progress: store.explorationProgress(for: course),
                 launcher: explorationLauncher,
-                writingNodeIDs: store.activeExplorationNodeIDs(courseID: course.id),
+                stateOf: { node in
+                    store.explorationState(
+                        of: node, courseID: course.id, progress: store.explorationProgress(for: course)
+                    )
+                },
                 onOpen: { node in
                     explorationLauncher.open(
                         node, course: course, store: store, appModel: appModel, appState: appState
@@ -3605,6 +3609,11 @@ private struct CourseDetailView: View {
                 )
                 .id(chapter.node.id)
                 .transition(.opacity)
+                .environment(\.courseExplorationState) { node in
+                    store.explorationState(
+                        of: node, courseID: course.id, progress: store.explorationProgress(for: course)
+                    )
+                }
             }
             #endif
 
@@ -3627,6 +3636,14 @@ private struct CourseDetailView: View {
     #endif
 
     private func generate(_ node: CourseLearningNode) {
+        // Explorations have their own writers: the course agent stays free,
+        // and nothing opens when the page is written.
+        if CourseExplorationMap.isExploration(node) {
+            explorationLauncher.open(
+                node, course: course, store: store, appModel: appModel, appState: appState
+            )
+            return
+        }
         store.generateCourseNodeInBackground(
             for: course,
             node: node,
@@ -4034,6 +4051,9 @@ private struct CourseLearningTreeNodeView: View {
                 for: node,
                 runtimeID: runtimeID
             ) {
+                // Explorations have their own writers, so a busy course agent
+                // never blocks them.
+                let blocked = generationDisabled && !CourseExplorationMap.isExploration(node)
                 Button(generationRequest.controlTitle) { onGenerate(node) }
                     .font(.caption.weight(.semibold))
                     .buttonStyle(.borderedProminent)
@@ -4042,18 +4062,18 @@ private struct CourseLearningTreeNodeView: View {
                         "generate-course-node-\(node.id)"
                     )
                     .accessibilityValue(
-                        generationDisabled
+                        blocked
                             ? "pending_generation-disabled"
                             : "pending_generation"
                     )
                     .accessibilityLabel(generationRequest.accessibilityLabel)
                     .accessibilityHint(
-                        generationDisabled
+                        blocked
                             ? "Wait for the current course agent request to finish."
                             : generationRequest.accessibilityHint
                     )
-                    .disabled(generationDisabled)
-                    .opacity(generationDisabled ? 0.45 : 1)
+                    .disabled(blocked)
+                    .opacity(blocked ? 0.45 : 1)
             } else {
                 Text("Pending")
                     .font(.caption.weight(.semibold))

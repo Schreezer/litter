@@ -9448,6 +9448,9 @@ final class CourseExperienceStore {
     /// (or blocks) the course's main agent.
     private(set) var explorationJobs: [CourseExplorationJob] = []
     private var explorationJobContexts: [String: ExplorationJobContext] = [:]
+    /// Jobs handed to a worker. A job stays queued until then, so the reader
+    /// can tell "waiting to start" from "writing".
+    private var dispatchedExplorationNodeIDs: Set<String> = []
 
     private struct ExplorationJobContext {
         let course: LearningCourse
@@ -9459,13 +9462,29 @@ final class CourseExperienceStore {
         explorationJobs.first { $0.id == nodeID }
     }
 
-    /// Jobs forked from one page that the learner has not opened or dismissed.
-    func explorationJobs(courseID: String, parentPageID: String) -> [CourseExplorationJob] {
-        explorationJobs.filter { $0.courseID == courseID && $0.parentPageID == parentPageID }
+    /// Jobs in one course that the learner has not opened or dismissed, from
+    /// every page, oldest first.
+    func explorationJobs(courseID: String) -> [CourseExplorationJob] {
+        explorationJobs.filter { $0.courseID == courseID }
     }
 
     func activeExplorationNodeIDs(courseID: String) -> Set<String> {
         Set(explorationJobs.filter { $0.courseID == courseID && $0.isActive }.map(\.id))
+    }
+
+    /// Where one exploration stands for the learner right now.
+    func explorationState(
+        of node: CourseLearningNode,
+        courseID: String,
+        progress: CourseExplorationProgress
+    ) -> CourseExplorationState {
+        CourseExplorationState.resolve(
+            node: node,
+            job: explorationJob(nodeID: node.id),
+            progress: progress,
+            isBackgroundGenerating: backgroundGeneratingCourseID == courseID
+                && backgroundGeneratingNodeID == node.id
+        )
     }
 
     /// Forks the page and queues it for writing. Returns once the placeholder
@@ -9487,10 +9506,68 @@ final class CourseExperienceStore {
             parentPageID: request.parentPageID,
             pageID: node.pageID,
             title: node.title,
+            label: request.statusLabel,
+            parentTitle: request.parentTitle,
             phase: .queued
         ))
         pumpExplorationJobs(appModel: appModel, appState: appState)
         return node
+    }
+
+    /// Queues an exploration that has no live job: one forked in an earlier
+    /// launch, or one whose write stopped. Returns once it is queued; nothing
+    /// opens when it is written.
+    func writeExploration(
+        nodeID: String,
+        in course: LearningCourse,
+        appModel: AppModel,
+        appState: AppState
+    ) async throws {
+        if let job = explorationJob(nodeID: nodeID) {
+            if job.isActive { return }
+            if job.failureReason != nil {
+                retryExploration(nodeID: nodeID, appModel: appModel, appState: appState)
+                return
+            }
+        }
+        if backgroundGeneratingCourseID == course.id, backgroundGeneratingNodeID == nodeID { return }
+        let repository = try await documentRepository(for: course)
+        let nodes = try await repository.outline().learningPages
+        guard var node = CourseExplorationMap.node(withID: nodeID, in: nodes),
+              CourseExplorationMap.isExploration(node),
+              let pageID = node.pageID else {
+            throw CourseReadingNavigationError.unavailable("This exploration is no longer in the course.")
+        }
+        // Another tap may have queued it while the outline loaded.
+        if explorationJob(nodeID: nodeID)?.isActive == true { return }
+        if node.status == .generated,
+           let page = try? await repository.pageSnapshot(id: pageID),
+           Self.generatedLessonIsReady(page) {
+            courseWorkspaceRefreshVersion += 1
+            return
+        }
+        if explorationJob(nodeID: nodeID)?.isActive == true { return }
+        let parent = CourseExplorationMap.forkParent(ofPageID: pageID, in: nodes)
+        let original = pendingExplorationRequests[nodeID]
+        let request = original ?? CourseExplorationRequest.reconstructed(node: node, parent: parent)
+        pendingExplorationRequests[nodeID] = request
+        // The course agent only writes a page that reads as pending.
+        node.status = .pendingGeneration
+        explorationJobs.removeAll { $0.id == nodeID }
+        explorationJobContexts[nodeID] = ExplorationJobContext(
+            course: course, node: node, runtimeID: course.agentRuntimeKind ?? activeAgentID
+        )
+        explorationJobs.append(CourseExplorationJob(
+            id: nodeID,
+            courseID: course.id,
+            parentPageID: request?.parentPageID ?? parent?.pageID ?? "",
+            pageID: pageID,
+            title: node.title,
+            label: original?.statusLabel ?? CourseExplorationRequest.statusLabel(for: node),
+            parentTitle: request?.parentTitle ?? parent?.title ?? course.title,
+            phase: .queued
+        ))
+        pumpExplorationJobs(appModel: appModel, appState: appState)
     }
 
     /// Queues a failed exploration again with the same request.
@@ -9505,10 +9582,20 @@ final class CourseExperienceStore {
     /// Forgets a finished or failed job once the learner has seen it. The page
     /// stays on the course map either way.
     func dismissExplorationJob(nodeID: String) {
-        guard explorationJob(nodeID: nodeID)?.isActive == false else { return }
+        guard let job = explorationJob(nodeID: nodeID), !job.isActive else { return }
         explorationJobs.removeAll { $0.id == nodeID }
         explorationJobContexts[nodeID] = nil
-        pendingExplorationRequests[nodeID] = nil
+        // A failed page can still be written later from its passage; keep how
+        // the learner asked for it.
+        if job.phase == .ready { pendingExplorationRequests[nodeID] = nil }
+    }
+
+    /// Clears every ready and failed notice in a course. The pages keep their
+    /// own state: unread ones still read as new.
+    func dismissExplorationNotices(courseID: String) {
+        for job in explorationJobs where job.courseID == courseID && !job.isActive {
+            dismissExplorationJob(nodeID: job.id)
+        }
     }
 
     /// Opening a written exploration by any route means its "ready" notice
@@ -9520,13 +9607,13 @@ final class CourseExperienceStore {
     }
 
     private func pumpExplorationJobs(appModel: AppModel, appState: AppState) {
-        for job in explorationJobs where job.phase == .queued {
+        for job in explorationJobs where job.phase == .queued && !dispatchedExplorationNodeIDs.contains(job.id) {
             guard let context = explorationJobContexts[job.id] else { continue }
-            let writing = explorationJobs.filter {
-                $0.courseID == job.courseID && $0.phase == .writing
+            let dispatched = explorationJobs.filter {
+                $0.courseID == job.courseID && dispatchedExplorationNodeIDs.contains($0.id)
             }.count
-            guard writing < CourseExplorationConcurrency.limit(runtimeID: context.runtimeID) else { continue }
-            setExplorationPhase(.writing, nodeID: job.id)
+            guard dispatched < CourseExplorationConcurrency.limit(runtimeID: context.runtimeID) else { continue }
+            dispatchedExplorationNodeIDs.insert(job.id)
             Task { @MainActor [weak self] in
                 await self?.runExplorationJob(context, appModel: appModel, appState: appState)
             }
@@ -9546,6 +9633,7 @@ final class CourseExperienceStore {
         let node = context.node
         do {
             if CourseExplorationConcurrency.supportsDedicatedWorkers(runtimeID: context.runtimeID) {
+                setExplorationPhase(.writing, nodeID: node.id)
                 let prompt = Self.explorationGenerationPrompt(
                     for: node,
                     request: pendingExplorationRequests[node.id]
@@ -9559,19 +9647,25 @@ final class CourseExperienceStore {
                 }
             } else {
                 try await writeExplorationOnCourseAgent(
-                    node: node, course: context.course, appModel: appModel, appState: appState
+                    node: node, course: context.course, appModel: appModel, appState: appState,
+                    onStart: { [weak self] in self?.setExplorationPhase(.writing, nodeID: node.id) }
                 )
             }
             courseWorkspaceRefreshVersion += 1
             if let issue = try await completedGenerationIssue(for: node, course: context.course) {
                 throw CourseReadingNavigationError.unavailable(issue)
             }
-            if let index = explorationJobs.firstIndex(where: { $0.id == node.id }),
-               let pageID = node.pageID,
-               let page = try? await documentRepository(for: context.course).pageSnapshot(id: pageID) {
+            // Look the job up after reading the page: the learner can open or
+            // dismiss other jobs meanwhile, which moves this one in the list.
+            if let pageID = node.pageID,
+               let page = try? await documentRepository(for: context.course).pageSnapshot(id: pageID),
+               let index = explorationJobs.firstIndex(where: { $0.id == node.id }) {
                 explorationJobs[index].title = page.title
             }
             setExplorationPhase(.ready, nodeID: node.id)
+            if let job = explorationJob(nodeID: node.id) {
+                announceExploration("“\(job.title)” is ready to read.")
+            }
         } catch {
             courseWorkspaceRefreshVersion += 1
             LLog.error(
@@ -9583,8 +9677,24 @@ final class CourseExperienceStore {
                 .failed(error is CancellationError ? "Stopped before the page was written." : error.localizedDescription),
                 nodeID: node.id
             )
+            if let job = explorationJob(nodeID: node.id) {
+                announceExploration("Couldn’t finish “\(job.label)”.")
+            }
         }
+        dispatchedExplorationNodeIDs.remove(node.id)
         pumpExplorationJobs(appModel: appModel, appState: appState)
+    }
+
+    /// Tells VoiceOver about a background exploration without interrupting
+    /// whatever it is reading.
+    private func announceExploration(_ message: String) {
+        UIAccessibility.post(
+            notification: .announcement,
+            argument: NSAttributedString(
+                string: message,
+                attributes: [.accessibilitySpeechAnnouncementPriority: UIAccessibilityPriority.low]
+            )
+        )
     }
 
     /// A fresh Hosted session per exploration, under the course's own Hosted
@@ -9708,13 +9818,15 @@ final class CourseExperienceStore {
         node: CourseLearningNode,
         course: LearningCourse,
         appModel: AppModel,
-        appState: AppState
+        appState: AppState,
+        onStart: () -> Void
     ) async throws {
         while backgroundGeneratingNodeID != nil
             || isAgentRequestPending(for: nil)
             || course.workspaceID != currentCourseWorkspaceID {
             try await Task.sleep(for: .milliseconds(500))
         }
+        onStart()
         generateCourseNodeInBackground(for: course, node: node, appModel: appModel, appState: appState)
         guard backgroundGeneratingCourseID == course.id, backgroundGeneratingNodeID == node.id else {
             throw CourseReadingNavigationError.unavailable(

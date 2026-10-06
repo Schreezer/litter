@@ -297,6 +297,8 @@ final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
     }
 
     private var attempts = 0
+    /// Explorations written so far, to give each its own title.
+    private var explorationWrites = 0
     private let transcriptsRoot: URL
     private let generationScenario: String
     private let appStore: AppStore?
@@ -470,8 +472,18 @@ final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
 
     /// Writes the exploration the way a real agent does: one revision-checked
     /// update that saves the content, the generated status, and a real title.
+    /// Tests can slow the write down, or make the first one fail.
     private func writeExploration(pageID: String, workspaceID: String, courseDirectory: URL) async throws {
-        try await Task.sleep(for: .seconds(1))
+        let environment = ProcessInfo.processInfo.environment
+        let delay = environment["LEARNFOLD_READING_EXPLORATION_DELAY_SECONDS"].flatMap(Double.init) ?? 1
+        try await Task.sleep(for: .seconds(delay))
+        explorationWrites += 1
+        let write = explorationWrites
+        if write == 1, environment["LEARNFOLD_READING_EXPLORATION_SCENARIO"] == "fail-first" {
+            throw NSError(domain: "ReadingFixture", code: 6, userInfo: [
+                NSLocalizedDescriptionKey: "Simulated exploration failure",
+            ])
+        }
         let repository = try await CourseDocumentRegistry.shared.repository(
             workspaceID: workspaceID,
             databaseURL: courseDirectory.appendingPathComponent(".course/course-library.sqlite"),
@@ -484,7 +496,7 @@ final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
             "command": "replace_content",
             "new_str": "## Why randomness matters\n\nIf the prover could predict the challenge, it could prepare an answer without knowing the secret. A random challenge removes that shortcut.\n\n## Keep going\n\nEach round halves a cheating prover's odds.",
             "properties": [
-                "title": "Why the challenge must be random",
+                "title": write == 1 ? "Why the challenge must be random" : "Why the challenge must be random, part \(write)",
                 "generation_status": "generated",
             ],
         ]

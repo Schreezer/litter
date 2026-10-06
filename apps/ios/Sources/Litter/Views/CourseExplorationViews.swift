@@ -2,16 +2,15 @@ import SwiftUI
 
 /// Forks explorations and opens existing ones. Forking returns as soon as the
 /// placeholder page exists; the store's exploration workers write it, so the
-/// learner keeps reading and can fork again right away.
+/// learner keeps reading and can fork again right away. Nothing here waits
+/// for a page to be written: the learner opens it once it is ready.
 @MainActor
 @Observable
 final class CourseExplorationLauncher {
-    private(set) var status: String?
     var error: String?
-    private var task: Task<Void, Never>?
+    private var openTask: Task<Void, Never>?
     private var forkCount = 0
 
-    var isBusy: Bool { task != nil }
     var isForking: Bool { forkCount > 0 }
 
     func launch(
@@ -22,13 +21,10 @@ final class CourseExplorationLauncher {
         appModel: AppModel,
         appState: AppState
     ) {
-        error = nil
-        forkCount += 1
         Task { @MainActor [weak self] in
-            defer { self?.forkCount -= 1 }
             do {
-                try await store.startExploration(
-                    request, anchor: anchor, in: course, appModel: appModel, appState: appState
+                try await self?.fork(
+                    request, anchor: anchor, course: course, store: store, appModel: appModel, appState: appState
                 )
             } catch {
                 self?.error = error.localizedDescription
@@ -36,6 +32,26 @@ final class CourseExplorationLauncher {
         }
     }
 
+    /// Creates the placeholder page and queues it, for callers that show
+    /// their own progress and errors.
+    func fork(
+        _ request: CourseExplorationRequest,
+        anchor: CourseExplorationAnchor? = nil,
+        course: LearningCourse,
+        store: CourseExperienceStore,
+        appModel: AppModel,
+        appState: AppState
+    ) async throws {
+        error = nil
+        forkCount += 1
+        defer { forkCount -= 1 }
+        try await store.startExploration(
+            request, anchor: anchor, in: course, appModel: appModel, appState: appState
+        )
+    }
+
+    /// Opens a written page. An exploration that is not written yet is queued
+    /// or retried instead, and it never opens by itself when it finishes.
     func open(
         _ node: CourseLearningNode,
         course: LearningCourse,
@@ -44,16 +60,30 @@ final class CourseExplorationLauncher {
         appState: AppState,
         replacesCurrentPage: Bool = false
     ) {
-        guard task == nil else { return }
         error = nil
-        if node.status != .generated { status = "Writing “\(node.title)”…" }
-        // Writing can take minutes; never pull the learner back after they leave.
-        let origin = store.navigationPath.last
-        task = Task { @MainActor [weak self] in
-            defer {
-                self?.task = nil
-                self?.status = nil
+        let job = store.explorationJob(nodeID: node.id)
+        if CourseExplorationMap.isExploration(node), node.status != .generated, job?.phase != .ready {
+            if job?.isActive == true { return }
+            if job?.failureReason != nil {
+                store.retryExploration(nodeID: node.id, appModel: appModel, appState: appState)
+                return
             }
+            Task { @MainActor [weak self] in
+                do {
+                    try await store.writeExploration(
+                        nodeID: node.id, in: course, appModel: appModel, appState: appState
+                    )
+                } catch {
+                    self?.error = error.localizedDescription
+                }
+            }
+            return
+        }
+        // The latest tap wins; an earlier open that is still checking the page
+        // must not push a second page later.
+        openTask?.cancel()
+        let origin = store.navigationPath.last
+        openTask = Task { @MainActor [weak self] in
             do {
                 try await store.openCourseNode(
                     node,
@@ -61,7 +91,7 @@ final class CourseExplorationLauncher {
                     replacesCurrentPage: replacesCurrentPage,
                     appModel: appModel,
                     appState: appState,
-                    shouldOpen: { store.navigationPath.last == origin }
+                    shouldOpen: { !Task.isCancelled && store.navigationPath.last == origin }
                 )
             } catch is CancellationError {
             } catch {
@@ -71,21 +101,12 @@ final class CourseExplorationLauncher {
     }
 }
 
-private struct CourseExplorationStatusView: View {
+/// Why the last fork or open did not happen, next to the control that asked.
+struct CourseExplorationForkErrorView: View {
     let launcher: CourseExplorationLauncher
 
     var body: some View {
-        if let status = launcher.status {
-            HStack(spacing: 10) {
-                ProgressView()
-                Text(status)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-            .accessibilityElement(children: .combine)
-            .accessibilityIdentifier("course-exploration-status")
-        } else if let error = launcher.error {
+        if let error = launcher.error {
             Label(error, systemImage: "exclamationmark.triangle")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -98,6 +119,9 @@ private struct CourseExplorationStatusView: View {
 /// learner's own question, plus where they already went from here.
 struct CourseWhereNextSection: View {
     let exploredFromHere: [CourseLearningNode]
+    /// Where each exploration from here stands, and its label while unwritten.
+    let stateOf: (CourseLearningNode) -> CourseExplorationState
+    let labelOf: (CourseLearningNode) -> String
     let forkParent: CourseLearningNode?
     let isExploration: Bool
     let isPinned: Bool
@@ -145,7 +169,7 @@ struct CourseWhereNextSection: View {
                         )
                     }
                     .buttonStyle(.plain)
-                    .disabled(launcher.isBusy || launcher.isForking)
+                    .disabled(launcher.isForking)
                     .accessibilityHint(direction.detail)
                     .accessibilityIdentifier("course-explore-\(direction.rawValue)")
                 }
@@ -169,12 +193,12 @@ struct CourseWhereNextSection: View {
                         .font(.title)
                         .foregroundStyle(Color.courseExploration)
                 }
-                .disabled(trimmedQuestion.isEmpty || launcher.isBusy || launcher.isForking)
+                .disabled(trimmedQuestion.isEmpty || launcher.isForking)
                 .accessibilityLabel("Explore this question")
                 .accessibilityIdentifier("course-explore-question-submit")
             }
 
-            CourseExplorationStatusView(launcher: launcher)
+            CourseExplorationForkErrorView(launcher: launcher)
 
             if !exploredFromHere.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
@@ -182,18 +206,16 @@ struct CourseWhereNextSection: View {
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
                     ForEach(exploredFromHere) { node in
-                        Button {
-                            onOpen(node)
-                        } label: {
-                            Label(node.title, systemImage: node.status == .generated
-                                  ? "arrow.triangle.branch" : "sparkle")
-                                .font(.subheadline)
-                                .foregroundStyle(Color.courseExploration)
-                                .multilineTextAlignment(.leading)
-                        }
-                        .buttonStyle(.borderless)
-                        .disabled(launcher.isBusy)
-                        .accessibilityIdentifier("course-explored-\(node.id)")
+                        let state = stateOf(node)
+                        CourseExplorationRow(
+                            node: node,
+                            state: state,
+                            label: labelOf(node),
+                            identifier: "course-explored-\(node.id)",
+                            actionIdentifier: "course-explored-\(state == .unwritten ? "write" : "retry")-\(node.id)",
+                            onOpen: { onOpen(node) },
+                            onWrite: { onOpen(node) }
+                        )
                     }
                 }
             }
@@ -230,7 +252,7 @@ struct CourseWhereNextSection: View {
     }
 
     private func submitQuestion() {
-        guard !trimmedQuestion.isEmpty, !launcher.isBusy, !launcher.isForking else { return }
+        guard !trimmedQuestion.isEmpty, !launcher.isForking else { return }
         onFork(.question, trimmedQuestion)
         question = ""
         questionFocused = false
@@ -244,8 +266,8 @@ struct CourseExplorationOverview: View {
     let resumeNode: CourseLearningNode?
     let progress: CourseExplorationProgress
     let launcher: CourseExplorationLauncher
-    /// Explorations an agent is writing right now.
-    var writingNodeIDs: Set<String> = []
+    /// Where each exploration stands right now.
+    let stateOf: (CourseLearningNode) -> CourseExplorationState
     let onOpen: (CourseLearningNode) -> Void
     let onSynthesize: (CourseLearningNode, [String]) -> Void
 
@@ -266,10 +288,12 @@ struct CourseExplorationOverview: View {
     }
 
     private var openThreads: [CourseLearningNode] {
-        // Pinned goals already have their own row above.
-        CourseExplorationMap.openThreads(
+        // Pinned goals already have their own row above. Threads being written
+        // come first, so "Show more" never hides one.
+        let threads = CourseExplorationMap.openThreads(
             in: nodes, progress: progress, excludingPageID: resumeNode?.pageID
         ).filter { !progress.pinnedNodeIDs.contains($0.id) }
+        return threads.filter { stateOf($0).isActive } + threads.filter { !stateOf($0).isActive }
     }
 
     var body: some View {
@@ -300,13 +324,13 @@ struct CourseExplorationOverview: View {
                     let visible = showsAllThreads ? threads : Array(threads.prefix(collapsedThreadLimit))
                     section("Open threads", identifier: "course-open-threads") {
                         ForEach(visible) { thread in
+                            let state = stateOf(thread)
                             row(
                                 title: thread.title,
-                                subtitle: thread.status == .generated
-                                    ? (thread.originQuestion.map { "“\($0)”" } ?? "Not finished")
-                                    : writingNodeIDs.contains(thread.id) ? "Writing…" : "Not written yet",
-                                systemImage: thread.status == .generated ? "arrow.triangle.branch" : "sparkle",
-                                identifier: "course-open-thread-\(thread.id)"
+                                subtitle: subtitle(for: thread, state: state),
+                                systemImage: systemImage(for: state),
+                                identifier: "course-open-thread-\(thread.id)",
+                                isWriting: state.isActive
                             ) { onOpen(thread) }
                         }
                         if !showsAllThreads, threads.count > collapsedThreadLimit {
@@ -328,11 +352,11 @@ struct CourseExplorationOverview: View {
                             .font(.subheadline.weight(.semibold))
                     }
                     .buttonStyle(.bordered)
-                    .disabled(launcher.isBusy)
+                    .disabled(launcher.isForking)
                     .accessibilityHint(CourseExplorationDirection.synthesis.detail)
                     .accessibilityIdentifier("course-explore-synthesis")
                 }
-                CourseExplorationStatusView(launcher: launcher)
+                CourseExplorationForkErrorView(launcher: launcher)
             }
             .padding(.horizontal, 4)
         }
@@ -367,7 +391,7 @@ struct CourseExplorationOverview: View {
                                 )
                         }
                         .buttonStyle(.plain)
-                        .disabled(node.kind != .markdown || node.pageID == nil || launcher.isBusy)
+                        .disabled(node.kind != .markdown || node.pageID == nil)
                     }
                 }
             }
@@ -393,11 +417,35 @@ struct CourseExplorationOverview: View {
         .accessibilityIdentifier(identifier)
     }
 
+    private func subtitle(for thread: CourseLearningNode, state: CourseExplorationState) -> String {
+        let question = thread.originQuestion.flatMap { $0 == thread.title || $0.isEmpty ? nil : "“\($0)”" }
+        switch state {
+        case .written(let isNew, _):
+            if isNew { return question.map { "New · \($0)" } ?? "New" }
+            return question ?? "Not finished"
+        case .writing: return "Writing…"
+        case .queued: return "Waiting to start"
+        case .failed: return "Couldn’t finish · Tap to try again"
+        case .unwritten: return "Not written yet · Tap to write"
+        }
+    }
+
+    private func systemImage(for state: CourseExplorationState) -> String {
+        switch state {
+        case .written: "arrow.triangle.branch"
+        case .writing: "pencil.line"
+        case .queued: "clock"
+        case .failed: "exclamationmark.triangle"
+        case .unwritten: "sparkle"
+        }
+    }
+
     private func row(
         title: String,
         subtitle: String,
         systemImage: String,
         identifier: String,
+        isWriting: Bool = false,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
@@ -417,9 +465,13 @@ struct CourseExplorationOverview: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+                if isWriting {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
             }
             .multilineTextAlignment(.leading)
             .padding(12)
@@ -430,7 +482,8 @@ struct CourseExplorationOverview: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(launcher.isBusy)
+        // A page being written opens once it is ready, from here or the reader.
+        .allowsHitTesting(!isWriting)
         .accessibilityIdentifier(identifier)
     }
 }
@@ -438,6 +491,12 @@ struct CourseExplorationOverview: View {
 extension Color {
     /// Explorations wander off the blue suggested route in their own color.
     static let courseExploration = Color(uiColor: .systemPurple)
+}
+
+extension EnvironmentValues {
+    /// Where an exploration stands, for views far below the store, so every
+    /// part of a screen tells the same story about it.
+    @Entry var courseExplorationState: ((CourseLearningNode) -> CourseExplorationState)?
 }
 
 /// Explorations growing off one page, drawn as side trails that sprout from
@@ -513,6 +572,7 @@ struct CourseSideTrailRow: View {
     let runtimeID: String
     let onOpenMarkdown: (String) -> Void
     let onGenerate: (CourseLearningNode) -> Void
+    @Environment(\.courseExplorationState) private var explorationStateOf
     @State private var showsDeeper: Bool
 
     init(
@@ -543,6 +603,8 @@ struct CourseSideTrailRow: View {
     }
 
     private var isCurrent: Bool { trail.id == currentNodeID }
+    /// Queued and failed explorations, which the page status alone cannot tell apart.
+    private var explorationState: CourseExplorationState? { explorationStateOf?(trail) }
     private var isPinned: Bool { progress.pinnedNodeIDs.contains(trail.id) }
     private var isFinished: Bool { trail.pageID.map(progress.finishedPageIDs.contains) ?? false }
     private var isVisited: Bool { trail.pageID.map { progress.lastVisitedAt[$0] != nil } ?? false }
@@ -555,7 +617,10 @@ struct CourseSideTrailRow: View {
     private var isEnabled: Bool {
         switch trail.status {
         case .generated: trail.pageID != nil
-        case .pendingGeneration: generationRequest != nil && !generationDisabled
+        // Explorations are written by their own workers, so a busy course
+        // agent never blocks them.
+        case .pendingGeneration: generationRequest != nil
+            && (!generationDisabled || CourseExplorationMap.isExploration(trail))
         case .generating, .partiallyGenerated: false
         }
     }
@@ -653,6 +718,23 @@ struct CourseSideTrailRow: View {
 
     private var badge: some View {
         ZStack {
+            if let explorationState, explorationState == .queued || explorationState.failureReason != nil {
+                CourseExplorationStateBadge(state: explorationState, size: isCompact ? 30 : Self.badgeSize)
+            } else {
+                statusBadge
+            }
+            if isCurrent {
+                Circle()
+                    .stroke(Color.courseExploration.opacity(0.3), lineWidth: 4)
+                    .padding(-5)
+            }
+        }
+        .frame(width: isCompact ? 30 : Self.badgeSize, height: isCompact ? 30 : Self.badgeSize)
+    }
+
+    @ViewBuilder
+    private var statusBadge: some View {
+        ZStack {
             switch trail.status {
             case .generated:
                 Circle().fill(Color.courseExploration.opacity(isFinished && !isCurrent ? 0.16 : 1))
@@ -672,13 +754,7 @@ struct CourseSideTrailRow: View {
                 Circle().fill(Color.courseExploration.opacity(0.1))
                 ProgressView().controlSize(.small).tint(Color.courseExploration)
             }
-            if isCurrent {
-                Circle()
-                    .stroke(Color.courseExploration.opacity(0.3), lineWidth: 4)
-                    .padding(-5)
-            }
         }
-        .frame(width: isCompact ? 30 : Self.badgeSize, height: isCompact ? 30 : Self.badgeSize)
     }
 
     private var badgeSymbol: String {
@@ -726,6 +802,14 @@ struct CourseSideTrailRow: View {
         var items: [Chip] = []
         if isCurrent { items.append(Chip(label: "You are here", symbol: "location.fill", prominent: true)) }
         if isPinned { items.append(Chip(label: "Goal", symbol: "pin.fill")) }
+        if explorationState == .queued {
+            items.append(Chip(label: "Waiting to start", symbol: "clock"))
+            return items
+        }
+        if explorationState?.failureReason != nil {
+            items.append(Chip(label: "Couldn’t finish · Tap to try again", symbol: "exclamationmark.triangle"))
+            return items
+        }
         switch trail.status {
         case .pendingGeneration:
             items.append(Chip(label: "Tap to write", symbol: "sparkle"))
@@ -829,14 +913,21 @@ struct CourseTrailLine: Shape {
 
 /// Asks what the learner wants from the passage before forking it. The
 /// question is optional; the chips fill the field so it can still be reworded.
+/// It stays open until the new page exists, so a failure is shown right here.
 struct CourseExplorePassagePrompt: View {
     let passage: String
     /// Mac popovers are tighter and submit on Return.
     var isCompact = false
-    let onSubmit: (String?) -> Void
+    /// Explorations that already start on this passage.
+    var alreadyExploredTitles: [String] = []
+    /// Quick questions already asked about this passage.
+    var usedIntents: Set<CourseExplorePassageIntent> = []
+    let onSubmit: (String?) async throws -> Void
     let onCancel: () -> Void
 
     @State private var question = ""
+    @State private var isStarting = false
+    @State private var error: String?
     @FocusState private var questionFocused: Bool
 
     var body: some View {
@@ -847,21 +938,31 @@ struct CourseExplorePassagePrompt: View {
                         .font(.headline)
                     Spacer()
                     Button("Cancel", action: onCancel)
+                        .disabled(isStarting)
                         .accessibilityIdentifier("course-explore-prompt-cancel")
                 }
             }
 
-            Text("“\(passage)”")
-                .font(isCompact ? .system(size: 12) : .subheadline)
-                .foregroundStyle(.secondary)
-                .lineLimit(3)
-                .padding(.leading, 10)
-                .overlay(alignment: .leading) {
-                    Capsule()
-                        .fill(Color.courseExploration.opacity(0.6))
-                        .frame(width: 3)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("“\(passage)”")
+                    .font(isCompact ? .system(size: 12) : .subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .padding(.leading, 10)
+                    .overlay(alignment: .leading) {
+                        Capsule()
+                            .fill(Color.courseExploration.opacity(0.6))
+                            .frame(width: 3)
+                    }
+                    .accessibilityLabel("Selected passage: \(passage)")
+                if let alreadyExplored {
+                    Label(alreadyExplored, systemImage: "arrow.triangle.branch")
+                        .font(isCompact ? .system(size: 11) : .caption)
+                        .foregroundStyle(Color.courseExploration)
+                        .lineLimit(2)
+                        .accessibilityIdentifier("course-explore-prompt-already")
                 }
-                .accessibilityLabel("Selected passage: \(passage)")
+            }
 
             TextField("What do you want to explore?", text: $question, axis: .vertical)
                 .lineLimit(1...4)
@@ -875,25 +976,48 @@ struct CourseExplorePassagePrompt: View {
                     Color(uiColor: .tertiarySystemFill),
                     in: RoundedRectangle(cornerRadius: isCompact ? 8 : 14, style: .continuous)
                 )
+                .disabled(isStarting)
                 .accessibilityIdentifier("course-explore-prompt-field")
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(CourseExplorePassageIntent.allCases) { intent in
+                        let isUsed = usedIntents.contains(intent)
                         Button {
                             question = intent.question
                             questionFocused = true
                         } label: {
-                            Label(intent.label, systemImage: intent.systemImage)
-                                .font(isCompact ? .system(size: 11, weight: .medium) : .subheadline.weight(.medium))
+                            HStack(spacing: 4) {
+                                Label(intent.label, systemImage: intent.systemImage)
+                                if isUsed {
+                                    Image(systemName: "checkmark")
+                                        .font(.caption2.weight(.bold))
+                                }
+                            }
+                            .font(isCompact ? .system(size: 11, weight: .medium) : .subheadline.weight(.medium))
                         }
                         .buttonStyle(.bordered)
                         .controlSize(isCompact ? .small : .regular)
                         .tint(Color.courseExploration)
-                        .accessibilityHint("Fills in: \(intent.question)")
+                        .disabled(isStarting)
+                        .accessibilityHint(isUsed
+                            ? "You already explored this question here."
+                            : "Fills in: \(intent.question)")
                         .accessibilityIdentifier("course-explore-intent-\(intent.rawValue)")
                     }
                 }
+            }
+
+            if let error {
+                Label {
+                    Text("Couldn’t start this exploration. \(error)")
+                        .foregroundStyle(.secondary)
+                } icon: {
+                    Image(systemName: "exclamationmark.circle")
+                        .foregroundStyle(.orange)
+                }
+                .font(isCompact ? .system(size: 11) : .footnote)
+                .accessibilityIdentifier("course-explore-prompt-error")
             }
 
             HStack {
@@ -901,16 +1025,25 @@ struct CourseExplorePassagePrompt: View {
                     Button("Cancel", action: onCancel)
                         .keyboardShortcut(.cancelAction)
                         .controlSize(.small)
+                        .disabled(isStarting)
                 }
                 Spacer()
                 Button(action: submit) {
-                    Label("Explore", systemImage: "arrow.triangle.branch")
-                        .font(isCompact ? .system(size: 12, weight: .semibold) : .body.weight(.semibold))
+                    HStack(spacing: 6) {
+                        if isStarting {
+                            ProgressView().controlSize(.small)
+                            Text("Starting…")
+                        } else {
+                            Label("Explore", systemImage: "arrow.triangle.branch")
+                        }
+                    }
+                    .font(isCompact ? .system(size: 12, weight: .semibold) : .body.weight(.semibold))
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color.courseExploration)
                 .controlSize(isCompact ? .small : .regular)
                 .keyboardShortcut(.defaultAction)
+                .disabled(isStarting)
                 .accessibilityHint(trimmedQuestion.isEmpty
                     ? "Writes a new page about this passage"
                     : "Writes a new page that answers your question")
@@ -920,7 +1053,18 @@ struct CourseExplorePassagePrompt: View {
         .padding(isCompact ? 14 : 20)
         .frame(width: isCompact ? 340 : nil)
         .frame(maxHeight: isCompact ? nil : .infinity, alignment: .top)
+        // A fork that is starting finishes here, so its result is never lost.
+        .interactiveDismissDisabled(isStarting)
         .onAppear { questionFocused = true }
+    }
+
+    private var alreadyExplored: String? {
+        guard !alreadyExploredTitles.isEmpty else { return nil }
+        let shown = alreadyExploredTitles.prefix(2).map { title in
+            title.count > 40 ? String(title.prefix(39)) + "…" : title
+        }
+        let more = alreadyExploredTitles.count - shown.count
+        return "Already explored here: " + shown.joined(separator: ", ") + (more > 0 ? " +\(more) more" : "")
     }
 
     private var trimmedQuestion: String {
@@ -928,164 +1072,422 @@ struct CourseExplorePassagePrompt: View {
     }
 
     private func submit() {
-        onSubmit(trimmedQuestion.isEmpty ? nil : trimmedQuestion)
+        guard !isStarting else { return }
+        let question = trimmedQuestion.isEmpty ? nil : trimmedQuestion
+        error = nil
+        isStarting = true
+        Task { @MainActor in
+            do {
+                try await onSubmit(question)
+            } catch {
+                self.error = error.localizedDescription
+            }
+            isStarting = false
+        }
     }
 }
 
-/// Floating status for explorations forked from the page being read: what is
-/// being written, then a way to open it. Reading is never interrupted.
-struct CourseExplorationJobsPill: View {
-    let jobs: [CourseExplorationJob]
-    let forkError: String?
-    /// Mac shows one inline line in the reader's header instead of a pill.
-    var isCompact = false
+/// An exploration's state in the Learn map's badge vocabulary.
+struct CourseExplorationStateBadge: View {
+    let state: CourseExplorationState
+    var size: CGFloat = 28
+
+    var body: some View {
+        ZStack {
+            switch state {
+            case .written(let isNew, let isFinished):
+                Circle().fill(Color.courseExploration.opacity(isNew ? 1 : 0.16))
+                Image(systemName: isFinished ? "checkmark" : "arrow.triangle.branch")
+                    .font(.system(size: size * 0.42, weight: .bold))
+                    .foregroundStyle(isNew ? Color.white : Color.courseExploration)
+            case .writing:
+                Circle().fill(Color.courseExploration.opacity(0.1))
+                ProgressView().controlSize(.small).tint(Color.courseExploration)
+            case .queued:
+                Circle().fill(Color.courseExploration.opacity(0.08))
+                Image(systemName: "clock")
+                    .font(.system(size: size * 0.42, weight: .semibold))
+                    .foregroundStyle(Color.courseExploration)
+            case .failed:
+                Circle().fill(Color.orange.opacity(0.14))
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: size * 0.4, weight: .semibold))
+                    .foregroundStyle(.orange)
+            case .unwritten:
+                Circle().fill(Color.courseExploration.opacity(0.06))
+                Circle().strokeBorder(
+                    Color.courseExploration.opacity(0.55),
+                    style: StrokeStyle(lineWidth: 1.5, dash: [3, 3])
+                )
+                Image(systemName: "sparkle")
+                    .font(.system(size: size * 0.42, weight: .semibold))
+                    .foregroundStyle(Color.courseExploration)
+            }
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+}
+
+/// One exploration as a row: what it is, where it stands, and the one thing
+/// a tap can do. Only a written page opens; nothing opens by itself later.
+struct CourseExplorationRow: View {
+    let node: CourseLearningNode
+    let state: CourseExplorationState
+    /// How the learner asked for it, shown until the page has its own title.
+    let label: String
+    let identifier: String
+    /// Identifies the Write It / Try Again button.
+    let actionIdentifier: String
+    let onOpen: () -> Void
+    /// Writes an unwritten page or retries a failed one, in place.
+    let onWrite: () -> Void
+
+    var body: some View {
+        switch state {
+        case .written:
+            Button(action: onOpen) {
+                content(trailing: AnyView(
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                ))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(accessibilityLabel)
+            .accessibilityIdentifier(identifier)
+        case .failed, .unwritten:
+            let actionTitle = state == .unwritten ? "Write It" : "Try Again"
+            content(trailing: AnyView(
+                Button(actionTitle, action: onWrite)
+                    .font(.footnote.weight(.semibold))
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(Color.courseExploration)
+                    .accessibilityIdentifier(actionIdentifier)
+            ))
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(accessibilityLabel)
+            .accessibilityAction(named: actionTitle, onWrite)
+            .accessibilityIdentifier(identifier)
+        case .writing, .queued:
+            content(trailing: nil)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(accessibilityLabel)
+                .accessibilityAddTraits(.updatesFrequently)
+                .accessibilityIdentifier(identifier)
+        }
+    }
+
+    private var title: String {
+        state.isWritten ? node.title : label
+    }
+
+    private var question: String? {
+        guard let question = node.originQuestion?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !question.isEmpty, question != title else { return nil }
+        return question
+    }
+
+    private func content(trailing: AnyView?) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            CourseExplorationStateBadge(state: state)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                subtitle
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            .multilineTextAlignment(.leading)
+            Spacer(minLength: 0)
+            if let trailing { trailing }
+        }
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+
+    private var subtitle: Text {
+        switch state {
+        case .written(let isNew, let isFinished):
+            if isFinished {
+                return question.map { Text("Read · \(Text($0).italic())") } ?? Text("Read")
+            }
+            if isNew {
+                return question.map { Text("New · \(Text($0).italic())") } ?? Text("New")
+            }
+            return question.map { Text($0).italic() } ?? Text("Opened")
+        case .writing:
+            return Text("Writing… It’ll be ready right here.")
+        case .queued:
+            return Text("Waiting to start. It’ll be ready right here.")
+        case .failed(let reason):
+            return Text("Couldn’t finish. \(reason)")
+        case .unwritten:
+            return Text("Not written yet.")
+        }
+    }
+
+    private var accessibilityLabel: String {
+        switch state {
+        case .written(let isNew, let isFinished):
+            let status = isFinished ? ", read" : isNew ? ", new" : ""
+            return "Exploration, \(title)\(status). Opens the page."
+        case .writing: return "Exploration, \(title), being written."
+        case .queued: return "Exploration, \(title), waiting to start."
+        case .failed(let reason): return "Exploration, \(title), couldn’t finish. \(reason)"
+        case .unwritten: return "Exploration, \(title), not written yet."
+        }
+    }
+}
+
+/// The reader's one quiet status for every exploration the learner started in
+/// this course. It lives in the toolbar the reader already has and opens a
+/// menu; nothing floats over the text and nothing opens until the learner asks.
+struct CourseExplorationStatusMenu: View {
+    enum Placement: Equatable {
+        case toolbar(compact: Bool)
+        case macHeader
+    }
+
+    let summary: CourseExplorationStatusSummary
+    let currentPageID: String?
+    let placement: Placement
     let onOpen: (CourseExplorationJob) -> Void
     let onRetry: (CourseExplorationJob) -> Void
     let onDismiss: (CourseExplorationJob) -> Void
-    let onDismissForkError: () -> Void
+    let onMarkAllSeen: () -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        if let content {
-            if isCompact {
-                compactBody(content)
+        Menu {
+            if !summary.ready.isEmpty {
+                Section("Ready to Read") {
+                    ForEach(summary.ready) { job in
+                        Button {
+                            onOpen(job)
+                        } label: {
+                            Text(job.title)
+                            Text(summary.origin(of: job, currentPageID: currentPageID))
+                        }
+                        .accessibilityIdentifier("course-exploration-status-open-\(job.id)")
+                    }
+                }
+            }
+            if !summary.writing.isEmpty {
+                Section("Writing") {
+                    ForEach(summary.writing) { job in
+                        let isQueued = job.phase == .queued
+                        Button {} label: {
+                            Text(job.label)
+                            Text("\(isQueued ? "Waiting to start" : "Writing…") · \(summary.origin(of: job, currentPageID: currentPageID))")
+                        }
+                        .disabled(true)
+                    }
+                }
+            }
+            if !summary.failed.isEmpty {
+                Section("Didn’t Finish") {
+                    ForEach(summary.failed) { job in
+                        Menu {
+                            Button {
+                                onRetry(job)
+                            } label: {
+                                Label("Try Again", systemImage: "arrow.clockwise")
+                            }
+                            Button {
+                                onDismiss(job)
+                            } label: {
+                                Label("Dismiss", systemImage: "xmark")
+                            }
+                        } label: {
+                            Text(job.label)
+                            Text(job.failureReason ?? "")
+                        }
+                    }
+                }
+            }
+            if !summary.ready.isEmpty || !summary.failed.isEmpty {
+                Section {
+                    Button(action: onMarkAllSeen) {
+                        Label("Mark All as Seen", systemImage: "checkmark")
+                    }
+                }
+            }
+        } label: {
+            label
+        }
+        .modifier(MacHeaderMenuStyle(isMac: placement == .macHeader))
+        .accessibilityLabel(summary.accessibilityLabel)
+        .accessibilityHint("Shows the explorations you started.")
+        .accessibilityIdentifier("course-exploration-status")
+    }
+
+    private var label: some View {
+        HStack(spacing: placement == .macHeader ? 5 : 6) {
+            Image(systemName: summary.systemImage)
+                .foregroundStyle(iconColor)
+                .symbolEffect(.bounce, value: reduceMotion ? 0 : summary.ready.count)
+            Text(isCompact ? "\(summary.totalCount)" : summary.fullLabel)
+                .font(placement == .macHeader ? .system(size: 11, weight: .medium) : .callout.weight(.semibold))
+                .foregroundStyle(summary.isReadyTinted ? Color.courseExploration : Color.primary)
+                .contentTransition(.numericText())
+                .lineLimit(1)
+        }
+        .fixedSize()
+        .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: summary.fullLabel)
+    }
+
+    private var isCompact: Bool {
+        if case .toolbar(let compact) = placement { compact } else { false }
+    }
+
+    private var iconColor: Color {
+        if summary.isReadyTinted { return .courseExploration }
+        return summary.isFailureOnly ? .orange : .primary
+    }
+
+    private struct MacHeaderMenuStyle: ViewModifier {
+        let isMac: Bool
+
+        func body(content: Content) -> some View {
+            if isMac {
+                content
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .help("Explorations you started")
             } else {
-                pillBody(content)
+                content
             }
         }
     }
+}
 
-    private func compactBody(_ content: Content) -> some View {
-        HStack(spacing: 6) {
-            content.icon
-                .controlSize(.mini)
-                .frame(width: 14)
-            Text(content.title)
-                .font(.system(size: 11, weight: .medium))
-                .lineLimit(1)
-                .help(content.detail ?? content.title)
-            if let action = content.action {
-                Button(action.label, action: action.perform)
-                    .font(.system(size: 11, weight: .semibold))
-                    .buttonStyle(.borderless)
-                    .tint(Color.courseExploration)
-                    .accessibilityIdentifier("course-exploration-pill-action")
+/// Everything that starts at a tapped passage: each exploration in the order
+/// it was forked, then any discussion, then ways to go further from here.
+struct CoursePassageThreadsList: View {
+    struct Exploration: Identifiable {
+        let node: CourseLearningNode
+        let state: CourseExplorationState
+        let label: String
+        var id: String { node.id }
+    }
+
+    let explorations: [Exploration]
+    let discussions: [CourseSelectionDiscussion]
+    /// Why the last Write It or Try Again did not start.
+    var error: String?
+    let onOpenExploration: (CourseLearningNode) -> Void
+    let onWrite: (CourseLearningNode) -> Void
+    let onOpenDiscussion: (CourseSelectionDiscussion) -> Void
+    let onExploreAgain: () -> Void
+    /// Absent when the passage already has a discussion to continue.
+    let onAsk: (() -> Void)?
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var contentHeight: CGFloat = 0
+    private let maximumListHeight: CGFloat = 360
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                rows
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
             }
-            if let dismiss = content.dismiss {
-                Button(action: dismiss) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.secondary)
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(height: min(max(contentHeight, 1), maximumListHeight))
+
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 8)
+                    .accessibilityIdentifier("course-passage-error")
+            }
+
+            Divider()
+
+            HStack(spacing: 8) {
+                Button(action: onExploreAgain) {
+                    Label("Explore Again", systemImage: "arrow.triangle.branch")
+                }
+                .accessibilityHint("Asks what to explore, then writes another page from this passage")
+                .accessibilityIdentifier("course-passage-explore-again")
+                if let onAsk {
+                    Button(action: onAsk) {
+                        Label("Ask", systemImage: "bubble.left.and.bubble.right")
+                    }
+                    .accessibilityHint("Opens a discussion about this passage")
+                    .accessibilityIdentifier("course-passage-ask")
+                }
+                Spacer(minLength: 0)
+            }
+            .font(.footnote.weight(.semibold))
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .tint(Color.courseExploration)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+        }
+        .frame(idealWidth: 320, maxWidth: 420)
+        .animation(reduceMotion ? nil : .default, value: explorations.map(\.state))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-passage-threads")
+    }
+
+    private var rows: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(explorations) { item in
+                CourseExplorationRow(
+                    node: item.node,
+                    state: item.state,
+                    label: item.label,
+                    identifier: "course-passage-exploration-\(item.node.id)",
+                    actionIdentifier: "course-passage-\(item.state == .unwritten ? "write" : "retry")-\(item.node.id)",
+                    onOpen: { onOpenExploration(item.node) },
+                    onWrite: { onWrite(item.node) }
+                )
+            }
+            ForEach(discussions) { discussion in
+                Button {
+                    onOpenDiscussion(discussion)
+                } label: {
+                    HStack(spacing: 12) {
+                        ZStack {
+                            Circle().fill(Color.blue.opacity(0.14))
+                            Image(systemName: "bubble.left.and.bubble.right")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.blue)
+                        }
+                        .frame(width: 28, height: 28)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Your discussion")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.primary)
+                            Text("Started \(discussion.createdAt.formatted(.relative(presentation: .named)))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.vertical, 6)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Dismiss")
-                .accessibilityIdentifier("course-exploration-pill-dismiss")
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("course-passage-discussion-\(discussion.id.uuidString)")
             }
         }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("course-exploration-pill")
-    }
-
-    private func pillBody(_ content: Content) -> some View {
-        Group {
-            HStack(spacing: 10) {
-                content.icon
-                    .frame(width: 18)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(content.title)
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(1)
-                    if let detail = content.detail {
-                        Text(detail)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-                Spacer(minLength: 4)
-                if let action = content.action {
-                    Button(action.label, action: action.perform)
-                        .font(.subheadline.weight(.semibold))
-                        .buttonStyle(.borderless)
-                        .tint(Color.courseExploration)
-                        .accessibilityIdentifier("course-exploration-pill-action")
-                }
-                if let dismiss = content.dismiss {
-                    Button(action: dismiss) {
-                        Image(systemName: "xmark")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(4)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Dismiss")
-                    .accessibilityIdentifier("course-exploration-pill-dismiss")
-                }
-            }
-            .padding(.leading, 14)
-            .padding(.trailing, 10)
-            .padding(.vertical, 10)
-            .modifier(GlassCapsuleModifier(interactive: true))
-            .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("course-exploration-pill")
-        }
-    }
-
-    private struct Content {
-        struct Action {
-            let label: String
-            let perform: () -> Void
-        }
-
-        let icon: AnyView
-        let title: String
-        let detail: String?
-        let action: Action?
-        let dismiss: (() -> Void)?
-    }
-
-    private var content: Content? {
-        let active = jobs.filter(\.isActive)
-        let writingDetail: String? = active.isEmpty ? nil
-            : active.count == 1 ? "Still writing “\(active[0].title)”"
-            : "Still writing \(active.count) more"
-        if let ready = jobs.last(where: { $0.phase == .ready }) {
-            return Content(
-                icon: AnyView(Image(systemName: "arrow.triangle.branch").foregroundStyle(Color.courseExploration)),
-                title: ready.title,
-                detail: writingDetail ?? "Ready to read",
-                action: .init(label: "Open") { onOpen(ready) },
-                dismiss: { onDismiss(ready) }
-            )
-        }
-        if let failed = jobs.last(where: { if case .failed = $0.phase { true } else { false } }),
-           case .failed(let reason) = failed.phase {
-            return Content(
-                icon: AnyView(Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)),
-                title: "Couldn’t write “\(failed.title)”",
-                detail: writingDetail ?? reason,
-                action: .init(label: "Retry") { onRetry(failed) },
-                dismiss: { onDismiss(failed) }
-            )
-        }
-        if !active.isEmpty {
-            let queued = active.filter { $0.phase == .queued }.count
-            return Content(
-                icon: AnyView(ProgressView().controlSize(.small)),
-                title: active.count == 1 ? "Writing “\(active[0].title)”" : "Writing \(active.count) explorations",
-                detail: queued > 0 ? "\(queued) waiting for a free agent" : "Keep reading. It will show up here when it’s ready.",
-                action: nil,
-                dismiss: nil
-            )
-        }
-        if let forkError {
-            return Content(
-                icon: AnyView(Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)),
-                title: "Couldn’t start the exploration",
-                detail: forkError,
-                action: nil,
-                dismiss: onDismissForkError
-            )
-        }
-        return nil
     }
 }

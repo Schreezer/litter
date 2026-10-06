@@ -98,6 +98,52 @@ struct CourseExplorationRequest: Equatable, Sendable {
         }
     }
 
+    /// A short name for the exploration while it is being written, in the
+    /// learner's terms and without nested quotes.
+    var statusLabel: String {
+        if direction == .synthesis { return "Tying the threads together" }
+        let passage = trimmed(quotedPassage)
+        if let question = trimmed(question),
+           !CourseExplorePassageIntent.allCases.contains(where: { $0.question == question }) {
+            return Self.clipped(question, limit: 60)
+        }
+        if let passage { return Self.clipped(passage, limit: 50) }
+        return placeholderTitle
+    }
+
+    /// Rebuilds the request for an exploration forked in an earlier launch,
+    /// from what its page saved: the learner's question and passage.
+    static func reconstructed(node: CourseLearningNode, parent: CourseLearningNode?) -> Self? {
+        guard let parent, let parentPageID = parent.pageID else { return nil }
+        return Self(
+            parentPageID: parentPageID,
+            parentTitle: parent.title,
+            direction: .question,
+            question: node.originQuestion,
+            quotedPassage: node.originAnchor?.selectedText
+        )
+    }
+
+    /// The status label for an exploration whose request is gone, read from
+    /// what its page saved: the learner's own question, else the passage.
+    static func statusLabel(for node: CourseLearningNode) -> String {
+        let question = (node.originQuestion?.trimmingCharacters(in: .whitespacesAndNewlines))
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let passage = (node.originAnchor?.selectedText.trimmingCharacters(in: .whitespacesAndNewlines))
+            .flatMap { $0.isEmpty ? nil : $0 }
+        if let passage {
+            // Quick intents and "Tell me more" quote the passage; the passage
+            // alone reads better than a question wrapped around it.
+            let isOwnQuestion = question.map { question in
+                !question.hasPrefix("Tell me more about")
+                    && !CourseExplorePassageIntent.allCases.contains { question.hasPrefix($0.question) }
+            } ?? false
+            if isOwnQuestion, let question { return clipped(question, limit: 60) }
+            return clipped(passage, limit: 50)
+        }
+        return question.map { clipped($0, limit: 60) } ?? node.title
+    }
+
     /// What the agent should write, without dictating the exact topic.
     var generationGuidance: String {
         var lines: [String] = []
@@ -135,10 +181,10 @@ struct CourseExplorationRequest: Equatable, Sendable {
         return text
     }
 
-    private static func clipped(_ text: String) -> String {
+    private static func clipped(_ text: String, limit: Int = titleLimit) -> String {
         let singleLine = text.split(whereSeparator: \.isNewline).joined(separator: " ")
-        guard singleLine.count > titleLimit else { return singleLine }
-        return String(singleLine.prefix(titleLimit - 1)).trimmingCharacters(in: .whitespaces) + "…"
+        guard singleLine.count > limit else { return singleLine }
+        return String(singleLine.prefix(limit - 1)).trimmingCharacters(in: .whitespaces) + "…"
     }
 }
 
@@ -235,10 +281,125 @@ struct CourseExplorationJob: Identifiable, Equatable, Sendable {
     let courseID: String
     let parentPageID: String
     let pageID: String?
+    /// The page title: a placeholder until the agent names the page.
     var title: String
+    /// How the learner asked for it, shown while it is being written.
+    var label: String
+    var parentTitle: String
     var phase: Phase
 
     var isActive: Bool { phase == .queued || phase == .writing }
+
+    var failureReason: String? {
+        if case .failed(let reason) = phase { reason } else { nil }
+    }
+}
+
+/// Where one exploration stands, from its page and its job this launch.
+enum CourseExplorationState: Equatable, Sendable {
+    case written(isNew: Bool, isFinished: Bool)
+    case queued
+    case writing
+    case failed(String)
+    /// Never written, or a write that stopped in an earlier launch.
+    case unwritten
+
+    static func resolve(
+        node: CourseLearningNode,
+        job: CourseExplorationJob?,
+        progress: CourseExplorationProgress,
+        isBackgroundGenerating: Bool = false
+    ) -> Self {
+        switch job?.phase {
+        case .queued: return .queued
+        case .writing: return .writing
+        case .failed(let reason) where node.status != .generated: return .failed(reason)
+        default: break
+        }
+        if isBackgroundGenerating { return .writing }
+        if node.status == .generated || job?.phase == .ready {
+            return .written(
+                isNew: node.pageID.map { progress.lastVisitedAt[$0] == nil } ?? true,
+                isFinished: node.pageID.map(progress.finishedPageIDs.contains) ?? false
+            )
+        }
+        return .unwritten
+    }
+
+    var isWritten: Bool {
+        if case .written = self { true } else { false }
+    }
+
+    var isActive: Bool { self == .queued || self == .writing }
+
+    var failureReason: String? {
+        if case .failed(let reason) = self { reason } else { nil }
+    }
+}
+
+/// The reader's one status line for every exploration the learner started in
+/// this course: what is ready, what is still being written, what failed.
+struct CourseExplorationStatusSummary: Equatable {
+    let ready: [CourseExplorationJob]
+    let writing: [CourseExplorationJob]
+    let failed: [CourseExplorationJob]
+
+    /// Jobs forked from the page being read come first, then the newest.
+    init(jobs: [CourseExplorationJob], currentPageID: String?) {
+        let ordered = jobs.enumerated().sorted { lhs, rhs in
+            let left = lhs.element.parentPageID == currentPageID
+            let right = rhs.element.parentPageID == currentPageID
+            if left != right { return left }
+            return lhs.offset > rhs.offset
+        }.map(\.element)
+        ready = ordered.filter { $0.phase == .ready }
+        writing = ordered.filter(\.isActive)
+        failed = ordered.filter { $0.failureReason != nil }
+    }
+
+    var isEmpty: Bool { ready.isEmpty && writing.isEmpty && failed.isEmpty }
+    var totalCount: Int { ready.count + writing.count + failed.count }
+
+    var fullLabel: String {
+        let r = ready.count, w = writing.count, f = failed.count
+        switch (r > 0, w > 0, f > 0) {
+        case (false, true, false):
+            return w == 1 ? "Writing 1 exploration" : "Writing \(w) explorations"
+        case (true, false, false):
+            return r == 1 ? "1 exploration ready" : "\(r) explorations ready"
+        case (false, false, true):
+            return f == 1 ? "1 exploration didn’t finish" : "\(f) explorations didn’t finish"
+        case (true, true, _):
+            return "\(r) ready · \(w) writing"
+        case (true, false, true):
+            return "\(r) ready · \(f) didn’t finish"
+        case (false, true, true):
+            return "\(w) writing · \(f) didn’t finish"
+        case (false, false, false):
+            return ""
+        }
+    }
+
+    var systemImage: String {
+        if !ready.isEmpty { return "arrow.triangle.branch" }
+        if !writing.isEmpty { return "pencil.line" }
+        return "exclamationmark.circle"
+    }
+
+    var isReadyTinted: Bool { !ready.isEmpty }
+    var isFailureOnly: Bool { ready.isEmpty && writing.isEmpty && !failed.isEmpty }
+
+    var accessibilityLabel: String {
+        var parts: [String] = []
+        if !ready.isEmpty { parts.append("\(ready.count) ready") }
+        if !writing.isEmpty { parts.append("\(writing.count) writing") }
+        if !failed.isEmpty { parts.append("\(failed.count) didn’t finish") }
+        return "Explorations: " + parts.joined(separator: ", ")
+    }
+
+    func origin(of job: CourseExplorationJob, currentPageID: String?) -> String {
+        job.parentPageID == currentPageID ? "From this page" : "From “\(job.parentTitle)”"
+    }
 }
 
 enum CourseExplorationConcurrency {

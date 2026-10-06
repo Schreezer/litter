@@ -234,7 +234,9 @@ private struct MacCourseOutlineNode: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
-                    .disabled(generationDisabled)
+                    // Explorations have their own writers, so a busy course
+                    // agent never blocks them.
+                    .disabled(generationDisabled && !CourseExplorationMap.isExploration(node))
                     .help("Create \(node.title)")
                     .accessibilityLabel(generationRequest?.accessibilityLabel ?? "Create \(node.title)")
                     .accessibilityIdentifier("generate-course-node-\(node.id)")

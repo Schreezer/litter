@@ -15,6 +15,7 @@ struct CourseLessonActionButton: View {
     @State private var requestID: UUID?
     @State private var isGenerating = false
     @State private var error: String?
+    @State private var notice: String?
 
     var body: some View {
         VStack(spacing: 8) {
@@ -25,6 +26,13 @@ struct CourseLessonActionButton: View {
                     .padding(12)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
                     .accessibilityIdentifier("course-reading-error")
+            } else if let notice {
+                Text(notice)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(12)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .accessibilityIdentifier("course-reading-notice")
             }
             actionButton
         }
@@ -40,6 +48,7 @@ struct CourseLessonActionButton: View {
         #if targetEnvironment(macCatalyst)
         Button {
             error = nil
+            notice = nil
             requestID = UUID()
         } label: {
             HStack(spacing: 8) {
@@ -64,6 +73,7 @@ struct CourseLessonActionButton: View {
         #else
         let button = Button {
             error = nil
+            notice = nil
             requestID = UUID()
         } label: {
             HStack(spacing: usesGlass ? 10 : 12) {
@@ -104,7 +114,7 @@ struct CourseLessonActionButton: View {
             if requestID == request { requestID = nil; isGenerating = false }
         }
         do {
-            try await store.openCourseNode(
+            let outcome = try await store.openCourseNode(
                 node,
                 in: course,
                 replacesCurrentPage: replacesCurrentPage,
@@ -113,6 +123,9 @@ struct CourseLessonActionButton: View {
                 onGenerating: { isGenerating = true },
                 shouldOpen: { requestID == request }
             )
+            if outcome == .stillWriting || outcome == .queued, requestID == request {
+                notice = "“\(node.title)” is being written. Open it again when it’s ready."
+            }
         } catch is CancellationError {
             // Leaving the reader cancels navigation, not the existing generation run.
         } catch {
@@ -122,10 +135,24 @@ struct CourseLessonActionButton: View {
     }
 }
 
+/// What opening a page on the course map did.
+enum CourseNodeOpenOutcome: Equatable {
+    case opened
+    /// The learner moved on before it was ready, so it was not opened.
+    case skipped
+    /// An exploration that is being written. Nothing opens when it finishes.
+    case stillWriting
+    /// An unwritten exploration, now queued for writing. Nothing opens when it finishes.
+    case queued
+}
+
 extension CourseExperienceStore {
     /// Opens any page on the course map, planned lesson or exploration, after
-    /// its durable generated status is confirmed. Generates it first if needed.
+    /// its durable generated status is confirmed. A planned lesson is generated
+    /// first if needed. An exploration is never waited on: one that is not
+    /// written yet is queued, and the learner opens it once it is ready.
     @MainActor
+    @discardableResult
     func openCourseNode(
         _ node: CourseLearningNode,
         in course: LearningCourse,
@@ -134,22 +161,17 @@ extension CourseExperienceStore {
         appState: AppState,
         onGenerating: @MainActor () -> Void = {},
         shouldOpen: @MainActor () -> Bool = { true }
-    ) async throws {
+    ) async throws -> CourseNodeOpenOutcome {
         let repository = try await documentRepository(for: course)
         var target = try await currentReadableTarget(node, in: repository)
         try Task.checkCancellation()
-        if target.status != .generated, explorationJob(nodeID: target.id)?.isActive == true {
-            // Its own exploration worker is writing it; starting the course
-            // agent on the same page would write it twice.
-            onGenerating()
-            while explorationJob(nodeID: target.id)?.isActive == true {
-                try await Task.sleep(for: .milliseconds(300))
+        if CourseExplorationMap.isExploration(target), target.status != .generated {
+            if explorationJob(nodeID: target.id)?.isActive == true
+                || (backgroundGeneratingCourseID == course.id && backgroundGeneratingNodeID == target.id) {
+                return .stillWriting
             }
-            try Task.checkCancellation()
-            target = try await currentReadableTarget(node, in: repository)
-            if target.status != .generated, case .failed(let reason) = explorationJob(nodeID: target.id)?.phase {
-                throw CourseReadingNavigationError.unavailable(reason)
-            }
+            try await writeExploration(nodeID: target.id, in: course, appModel: appModel, appState: appState)
+            return .queued
         }
         if target.status != .generated {
             onGenerating()
@@ -187,10 +209,11 @@ extension CourseExperienceStore {
         guard let pageID = target.pageID else {
             throw CourseReadingNavigationError.unavailable("This lesson has no page yet. Open the course agent to repair it.")
         }
-        guard shouldOpen() else { return }
+        guard shouldOpen() else { return .skipped }
         openReadingPage(
             courseID: course.id, pageID: pageID, replacingCurrentPage: replacesCurrentPage
         )
+        return .opened
     }
 
     private func currentReadableTarget(
