@@ -1233,7 +1233,9 @@ enum AppleCourseLessonCheckPolicy {
         let answer = clean(content.checkAnswer)
         // A positional answer refers to the original model choices. Removing
         // a duplicate must not shift its letter or number to a different answer.
-        let originalIndex = Int(answer).map { $0 - 1 }
+        let originalIndex = Int(answer).flatMap { number in
+            number > 0 && number <= content.checkOptions.count ? number - 1 : nil
+        }
             ?? answer.uppercased().first.flatMap { letter in
                 answer.count == 1 ? "ABCDE".firstIndex(of: letter)
                     .map { "ABCDE".distance(from: "ABCDE".startIndex, to: $0) } : nil

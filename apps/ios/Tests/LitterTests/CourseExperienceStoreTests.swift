@@ -4986,7 +4986,7 @@ final class CourseExperienceStoreTests: XCTestCase {
             XCTAssertEqual(assessment.answer?.optionId, "option-1")
         }
         XCTAssertNil(AppleCourseLessonCheckPolicy.assessmentFence(for: content(answer: "Something else")))
-        for answer in ["Do not digest food", "They remember a pathogen", "Remember", "Remember a pathogen or digest food"] {
+        for answer in ["Do not digest food", "They remember a pathogen", "Remember", "Remember a pathogen or digest food", "0", "-1", String(Int.min), String(Int.max)] {
             XCTAssertNil(AppleCourseLessonCheckPolicy.assessmentFence(for: content(answer: answer)), answer)
         }
         XCTAssertNil(AppleCourseLessonCheckPolicy.assessmentFence(for: content(answer: "C")))
