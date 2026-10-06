@@ -88,6 +88,59 @@ final class RunningTurnSnapshotTests: XCTestCase {
         XCTAssertEqual(payload.lastTool, "edit_file src/auth.go")
     }
 
+    func testLastToolUsesActivityPhrase() {
+        let key = ThreadKey(serverId: "macbook", threadId: "t3")
+        let server = makeServer(id: "macbook", displayName: "MacBook Pro")
+        let reading = makeSummary(
+            key: key,
+            serverDisplayName: "MacBook Pro",
+            title: "Light Reactions",
+            lastToolLabel: "MCP native-editor-fetch",
+            currentActivity: AppTurnActivity(
+                kind: .readingCourse,
+                subject: "Chlorophyll basics",
+                pageId: "page-chlorophyll",
+                isRunning: true,
+                unitCount: 0,
+                stepCount: 1,
+                coursePagesRead: 0,
+                coursePagesWritten: 0
+            )
+        )
+        let thread = makeThread(key: key, model: "gpt-5-codex")
+
+        let payload = TurnLiveActivityController.makeRunningTurnSnapshot(
+            for: thread,
+            startDate: Date(timeIntervalSince1970: 100),
+            snapshot: makeRecord(servers: [server], summaries: [reading], threads: [thread])
+        )
+        XCTAssertEqual(payload.lastTool, "Reading “Chlorophyll basics”")
+
+        let command = makeSummary(
+            key: key,
+            serverDisplayName: "MacBook Pro",
+            title: "Fix auth",
+            lastToolLabel: "Bash cd /Users/me/project && cargo test",
+            currentActivity: AppTurnActivity(
+                kind: .runningCommand,
+                subject: "cargo test -p codex-mobile-client --lib turn_activity",
+                pageId: nil,
+                isRunning: true,
+                unitCount: 0,
+                stepCount: 1,
+                coursePagesRead: 0,
+                coursePagesWritten: 0
+            )
+        )
+        let commandPayload = TurnLiveActivityController.makeRunningTurnSnapshot(
+            for: thread,
+            startDate: Date(timeIntervalSince1970: 100),
+            snapshot: makeRecord(servers: [server], summaries: [command], threads: [thread])
+        )
+        XCTAssertEqual(commandPayload.lastTool, "Running cargo test -p codex-mobile-client --lib…")
+        XCTAssertEqual(commandPayload.lastTool?.count, 48)
+    }
+
     func testMakeRunningTurnSnapshotFallsBackWhenServerOrSummaryMissing() {
         let key = ThreadKey(serverId: "studio", threadId: "t2")
         let thread = makeThread(key: key, model: "")
@@ -141,7 +194,8 @@ final class RunningTurnSnapshotTests: XCTestCase {
         key: ThreadKey,
         serverDisplayName: String,
         title: String,
-        lastToolLabel: String?
+        lastToolLabel: String?,
+        currentActivity: AppTurnActivity? = nil
     ) -> AppSessionSummary {
         AppSessionSummary(
             key: key,
@@ -173,7 +227,9 @@ final class RunningTurnSnapshotTests: XCTestCase {
             lastTurnEndMs: nil,
             stats: nil,
             tokenUsage: nil,
-            goal: nil
+            goal: nil,
+            currentActivity: currentActivity,
+            lastTurnOutcome: nil
         )
     }
 

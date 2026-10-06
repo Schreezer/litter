@@ -122,10 +122,11 @@ final class AppRuntimeController {
     }
 
     func handleSnapshot(_ snapshot: AppSnapshotRecord?) {}
+    var canBeginUserInitiatedTurn: Bool { false }
     func beginUserInitiatedTurn(
         key: ThreadKey,
         appModel: AppModel,
-        agentName: String = "Codex",
+        context: ContinuedTurnContext,
         keepsAliveAcrossTurns: Bool = false
     ) -> UUID? { nil }
     func markUserInitiatedTurnAccepted(_ token: UUID?) {}
@@ -134,7 +135,7 @@ final class AppRuntimeController {
         key: ThreadKey,
         agentName: String
     ) -> UUID? { nil }
-    func finishUserInitiatedMultiTurn(key: ThreadKey, success: Bool) {}
+    func finishUserInitiatedMultiTurn(key: ThreadKey, outcome: TurnOutcome) {}
     func appDidEnterBackground() {
         lastBackgroundedAt = Date()
     }

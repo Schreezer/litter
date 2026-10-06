@@ -2796,6 +2796,9 @@ final class CourseExperienceStore {
         let sources: [CourseSource]
         let target: CourseAgentExecutionTarget
         let optimisticMessageID: UUID?
+        /// Names the job on the background-task banner; nil derives it from
+        /// the dispatch scope.
+        var bannerIntent: ContinuedTurnContext.Intent? = nil
     }
 
     private struct HermesRecoveryScope: Hashable {
@@ -4686,7 +4689,7 @@ final class CourseExperienceStore {
         if let key {
             AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                 key: key,
-                success: false
+                outcome: .interrupted
             )
         }
         if let selectionDiscussionID {
@@ -5356,6 +5359,7 @@ final class CourseExperienceStore {
         pageContext: CoursePageChatContext? = nil,
         selectionDiscussionID: UUID? = nil,
         visibility: CourseAgentTranscriptVisibility = .learner,
+        bannerIntent: ContinuedTurnContext.Intent? = nil,
         appModel: AppModel,
         appState: AppState
     ) -> Bool {
@@ -5465,7 +5469,10 @@ final class CourseExperienceStore {
             learnerText: isDurableSubmission ? trimmed : nil,
             sources: submittedSources,
             target: dispatchTarget,
-            optimisticMessageID: optimisticMessage?.id
+            optimisticMessageID: optimisticMessage?.id,
+            bannerIntent: bannerIntent
+                ?? (reference?.pageTitle ?? pageContext?.pageTitle)
+                    .map { ContinuedTurnContext.Intent.answerQuestion(pageTitle: $0) }
         )
         if isDurableSubmission {
             // A new attempt invalidates whatever the last status check found.
@@ -5560,7 +5567,8 @@ final class CourseExperienceStore {
             learnerText: learnerText,
             sources: previousAttempt.sources,
             target: previousAttempt.target,
-            optimisticMessageID: optimisticMessage.id
+            optimisticMessageID: optimisticMessage.id,
+            bannerIntent: previousAttempt.bannerIntent
         )
 
         if composerMatches(
@@ -5705,7 +5713,7 @@ final class CourseExperienceStore {
                     if let pendingThreadKey {
                         AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                             key: pendingThreadKey,
-                            success: false
+                            outcome: .interrupted
                         )
                     }
                     return
@@ -5723,7 +5731,7 @@ final class CourseExperienceStore {
                 self.chatRuns.finish(scope, token: runToken)
                 AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                     key: threadKey,
-                    success: false
+                    outcome: .interrupted
                 )
             } catch {
                 let message = "Couldn’t stop the agent: \(error.localizedDescription)"
@@ -5784,6 +5792,10 @@ final class CourseExperienceStore {
             _ = self.sendMessage(
                 approval,
                 visibility: .internalInstruction,
+                bannerIntent: .writeLesson(
+                    title: preparedTarget.title,
+                    pageID: preparedTarget.pageID
+                ),
                 appModel: appModel,
                 appState: appState
             )
@@ -6905,7 +6917,7 @@ final class CourseExperienceStore {
             if let hermesRecoveryKey {
                 AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                     key: hermesRecoveryKey,
-                    success: false
+                    outcome: .failed(message: error.localizedDescription)
                 )
             }
             if runtimeID == .codex,
@@ -7417,7 +7429,8 @@ final class CourseExperienceStore {
         let generationTarget = generationRequest.target
 
         let workspaceID = currentCourseWorkspaceID
-        let prompt = CourseExplorationMap.isExploration(generationTarget)
+        let isExploration = CourseExplorationMap.isExploration(generationTarget)
+        let prompt = isExploration
             ? Self.explorationGenerationPrompt(
                 for: generationTarget,
                 request: pendingExplorationRequests[generationTarget.id]
@@ -7430,7 +7443,13 @@ final class CourseExperienceStore {
             learnerText: nil,
             sources: [],
             target: mainDispatchTarget(),
-            optimisticMessageID: nil
+            optimisticMessageID: nil,
+            bannerIntent: isExploration
+                ? .exploreTopic(
+                    title: explorationBannerTopic(for: generationTarget),
+                    pageID: generationTarget.pageID
+                )
+                : .writeLesson(title: generationTarget.title, pageID: generationTarget.pageID)
         )
 
         let scope = CourseChatScope.main
@@ -8154,7 +8173,7 @@ final class CourseExperienceStore {
             if let hermesRecoveryKey {
                 AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                     key: hermesRecoveryKey,
-                    success: false
+                    outcome: .failed(message: error.localizedDescription)
                 )
             }
             if currentAgentRuntimeID == .codex,
@@ -9642,7 +9661,7 @@ final class CourseExperienceStore {
                     try await writeExplorationWithHostedWorker(prompt: prompt, course: context.course)
                 } else {
                     try await writeExplorationWithCodexWorker(
-                        prompt: prompt, course: context.course, appModel: appModel
+                        prompt: prompt, node: node, course: context.course, appModel: appModel
                     )
                 }
             } else {
@@ -9729,6 +9748,7 @@ final class CourseExperienceStore {
     /// A fresh Codex thread per exploration, on the course's server and model.
     private func writeExplorationWithCodexWorker(
         prompt: String,
+        node: CourseLearningNode,
         course: LearningCourse,
         appModel: AppModel
     ) async throws {
@@ -9745,7 +9765,7 @@ final class CourseExperienceStore {
                 "Codex authentication was cancelled. Reconnect the agent to continue."
             )
         }
-        _ = try await documentRepository(for: course)
+        let repository = try await documentRepository(for: course)
         let key = try await startFreshCourseThread(
             serverID: serverID,
             runtimeID: runtimeID,
@@ -9768,10 +9788,16 @@ final class CourseExperienceStore {
             effort: ReasoningEffort(wireValue: target.reasoningEffortID),
             serviceTier: nil
         )
+        let bannerContext = ContinuedTurnContext(
+            agentName: runtimeID.displayLabel,
+            intent: .exploreTopic(title: explorationBannerTopic(for: node), pageID: node.pageID),
+            pageTitlesByID: await Self.bannerPageTitles(in: repository)
+        )
         let receipt = try await appModel.startTurn(
             key: key,
             payload: payload,
             backgroundAgentName: runtimeID.displayLabel,
+            backgroundContext: bannerContext,
             mayCreateBackgroundContinuation: true
         )
         guard receipt.kind != .queued, let turnID = receipt.turnId, !turnID.isEmpty else {
@@ -10711,6 +10737,49 @@ final class CourseExperienceStore {
         nodes.flatMap { [$0] + flattenLearningNodes($0.children) }
     }
 
+    /// Page titles for the background-task banner, keyed by page ID. Covers
+    /// context pages too, since the agent reads its sources. Best effort: a
+    /// missing title only makes the banner less specific. Reading the outline
+    /// loads the workspace, so it is skipped when no continued-processing
+    /// task could start (before iOS 26, on Mac, or while the app is not
+    /// active).
+    private static func bannerPageTitles(
+        in repository: CourseDocumentRepository
+    ) async -> [String: String] {
+        guard AppRuntimeController.shared.canBeginUserInitiatedTurn,
+              let outline = try? await repository.outline() else { return [:] }
+        return Dictionary(
+            flattenLearningNodes(outline.allPages).compactMap { node in
+                node.pageID.map { ($0, node.title) }
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+
+    /// The exploration a banner names: the learner's question or passage
+    /// rather than the placeholder page title built from them.
+    private func explorationBannerTopic(for node: CourseLearningNode) -> String {
+        pendingExplorationRequests[node.id]?.bannerTopic
+            ?? CourseExplorationRequest.bannerTopic(forTitle: node.title)
+    }
+
+    /// An explicit intent wins; otherwise a discussion answers about its page
+    /// and the main chat works on the course.
+    private func courseBannerIntent(
+        attempt: CourseAgentDispatchAttempt,
+        selectionDiscussionID: UUID?
+    ) -> ContinuedTurnContext.Intent {
+        if let intent = attempt.bannerIntent { return intent }
+        if let discussion = selectionDiscussionID.flatMap({ selectionDiscussion(id: $0) }) {
+            return .answerQuestion(pageTitle: discussion.pageTitle)
+        }
+        let courseTitle = courses.first { $0.workspaceID == attempt.workspaceID }?.title
+            ?? (attempt.workspaceID == currentCourseWorkspaceID && !brief.title.isEmpty
+                ? brief.title
+                : nil)
+        return .courseChat(courseTitle: courseTitle)
+    }
+
     func importImageSource(
         data: Data,
         selectionDiscussionID: UUID? = nil
@@ -11257,7 +11326,7 @@ final class CourseExperienceStore {
                 rootTitle: brief.title.isEmpty ? "New Course" : brief.title
             )
             try requireHermesLeaseIfNeeded()
-            _ = repository
+            let bannerPageTitles = await Self.bannerPageTitles(in: repository)
             await CourseDocumentRegistry.shared.register(
                 threadID: threadKey.threadId,
                 workspaceID: workspaceID
@@ -11418,6 +11487,14 @@ final class CourseExperienceStore {
                     key: threadKey,
                     payload: payload,
                     backgroundAgentName: runtimeID.displayLabel,
+                    backgroundContext: ContinuedTurnContext(
+                        agentName: runtimeID.displayLabel,
+                        intent: courseBannerIntent(
+                            attempt: attempt,
+                            selectionDiscussionID: selectionDiscussionID
+                        ),
+                        pageTitlesByID: bannerPageTitles
+                    ),
                     keepsBackgroundAliveAcrossTurns: runtimeID == "hermes",
                     mayCreateBackgroundContinuation: true
                 )
@@ -11601,7 +11678,7 @@ final class CourseExperienceStore {
             if runtimeID == "hermes", let key = acceptedHermesTurn?.key ?? hermesThreadKey {
                 AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                     key: key,
-                    success: false
+                    outcome: .failed(message: error.localizedDescription)
                 )
             }
             if nsError.domain == "LearnfoldRemoteCourseTool",
@@ -12452,7 +12529,7 @@ final class CourseExperienceStore {
                 )
                 AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                     key: key,
-                    success: true
+                    outcome: .completed
                 )
                 return
             }
@@ -14992,7 +15069,7 @@ final class CourseExperienceStore {
             }
             AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                 key: key,
-                success: false
+                outcome: .failed(message: "The request did not reach Hermes.")
             )
             try persistPendingHermesExpectedTurn(
                 nil,

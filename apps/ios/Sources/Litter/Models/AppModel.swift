@@ -2305,6 +2305,7 @@ final class AppModel {
         key: ThreadKey,
         payload: AppComposerPayload,
         backgroundAgentName: String = "Codex",
+        backgroundContext: ContinuedTurnContext? = nil,
         keepsBackgroundAliveAcrossTurns: Bool = false,
         mayCreateBackgroundContinuation: Bool
     ) async throws -> AppTurnSubmissionReceipt {
@@ -2312,7 +2313,12 @@ final class AppModel {
             AppRuntimeController.shared.beginUserInitiatedTurn(
                 key: key,
                 appModel: self,
-                agentName: backgroundAgentName,
+                context: backgroundTurnContext(
+                    backgroundContext,
+                    agentName: backgroundAgentName,
+                    key: key,
+                    payload: payload
+                ),
                 keepsAliveAcrossTurns: keepsBackgroundAliveAcrossTurns
             )
         } else {
@@ -2335,6 +2341,25 @@ final class AppModel {
             lastError = error.localizedDescription
             throw error
         }
+    }
+
+    /// Callers without a specific job get a generic banner named by the
+    /// thread's explicit title or the learner's first typed line.
+    private func backgroundTurnContext(
+        _ context: ContinuedTurnContext?,
+        agentName: String,
+        key: ThreadKey,
+        payload: AppComposerPayload
+    ) -> ContinuedTurnContext {
+        var resolved = context ?? ContinuedTurnContext(
+            agentName: agentName,
+            intent: .generic(title: ContinuedTurnContext.genericTitle(
+                threadTitle: threadSnapshot(for: key)?.info.title,
+                typedText: payload.text
+            ))
+        )
+        resolved.agentName = agentName
+        return resolved
     }
 
     func hydrateThreadPermissions(for key: ThreadKey, appState: AppState) async -> ThreadKey? {

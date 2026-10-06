@@ -144,6 +144,57 @@ struct CourseExplorationRequest: Equatable, Sendable {
         return question.map { clipped($0, limit: 60) } ?? node.title
     }
 
+    /// What the background-task banner names inside "Exploring “…”": the
+    /// learner's own question, else the passage they forked from, without
+    /// the placeholder's framing. Quick-intent forks from different passages
+    /// therefore read differently.
+    var bannerTopic: String {
+        let question = trimmed(question)
+        let asksQuickIntent = question.map { question in
+            CourseExplorePassageIntent.allCases.contains { $0.question == question }
+        } ?? false
+        let topic: String
+        if let question, !asksQuickIntent {
+            topic = question
+        } else if let passage = trimmed(quotedPassage) {
+            topic = passage
+        } else if let question {
+            topic = question
+        } else if direction == .question {
+            topic = parentTitle
+        } else {
+            topic = placeholderTitle
+        }
+        return Self.bannerSafe(Self.clipped(topic))
+    }
+
+    /// The banner topic for an exploration whose request is gone, such as
+    /// after a relaunch: its title without the placeholder's framing.
+    static func bannerTopic(forTitle title: String) -> String {
+        var topic = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let intent = CourseExplorePassageIntent.allCases.first(where: {
+            topic.hasPrefix($0.question + " “")
+        }) {
+            topic = String(topic.dropFirst(intent.question.count + 1))
+        } else if topic.hasPrefix("Exploring ") {
+            topic = String(topic.dropFirst("Exploring ".count))
+        }
+        if topic.hasPrefix("“") {
+            topic = String(topic.dropFirst())
+            if topic.hasSuffix("”") { topic = String(topic.dropLast()) }
+        }
+        return bannerSafe(topic)
+    }
+
+    /// The banner wraps the topic in “ ”; inner double quotes become single
+    /// quotes so that pair stays balanced.
+    private static func bannerSafe(_ topic: String) -> String {
+        topic
+            .replacingOccurrences(of: "“", with: "‘")
+            .replacingOccurrences(of: "”", with: "’")
+            .replacingOccurrences(of: "\"", with: "'")
+    }
+
     /// What the agent should write, without dictating the exact topic.
     var generationGuidance: String {
         var lines: [String] = []
