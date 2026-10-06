@@ -1785,6 +1785,7 @@ mod tests {
     fn error_notification() {
         let notification = ServerNotification::Error(proto::ErrorNotification {
             error: proto::TurnError {
+                misalignment: None,
                 message: "rate limited".to_string(),
                 codex_error_info: None,
                 additional_details: None,

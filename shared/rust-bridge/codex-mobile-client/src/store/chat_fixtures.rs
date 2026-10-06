@@ -115,6 +115,7 @@ fn error_notification(turn: &str, message: &str, will_retry: bool) -> UiEvent {
         "codex".into(),
         &upstream::ServerNotification::Error(upstream::ErrorNotification {
             error: upstream::TurnError {
+                misalignment: None,
                 message: message.into(),
                 codex_error_info: None,
                 additional_details: None,

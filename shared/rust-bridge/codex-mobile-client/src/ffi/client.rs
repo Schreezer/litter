@@ -3563,6 +3563,7 @@ Widget construction guidelines (for reference when making UI decisions):\n\n\
 
 #[cfg(test)]
 mod tests {
+    use super::{amp_mode_models, finish_model_refresh};
     use super::{
         ImageViewSource, append_cached_models_for_failed_runtimes, append_missing_amp_mode_models,
         choose_saved_app_update_server_id, codex_account_error, image_read_command,

@@ -1417,7 +1417,7 @@ mod mobile_client_tests {
             .map_err(|error| RpcError::Deserialization(error.to_string())),
             other => Err(RpcError::Deserialization(format!(
                 "unexpected request in test: {}",
-                other.method()
+                other.method_name()
             ))),
         });
         let session = Arc::new(ServerSession::test_stub_with_handlers(
