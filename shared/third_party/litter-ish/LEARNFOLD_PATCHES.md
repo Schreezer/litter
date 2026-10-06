@@ -29,6 +29,11 @@ Learnfold carries the following local security/build patches:
   space silently produced an empty `cpu-offsets.h` and the arm64 gadgets
   failed to assemble.
 
+- `embed/Cargo.toml`: preserves host procedural-macro symbols during the
+  supervisor cross-build. Its shipped Linux binary remains stripped; stripping
+  the host macros prevented Rust 1.95 from loading `thiserror_impl`.
+  `embed/host/build.rs` watches that profile configuration for cache invalidation.
+
 Regression coverage lives in `apps/ios/Tests/LitterTests/CourseBashToolTests.swift`:
 it checks dropped-uid mount denial, final-source-symlink mount denial,
 preexisting workspace-symlink rejection, guest symlink-creation denial,

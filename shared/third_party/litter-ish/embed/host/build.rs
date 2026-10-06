@@ -106,6 +106,7 @@ fn main() {
         .expect("write bindings");
 
     // -- 3. Supervisor cross-build -----------------------------------------
+    println!("cargo:rerun-if-changed={}", embed_dir.join("Cargo.toml").display());
     let supervisor_src = embed_dir.join("supervisor");
     let protocol_src = embed_dir.join("protocol");
     emit_rerun_if_changed_recursive(&supervisor_src);

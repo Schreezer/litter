@@ -29,3 +29,8 @@ lto       = true
 panic     = "abort"
 codegen-units = 1
 strip     = true
+
+# Host procedural macros need their exported declarations during cross-builds.
+# Keep the shipped supervisor stripped while preserving those build artifacts.
+[profile.supervisor.build-override]
+strip = "none"
