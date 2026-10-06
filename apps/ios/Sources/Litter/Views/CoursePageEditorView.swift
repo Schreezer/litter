@@ -512,7 +512,13 @@ struct CoursePageEditorView: View {
             runtimeProbeOverlay
         }
 #endif
+        #if targetEnvironment(macCatalyst)
+        // The window title names the course; an empty title would fall back
+        // to the app name.
+        .navigationTitle(course.title)
+        #else
         .navigationTitle("")
+        #endif
         .task(id: loadID) {
             await loadPage(requestID: loadID)
         }
@@ -3851,9 +3857,9 @@ private struct CoursePageEditorCanvas: View {
             }
             if !isEditing, let explorationStatus {
                 explorationStatus
-            } else if readingSelection == nil {
-                Text(isEditing ? "Editing" : "Reading")
-                    .font(.system(size: 11, weight: .medium))
+            } else if isEditing {
+                Text("Editing")
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)

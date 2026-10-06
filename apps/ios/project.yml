@@ -275,6 +275,9 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Litter/Bridge/codex_bridge_objc.h
         SUPPORTS_MACCATALYST: YES
         SUPPORTS_MACCATALYST_OPTIMIZED_FOR_MAC: YES
+        # "6" is the Mac idiom. Without it Catalyst runs the iPad idiom scaled
+        # to 77%, ignoring the optimized-for-Mac setting above.
+        TARGETED_DEVICE_FAMILY: "2,6"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         "LIBRARY_SEARCH_PATHS[sdk=macosx*]": "$(inherited) $(PROJECT_DIR)/GeneratedRust/ios-macabi"
       configs:

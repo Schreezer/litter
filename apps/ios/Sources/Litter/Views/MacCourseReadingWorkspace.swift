@@ -43,7 +43,7 @@ struct MacCourseReadingWorkspace<Reader: View, Discussion: View>: View {
             HStack(spacing: 0) {
                 if showsInlineOutline {
                     outline
-                        .frame(width: 192)
+                        .frame(width: 220)
                     Divider()
                 }
 
@@ -107,24 +107,24 @@ private struct MacCourseReadingOutline: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("COURSE OUTLINE")
-                    .font(.system(size: 10, weight: .semibold))
-                    .tracking(0.7)
-                    .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
                 Text(courseTitle)
-                    .font(.system(size: 14, weight: .semibold))
-                    .lineLimit(3)
+                    .font(.headline)
+                    .lineLimit(2)
                 Text(lessonSummary)
-                    .font(.system(size: 11))
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            .padding(16)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Course outline, \(courseTitle), \(lessonSummary)")
 
             Divider()
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 3) {
+                LazyVStack(alignment: .leading, spacing: 1) {
                     ForEach(nodes) { node in
                         MacCourseOutlineNode(
                             node: node,
@@ -137,12 +137,12 @@ private struct MacCourseReadingOutline: View {
                         )
                     }
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 12)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 8)
             }
         }
         .frame(maxHeight: .infinity, alignment: .top)
-        .background(Color(uiColor: .secondarySystemBackground))
+        .background(Color(uiColor: .systemBackground))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("mac-course-reading-outline")
     }
@@ -175,6 +175,11 @@ private struct MacCourseOutlineNode: View {
         }
     }
 
+    /// Ready is the normal state, so only exceptions earn a second line.
+    private var visibleStatus: String? {
+        node.status == .generated ? nil : statusLabel
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 5) {
@@ -183,29 +188,31 @@ private struct MacCourseOutlineNode: View {
                         isExpanded.toggle()
                     } label: {
                         Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 9, weight: .semibold))
-                            .frame(width: 14, height: 24)
+                            .font(.caption.weight(.semibold))
+                            .frame(width: 16, height: 18)
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("\(isExpanded ? "Collapse" : "Expand") \(node.title)")
                 } else {
                     Image(systemName: node.status == .generated ? "doc.text" : "circle.dashed")
-                        .font(.system(size: 11))
-                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
-                        .frame(width: 14)
+                        .font(.callout)
+                        .foregroundStyle(isSelected ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                        .frame(width: 16)
                 }
 
                 Button(action: openNode) {
-                    VStack(alignment: .leading, spacing: 3) {
+                    VStack(alignment: .leading, spacing: 1) {
                         Text(node.title)
-                            .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
-                            .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
+                            .font(node.children.isEmpty ? .body : .body.weight(.semibold))
+                            .foregroundStyle(canOpen || !node.children.isEmpty ? Color.primary : Color.secondary)
                             .lineLimit(2)
                             .multilineTextAlignment(.leading)
-                        Text(statusLabel)
-                            .font(.system(size: 10))
-                            .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                        if let visibleStatus {
+                            Text(visibleStatus)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
@@ -238,12 +245,12 @@ private struct MacCourseOutlineNode: View {
                         .accessibilityLabel("\(node.title) is in progress")
                 }
             }
-            .padding(.leading, CGFloat(min(depth, 4)) * 9 + 6)
-            .padding(.trailing, 7)
-            .padding(.vertical, 9)
+            .padding(.leading, CGFloat(min(depth, 4)) * 14 + 6)
+            .padding(.trailing, 6)
+            .padding(.vertical, 5)
             .background(
-                isSelected ? Color.accentColor.opacity(0.10) : Color.clear,
-                in: RoundedRectangle(cornerRadius: 7)
+                isSelected ? Color.primary.opacity(0.10) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
             )
 
             if isExpanded {

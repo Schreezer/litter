@@ -1,13 +1,24 @@
 #if targetEnvironment(macCatalyst)
 import SwiftUI
 
+enum MacCourseSidebarItem: Hashable {
+    case library
+    case draft
+    case course(String)
+}
+
 /// Desktop navigation stays mounted while the existing course routes change.
+/// Uses the system split view so the sidebar gets the platform material,
+/// row metrics (which follow the user's sidebar icon size), accent-colored
+/// selection, and a standard show/hide control.
 struct MacCourseWorkspaceView<Content: View>: View {
     @Bindable var store: CourseExperienceStore
     let onNewCourse: () -> Void
     let onOpenAppSettings: () -> Void
     let onOpenAgentSettings: () -> Void
     @ViewBuilder let content: () -> Content
+
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     private var selectedCourseID: String? {
         for route in store.navigationPath.reversed() {
@@ -21,169 +32,143 @@ struct MacCourseWorkspaceView<Content: View>: View {
         return nil
     }
 
-    var body: some View {
-        HStack(spacing: 0) {
-            sidebar
-                .frame(width: 220)
-            Divider()
-            content()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+    private var selectedItem: MacCourseSidebarItem? {
+        if let selectedCourseID { return .course(selectedCourseID) }
+        if store.navigationPath.isEmpty { return .library }
+        if store.navigationPath.last == .newCourse { return .draft }
+        return nil
+    }
+
+    private func select(_ item: MacCourseSidebarItem) {
+        switch item {
+        case .library:
+            store.navigationPath.removeAll()
+        case .draft:
+            store.resumeCourseDraft()
+        case .course(let id):
+            store.navigationPath = [.course(id)]
         }
-        .background(Color(uiColor: .systemGroupedBackground))
+    }
+
+    var body: some View {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            sidebar
+                .navigationSplitViewColumnWidth(min: 200, ideal: 236, max: 320)
+        } detail: {
+            content()
+        }
+        .navigationSplitViewStyle(.balanced)
         .accessibilityIdentifier("mac-course-workspace")
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 10) {
-                Image(systemName: "books.vertical.fill")
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(.blue)
-                Text("Learnfold")
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
-            }
-            .padding(.horizontal, 20)
-            .padding(.top, 26)
-            .padding(.bottom, 24)
+        // Rows are buttons rather than `List(selection:)`: a selection change
+        // inside a split view sidebar resets the detail NavigationStack, which
+        // would drop the course route the store just pushed.
+        List {
+            Section {
+                row(.library, title: "Library", systemImage: "books.vertical")
+                    .accessibilityIdentifier("mac-sidebar-library")
 
-            Button(action: onNewCourse) {
-                Label("New course", systemImage: "plus")
-                    .font(.system(size: 13, weight: .semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 3)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.regular)
-            .padding(.horizontal, 16)
-            .padding(.bottom, 20)
-            .help("Create a course (⌘N)")
-            .accessibilityIdentifier("mac-sidebar-new-course")
-
-            sidebarRow(
-                title: "My courses",
-                icon: "square.grid.2x2",
-                selected: store.navigationPath.isEmpty
-            ) { store.navigationPath.removeAll() }
-            .padding(.horizontal, 10)
-            .accessibilityIdentifier("mac-sidebar-library")
-
-            if let draft = store.resumableCourseDraft {
-                sidebarRow(
-                    title: "Course draft",
-                    icon: draft.isAgentWorking ? "ellipsis.message" : "square.and.pencil",
-                    selected: store.navigationPath.last == .newCourse && selectedCourseID == nil
-                ) { store.resumeCourseDraft() }
-                .padding(.horizontal, 10)
-                .accessibilityIdentifier("mac-sidebar-draft")
+                if let draft = store.resumableCourseDraft {
+                    row(
+                        .draft,
+                        title: draft.courseTitle ?? "Course Draft",
+                        systemImage: draft.isAgentWorking ? "ellipsis.message" : "square.and.pencil"
+                    )
+                    .help(draft.detail)
+                    .accessibilityIdentifier("mac-sidebar-draft")
+                }
             }
 
-            HStack {
-                Text("COURSES")
-                    .font(.system(size: 10, weight: .semibold))
-                    .tracking(1.1)
-                Spacer()
-                Text("\(store.courses.count)")
-                    .font(.system(size: 11, weight: .medium))
-            }
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 20)
-            .padding(.top, 28)
-            .padding(.bottom, 9)
-
-            ScrollView {
-                VStack(spacing: 3) {
-                    ForEach(store.courses) { course in
-                        sidebarRow(
-                            title: course.title,
-                            icon: "book.closed",
-                            selected: selectedCourseID == course.id,
-                            tint: Color(hex: course.accentHex)
-                        ) { store.navigationPath = [.course(course.id)] }
+            Section("Courses") {
+                ForEach(store.courses) { course in
+                    row(.course(course.id), title: course.title, systemImage: macSidebarCourseSymbol(course))
                         .help(course.title)
                         .accessibilityIdentifier("mac-sidebar-course-\(course.id)")
-                    }
-                    if store.courses.isEmpty {
-                        Text("Your courses will appear here.")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .padding(10)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
                 }
-                .padding(.horizontal, 10)
-            }
-
-            Divider().padding(.horizontal, 16)
-
-            Button(action: onOpenAgentSettings) {
-                HStack(spacing: 10) {
-                    AgentIconView(kind: store.selectedAgentID ?? "codex", size: 27)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text((store.selectedAgentID ?? "codex").titleDisplayLabel)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.primary)
-                        HStack(spacing: 5) {
-                            Circle().fill(connectionTint).frame(width: 5, height: 5)
-                            Text(connectionLabel)
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    Spacer(minLength: 0)
-                    Image(systemName: "slider.horizontal.3")
-                        .font(.system(size: 12))
+                if store.courses.isEmpty {
+                    Text("No courses yet")
                         .foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 12)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .help("Agent and iCloud settings")
-            .accessibilityLabel("Course agent menu")
-            .accessibilityIdentifier("course-home-agent-settings")
-            .padding(.horizontal, 10)
-
-            sidebarRow(title: "Settings", icon: "gearshape", selected: false, action: onOpenAppSettings)
-                .accessibilityLabel("App Settings")
-                .accessibilityIdentifier("course-home-app-settings")
-                .padding(.horizontal, 10)
-                .padding(.bottom, 16)
         }
-        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .listStyle(.sidebar)
+        .environment(\.defaultMinListRowHeight, 28)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            agentStatus
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button(action: onNewCourse) {
+                    Label("New Course", systemImage: "plus")
+                }
+                .help("New Course (⌘N)")
+                .accessibilityIdentifier("mac-sidebar-new-course")
+            }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("mac-course-sidebar")
     }
 
-    private func sidebarRow(
-        title: String,
-        icon: String,
-        selected: Bool,
-        tint: Color = .blue,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            HStack(alignment: .center, spacing: 10) {
-                Image(systemName: icon)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(selected ? Color.blue : tint)
-                    .frame(width: 20)
+    private func row(_ item: MacCourseSidebarItem, title: String, systemImage: String) -> some View {
+        let isSelected = selectedItem == item
+        return Button {
+            select(item)
+        } label: {
+            Label {
                 Text(title)
-                    .font(.system(size: 12, weight: selected ? .semibold : .medium))
-                    .foregroundStyle(selected ? Color.blue : Color.primary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                Spacer(minLength: 0)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            } icon: {
+                Image(systemName: systemImage)
+                    .foregroundStyle(.tint)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 11)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(selected ? Color.blue.opacity(0.12) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 8))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
+        .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 12))
+        .listRowBackground(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(isSelected ? Color.primary.opacity(0.1) : Color.clear)
+                .padding(.horizontal, 6)
+        )
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    /// Status, not a primary action: the agent's own settings stay one click
+    /// away, while app settings live in the app menu (⌘,).
+    private var agentStatus: some View {
+        Button(action: onOpenAgentSettings) {
+            HStack(spacing: 8) {
+                AgentIconView(kind: store.selectedAgentID ?? "codex", size: 20)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text((store.selectedAgentID ?? "codex").titleDisplayLabel)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.primary)
+                    HStack(spacing: 4) {
+                        Circle().fill(connectionTint).frame(width: 6, height: 6)
+                        Text(connectionLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Agent and iCloud settings")
+        .accessibilityLabel("Course agent, \(connectionLabel)")
+        .accessibilityIdentifier("course-home-agent-settings")
+        .contextMenu {
+            Button("Agent Settings…", action: onOpenAgentSettings)
+            Button("Settings…", action: onOpenAppSettings)
+                .accessibilityIdentifier("course-home-app-settings")
+        }
     }
 
     private var connectionLabel: String {
@@ -204,5 +189,10 @@ struct MacCourseWorkspaceView<Content: View>: View {
         case .failed: return .orange
         }
     }
+}
+
+private func macSidebarCourseSymbol(_ course: LearningCourse) -> String {
+    let progress = course.progress.isFinite ? course.progress : 0
+    return progress >= 1 ? "checkmark.circle" : "book.closed"
 }
 #endif
