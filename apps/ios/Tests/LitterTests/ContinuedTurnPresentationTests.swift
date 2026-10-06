@@ -455,7 +455,7 @@ final class ContinuedTurnPresentationTests: XCTestCase {
     func testUnrelatedPageWriteCannotAnnounceTheTargetLessonReady() {
         let result = Formatter.finished(
             context: lesson,
-            activity: activity(.writingCoursePage, isRunning: false, pageId: "page-notes", written: 1),
+            activity: activity(.writingCoursePage, pageId: "page-notes", isRunning: false, written: 1),
             outcome: .completed
         )
         XCTAssertEqual(result.banner.title, "Codex finished")
