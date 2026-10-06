@@ -1231,15 +1231,21 @@ enum AppleCourseLessonCheckPolicy {
         options = Array(options.prefix(5))
         guard !question.isEmpty, !explanation.isEmpty, options.count >= 2 else { return nil }
         let answer = clean(content.checkAnswer)
-        let answerIndex = options.firstIndex { normalized($0) == normalized(answer) }
-            // Accept explicit choice numbers or letters, but never infer a
-            // grading key from a paraphrase or a negated choice.
-            ?? Int(answer).flatMap { (1...options.count).contains($0) ? $0 - 1 : nil }
+        // A positional answer refers to the original model choices. Removing
+        // a duplicate must not shift its letter or number to a different answer.
+        let originalIndex = Int(answer).map { $0 - 1 }
             ?? answer.uppercased().first.flatMap { letter in
                 answer.count == 1 ? "ABCDE".firstIndex(of: letter)
-                    .map { "ABCDE".distance(from: "ABCDE".startIndex, to: $0) }
-                    .flatMap { $0 < options.count ? $0 : nil } : nil
+                    .map { "ABCDE".distance(from: "ABCDE".startIndex, to: $0) } : nil
             }
+        let positionalIndex = originalIndex.flatMap { index -> Int? in
+            guard content.checkOptions.indices.contains(index) else { return nil }
+            let originalChoice = normalized(content.checkOptions[index])
+            guard !originalChoice.isEmpty else { return nil }
+            return options.firstIndex { normalized($0) == originalChoice }
+        }
+        let answerIndex = options.firstIndex { normalized($0) == normalized(answer) }
+            ?? positionalIndex
         guard let answerIndex else { return nil }
         let object: [String: Any] = [
             "version": 1,

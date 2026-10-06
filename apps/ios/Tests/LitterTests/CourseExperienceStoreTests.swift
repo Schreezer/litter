@@ -5001,6 +5001,26 @@ final class CourseExperienceStoreTests: XCTestCase {
         XCTAssertTrue(markdown.contains("\"option_id\":\"option-2\""))
     }
 
+    func testApplePositionalCheckAnswersKeepTheirOriginalChoiceAfterDeduplication() throws {
+        for (answer, expectedID) in [("B", "option-1"), ("2", "option-1"), ("C", "option-2"), ("3", "option-2")] {
+            let content = AppleCourseGeneratedLessonContent(
+                explanation: "Memory cells remember a pathogen.",
+                example: "A booster refreshes that memory.",
+                exercise: "Explain it in your own words.",
+                checkQuestion: "What do memory cells do?",
+                checkOptions: ["Remember a pathogen", "Remember a pathogen ", "Digest food"],
+                checkAnswer: answer,
+                checkExplanation: "Use the choice identified by the supplied letter or number."
+            )
+            let fence = try XCTUnwrap(AppleCourseLessonCheckPolicy.assessmentFence(for: content))
+            let body = fence.replacingOccurrences(of: "```learnfold-assessment\n", with: "")
+                .replacingOccurrences(of: "\n```", with: "")
+            let assessment = try XCTUnwrap(parseCourseAssessmentBlock(body: body).assessment)
+            XCTAssertEqual(assessment.options.map(\.text), ["Remember a pathogen", "Digest food"])
+            XCTAssertEqual(assessment.answer?.optionId, expectedID, answer)
+        }
+    }
+
     func testAppleFirstPlanRenamesNodesThatReuseThePlanID() throws {
         let plan = makeGroupedHierarchyPlan()
         let chapter = try XCTUnwrap(plan.chapters.first)
