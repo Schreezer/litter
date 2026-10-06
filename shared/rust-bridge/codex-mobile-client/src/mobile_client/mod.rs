@@ -434,7 +434,9 @@ fn mcp_elicitation_response_json(
                 meta: None,
             }
         }
-        upstream::McpServerElicitationRequest::OpenAiForm { .. } => {
+        upstream::McpServerElicitationRequest::OpenAiForm { .. }
+        | upstream::McpServerElicitationRequest::OpenAiElicitationForm { .. }
+        | upstream::McpServerElicitationRequest::UserVerification { .. } => {
             // Litter does not advertise this capability yet. If a remote server
             // sends it anyway, fail closed instead of fabricating form content.
             upstream::McpServerElicitationRequestResponse {
@@ -2514,7 +2516,10 @@ impl MobileClient {
                     sort_direction: None,
                     model_providers: None,
                     source_kinds: None,
+                    originators: None,
                     archived: None,
+                    section_id: None,
+                    project_id: None,
                     cwd: None,
                     search_term: None,
                     use_state_db_only: false,
@@ -3912,6 +3917,8 @@ impl MobileClient {
                     text: "Implement the plan.".to_string(),
                     text_elements: Vec::new(),
                 }],
+                turn_trigger: None,
+                tool_output: None,
                 responsesapi_client_metadata: None,
                 additional_context: None,
                 cwd: None,
@@ -3923,12 +3930,14 @@ impl MobileClient {
                 permissions: None,
                 model: None,
                 service_tier: None,
+                service_tier_for_turn: None,
                 effort: None,
                 summary: None,
                 personality: None,
                 output_schema: None,
                 collaboration_mode,
                 multi_agent_mode: None,
+                cyber_access_program: None,
             },
         )
         .await

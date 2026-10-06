@@ -262,8 +262,13 @@ impl From<codex_protocol::account::PlanType> for PlanType {
             codex_protocol::account::PlanType::Edu => Self::Edu,
             codex_protocol::account::PlanType::Unknown => Self::Unknown,
             codex_protocol::account::PlanType::ProLite => Self::Unknown,
+            codex_protocol::account::PlanType::SelfServeBusinessProLite => Self::Business,
             codex_protocol::account::PlanType::SelfServeBusinessUsageBased => Self::Business,
             codex_protocol::account::PlanType::EnterpriseCbpUsageBased => Self::Enterprise,
+            codex_protocol::account::PlanType::Ent26
+            | codex_protocol::account::PlanType::EnterpriseCbpAutomation => Self::Enterprise,
+            codex_protocol::account::PlanType::EduPlus
+            | codex_protocol::account::PlanType::EduPro => Self::Edu,
         }
     }
 }
@@ -562,7 +567,8 @@ impl From<upstream::AuthMode> for AuthMode {
             upstream::AuthMode::AgentIdentity => Self::AgentIdentity,
             upstream::AuthMode::Headers
             | upstream::AuthMode::PersonalAccessToken
-            | upstream::AuthMode::BedrockApiKey => Self::ApiKey,
+            | upstream::AuthMode::BedrockApiKey
+            | upstream::AuthMode::BedrockAccessKeys => Self::ApiKey,
         }
     }
 }
@@ -726,6 +732,7 @@ pub enum PlanType {
 pub enum InputModality {
     Text,
     Image,
+    Audio,
 }
 
 impl From<codex_protocol::openai_models::InputModality> for InputModality {
@@ -733,6 +740,7 @@ impl From<codex_protocol::openai_models::InputModality> for InputModality {
         match value {
             codex_protocol::openai_models::InputModality::Text => Self::Text,
             codex_protocol::openai_models::InputModality::Image => Self::Image,
+            codex_protocol::openai_models::InputModality::Audio => Self::Audio,
         }
     }
 }

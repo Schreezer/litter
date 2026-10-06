@@ -21,6 +21,22 @@ enum ConversationLiveDetailRetentionPolicy {
     }
 }
 
+/// Expansion choices belong to the whole transcript even when it is rendered
+/// as separate turns. Otherwise every older turn retains its own latest tool
+/// and command row after a new turn starts.
+struct ConversationTimelineExpansionContext {
+    let retainedRichDetailItemIDs: Set<String>
+    let latestCommandExecutionItemId: String?
+
+    init(items: [ConversationItem]) {
+        retainedRichDetailItemIDs = ConversationLiveDetailRetentionPolicy.retainedRichDetailItemIDs(for: items)
+        latestCommandExecutionItemId = items.reversed().first(where: { item in
+            guard case .commandExecution(let data) = item.content else { return false }
+            return !data.isPureExploration
+        })?.id
+    }
+}
+
 struct ConversationTurnTimeline: View {
     @AppStorage(ConversationDisplayPreferenceKey.reasoning) private var reasoningDisplayModeRaw = ConversationDetailDisplayMode.collapsed.rawValue
     @AppStorage(ConversationDisplayPreferenceKey.commands) private var commandDisplayModeRaw = ConversationDetailDisplayMode.collapsed.rawValue
@@ -39,6 +55,7 @@ struct ConversationTurnTimeline: View {
     let onEditUserItem: (ConversationItem) -> Void
     let onForkFromUserItem: (ConversationItem) -> Void
     var onOpenConversation: ((ThreadKey) -> Void)? = nil
+    var expansionContext: ConversationTimelineExpansionContext? = nil
 
     var body: some View {
         timelineContent
@@ -46,14 +63,8 @@ struct ConversationTurnTimeline: View {
 
     private var timelineContent: some View {
         let rows = rowDescriptors
-        let retainedRichDetailItemIDs = ConversationLiveDetailRetentionPolicy.retainedRichDetailItemIDs(for: items)
+        let resolvedExpansionContext = expansionContext ?? ConversationTimelineExpansionContext(items: items)
         let commandDisplayMode = ConversationDetailDisplayMode.resolve(commandDisplayModeRaw)
-        let latestCommandExecutionItemId = rows.reversed().compactMap { row -> String? in
-            guard case .item(let item) = row,
-                  case .commandExecution(let data) = item.content,
-                  !data.isPureExploration else { return nil }
-            return item.id
-        }.first
 
         return VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
@@ -61,10 +72,10 @@ struct ConversationTurnTimeline: View {
                     row,
                     isLastRow: index == rows.indices.last,
                     isPreferredExpandedCommandRow: row.preferredExpandedCommandRow(
-                        latestCommandExecutionItemId: latestCommandExecutionItemId,
+                        latestCommandExecutionItemId: resolvedExpansionContext.latestCommandExecutionItemId,
                         commandDisplayMode: commandDisplayMode
                     ),
-                    retainedRichDetailItemIDs: retainedRichDetailItemIDs
+                    retainedRichDetailItemIDs: resolvedExpansionContext.retainedRichDetailItemIDs
                 )
                     .id(row.id)
                     .modifier(RowEntranceModifier(isAssistantRow: row.isAssistantRow))

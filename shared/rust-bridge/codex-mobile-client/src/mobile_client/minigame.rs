@@ -281,6 +281,7 @@ pub(crate) async fn run_minigame(
         history_mode: None,
         session_start_source: None,
         thread_source: None,
+        project_id: None,
         environments: None,
         dynamic_tools: Some(dynamic_tools),
         mock_experimental_field: None,
@@ -326,6 +327,8 @@ pub(crate) async fn run_minigame(
             text: "Generate the minigame now.".to_string(),
             text_elements: Vec::new(),
         }],
+        turn_trigger: None,
+        tool_output: None,
         responsesapi_client_metadata: None,
         additional_context: None,
         cwd: None,
@@ -338,12 +341,14 @@ pub(crate) async fn run_minigame(
         model: Some(MINIGAME_MODEL.to_string()),
         // Upstream TurnStartParams.service_tier is Option<Option<CoreServiceTier>>
         service_tier: Some(Some(service_tier_into_upstream_string(ServiceTier::Fast))),
+        service_tier_for_turn: None,
         effort: Some(reasoning_effort_into_upstream(ReasoningEffort::Low)),
         summary: None,
         personality: None,
         output_schema: None,
         collaboration_mode: None,
         multi_agent_mode: None,
+        cyber_access_program: None,
     };
 
     if let Err(e) = client

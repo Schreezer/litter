@@ -1841,7 +1841,6 @@
 				49D8F8EB81409A95F0AA81B6 /* home_cat.png */,
 				EB7A91131021ED64DF88AF8B /* Fonts */,
 				DB02264740185FE99A0B2419 /* Themes */,
-				CBFC126980D89207F3601305 /* ThirdPartyLicenses */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -1903,13 +1902,6 @@
 			);
 			name = LitterWatchComplications;
 			path = Sources/LitterWatchComplications;
-			sourceTree = "<group>";
-		};
-		CBFC126980D89207F3601305 /* ThirdPartyLicenses */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = ThirdPartyLicenses;
 			sourceTree = "<group>";
 		};
 		D50A88119F9D44E48BDF3D0B /* Components */ = {

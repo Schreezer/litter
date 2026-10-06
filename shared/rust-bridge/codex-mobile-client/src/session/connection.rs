@@ -737,12 +737,17 @@ impl ServerSession {
             .await
             .map_err(|e| TransportError::ConnectionFailed(format!("config build failed: {e}")))?;
 
-        let auth_manager = AuthManager::shared_from_config(&base_config, false).await;
+        let auth_manager = AuthManager::shared_from_config(&base_config, false)
+            .await
+            .map_err(|e| {
+                TransportError::ConnectionFailed(format!("auth manager init failed: {e}"))
+            })?;
 
         let cloud_config_bundle = cloud_config_bundle_loader(
             auth_manager.clone(),
             base_config.chatgpt_base_url.clone(),
             base_config.codex_home.to_path_buf(),
+            base_config.http_client_factory(),
         );
 
         let mut resolved_builder = ConfigBuilder::default()
@@ -786,6 +791,7 @@ impl ServerSession {
                 capabilities: Some(InitializeCapabilities {
                     experimental_api: true,
                     request_attestation: false,
+                    extensions: None,
                     mcp_server_openai_form_elicitation: false,
                     opt_out_notification_methods: None,
                 }),
@@ -1837,7 +1843,7 @@ fn route_app_server_event(
             info!("remote event notification {}", notification);
             let _ = event_tx.send(ServerEvent::Notification {
                 runtime_kind,
-                notification: notification.clone(),
+                notification: *notification.clone(),
             });
         }
         AppServerEvent::ServerRequest(request) => {
@@ -1845,7 +1851,7 @@ fn route_app_server_event(
             append_android_debug_log(&format!("server_request={request:?}"));
             let _ = event_tx.send(ServerEvent::Request {
                 runtime_kind,
-                request: request.clone(),
+                request: *request.clone(),
             });
         }
         AppServerEvent::Lagged { skipped } => {
@@ -1869,13 +1875,13 @@ fn route_in_process_event(
         InProcessServerEvent::ServerNotification(notification) => {
             let _ = event_tx.send(ServerEvent::Notification {
                 runtime_kind: "codex".to_string(),
-                notification,
+                notification: *notification,
             });
         }
         InProcessServerEvent::ServerRequest(request) => {
             let _ = event_tx.send(ServerEvent::Request {
                 runtime_kind: "codex".to_string(),
-                request,
+                request: *request,
             });
         }
         InProcessServerEvent::Lagged { skipped } => {

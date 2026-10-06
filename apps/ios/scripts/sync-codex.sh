@@ -6,7 +6,7 @@ IOS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_DIR="$(cd "$IOS_DIR/../.." && pwd)"
 SUBMODULE_DIR="$REPO_DIR/shared/third_party/codex"
 PATCH_FILES=(
-    "$REPO_DIR/patches/codex/mobile-0.144.6.patch"
+    "$REPO_DIR/patches/codex/mobile-0.155.1.patch"
 )
 
 patch_already_upstreamed() {

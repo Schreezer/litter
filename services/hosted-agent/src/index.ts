@@ -7,7 +7,7 @@ import { generateText, isToolUIPart } from "ai"
 import { ProviderProgress, PROVIDER_STEP_TIMEOUT_MS } from "./provider-progress"
 import { HostedTelemetry, observedProviderFetch } from "./telemetry"
 import { isAuthorized, unauthorized } from "./auth"
-import { COURSE_AGENT_PROMPT, COURSE_DISCUSSION_PROMPT } from "./course-prompt"
+import { COURSE_AGENT_PROMPT, COURSE_DISCUSSION_PROMPT, LEGACY_COURSE_AGENT_PROMPT, QUESTION_CHOICE_CAPABILITY } from "./course-prompt"
 import { createHostedModel, DEFAULT_MODEL } from "./provider"
 import { authorizeGuestRoute, enforceGuestTurnLimit, guestSession } from "./guest"
 import { HostedTurnOwnership, awaitsClientTools, matchesPendingClientTool } from "./turn-ownership"
@@ -26,6 +26,22 @@ function workspaceIDFrom(context: TurnContext): string | null {
   const normalized = value.trim()
   if (!normalized || normalized.length > MAX_WORKSPACE_ID_LENGTH) return null
   return /^[a-zA-Z0-9._-]+$/.test(normalized) ? normalized : null
+}
+
+function supportsQuestionChoices(context: TurnContext): boolean {
+  const capabilities = context.body?.clientCapabilities
+  return Array.isArray(capabilities) && capabilities.includes(QUESTION_CHOICE_CAPABILITY)
+}
+
+function courseSystemPrompt(system: string, supportsChoices: boolean): string {
+  const prompt = supportsChoices ? COURSE_AGENT_PROMPT : LEGACY_COURSE_AGENT_PROMPT
+  // Preserve any extra system instructions Think supplies around our prompt.
+  const additional = system.includes(COURSE_AGENT_PROMPT)
+    ? system.replace(COURSE_AGENT_PROMPT, "").trim()
+    : system.includes(LEGACY_COURSE_AGENT_PROMPT)
+      ? system.replace(LEGACY_COURSE_AGENT_PROMPT, "").trim()
+      : system.trim()
+  return additional ? `${prompt}\n\n${additional}` : prompt
 }
 
 function textFromMessage(message: unknown): string | null {
@@ -263,7 +279,7 @@ export class HostedCourseAgent extends Think<HostedEnv> {
   }
 
   override getSystemPrompt(): string {
-    return COURSE_AGENT_PROMPT
+    return LEGACY_COURSE_AGENT_PROMPT
   }
 
   override getSkills() {
@@ -296,7 +312,7 @@ export class HostedCourseAgent extends Think<HostedEnv> {
     // Unlike model-visible messages, this durable UI history retains message
     // IDs. Recovery may admit a new request for the same learner submission.
     const userMessageID = this.messages.findLast((message) => message.role === "user")?.id
-    const { workspaceID, generation, isDiscussion } = await this.ctx.storage.transaction(async (storage) => {
+    const { workspaceID, generation, isDiscussion, questionChoices } = await this.ctx.storage.transaction(async (storage) => {
       const saved = await storage.get<string>("learnfold.workspaceId")
       const supplied = workspaceIDFrom(context)
       const isBodylessContinuation = context.continuation && context.body === undefined
@@ -339,7 +355,16 @@ export class HostedCourseAgent extends Think<HostedEnv> {
           "learnfold.generationTurn", "learnfold.generationRequestId", "learnfold.generationUserMessageId",
         ])
       }
-      return { workspaceID: resolved, generation, isDiscussion: role === "discussion" }
+      // A tool auto-continuation has no request body. Keep the client renderer
+      // capability with its turn so a tool call cannot switch prompt formats.
+      const savedChoices = await storage.get<boolean>("learnfold.questionChoices")
+      const questionChoices = context.continuation
+        ? savedChoices === true
+        : supportsQuestionChoices(context)
+      if (savedChoices !== questionChoices) {
+        await storage.put("learnfold.questionChoices", questionChoices)
+      }
+      return { workspaceID: resolved, generation, isDiscussion: role === "discussion", questionChoices }
     })
     await enforceGuestTurnLimit(this.name, this.env)
     const clientToolNames = Object.keys(context.tools).filter((name) =>
@@ -354,7 +379,7 @@ export class HostedCourseAgent extends Think<HostedEnv> {
       : clientToolNames
     this.telemetry.prepared(context.continuation, context.messages.length, activeTools.length)
     return {
-      instructions: `${context.system}${isDiscussion ? `\n\n${COURSE_DISCUSSION_PROMPT}` : ""}\n\nCurrent Learnfold workspace_id: ${workspaceID}${generationInstructions(generation)}`,
+      instructions: `${courseSystemPrompt(context.system, questionChoices)}${isDiscussion ? `\n\n${COURSE_DISCUSSION_PROMPT}` : ""}\n\nCurrent Learnfold workspace_id: ${workspaceID}${generationInstructions(generation)}`,
       activeTools,
       maxSteps: this.name.startsWith("guest-") ? 12 : 24,
       sendReasoning: false,

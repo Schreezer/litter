@@ -937,7 +937,11 @@ fn mcp_elicitation_questions(
             }
             questions
         }
-        codex_app_server_protocol::McpServerElicitationRequest::OpenAiForm { message, .. } => {
+        codex_app_server_protocol::McpServerElicitationRequest::OpenAiForm { message, .. }
+        | codex_app_server_protocol::McpServerElicitationRequest::OpenAiElicitationForm {
+            message,
+            ..
+        } => {
             vec![PendingUserInputQuestion {
                 id: MCP_URL_ACTION_FIELD_ID.to_string(),
                 header: Some(format!("MCP: {}", params.server_name)),
@@ -952,6 +956,23 @@ fn mcp_elicitation_questions(
                 }],
             }]
         }
+        codex_app_server_protocol::McpServerElicitationRequest::UserVerification {
+            title,
+            description,
+            ..
+        } => vec![PendingUserInputQuestion {
+            id: MCP_URL_ACTION_FIELD_ID.to_string(),
+            header: Some(format!("MCP: {}", params.server_name)),
+            question: format!(
+                "{title}\n\n{description}\n\nThis device verification request is not supported by this Litter build."
+            ),
+            is_other_allowed: false,
+            is_secret: false,
+            options: vec![PendingUserInputOption {
+                label: MCP_APPROVAL_CANCEL_LABEL.to_string(),
+                description: Some("Cancel this request.".to_string()),
+            }],
+        }],
         codex_app_server_protocol::McpServerElicitationRequest::Url { message, url, .. } => {
             let prompt = if message.trim().is_empty() {
                 url.clone()
@@ -1313,6 +1334,8 @@ mod tests {
             text: String::new(),
             phase: None,
             memory_citation: None,
+            delivery: None,
+            questions: None,
         }
     }
 
@@ -1347,14 +1370,20 @@ mod tests {
         let notification = ServerNotification::ThreadStarted(proto::ThreadStartedNotification {
             thread: proto::Thread {
                 id: "thr_1".to_string(),
+                environments: None,
                 extra: None,
                 session_id: "session_1".to_string(),
                 forked_from_id: None,
                 parent_thread_id: None,
                 preview: "Preview".to_string(),
                 ephemeral: false,
+                section: None,
+                section_entered_at: None,
+                project_id: None,
                 history_mode: Default::default(),
                 model_provider: "openai".to_string(),
+                model: None,
+                reasoning_effort: None,
                 created_at: 1,
                 updated_at: 2,
                 recency_at: None,
@@ -1362,12 +1391,15 @@ mod tests {
                 path: None,
                 cwd: test_abs_path("/tmp"),
                 cli_version: "1.0.0".to_string(),
+                originator: None,
                 source: proto::SessionSource::Cli,
+                can_accept_direct_input: None,
                 thread_source: None,
                 agent_nickname: Some("builder".to_string()),
                 agent_role: Some("worker".to_string()),
                 git_info: None,
                 name: Some("Example".to_string()),
+                daybreak_enabled: None,
                 turns: Vec::new(),
             },
         });
@@ -1756,6 +1788,7 @@ mod tests {
                 message: "rate limited".to_string(),
                 codex_error_info: None,
                 additional_details: None,
+                misalignment: None,
             },
             will_retry: false,
             thread_id: String::new(),
@@ -1777,6 +1810,7 @@ mod tests {
                 message: "oops".to_string(),
                 codex_error_info: None,
                 additional_details: None,
+                misalignment: None,
             },
             will_retry: false,
             thread_id: "thr_1".to_string(),
@@ -1869,6 +1903,7 @@ mod tests {
                         total_tokens: 5000,
                         input_tokens: 3000,
                         cached_input_tokens: 0,
+                        cache_write_input_tokens: 0,
                         output_tokens: 2000,
                         reasoning_output_tokens: 0,
                     },
@@ -1876,6 +1911,7 @@ mod tests {
                         total_tokens: 150,
                         input_tokens: 100,
                         cached_input_tokens: 0,
+                        cache_write_input_tokens: 0,
                         output_tokens: 50,
                         reasoning_output_tokens: 0,
                     },
@@ -1903,6 +1939,7 @@ mod tests {
                 rate_limits: proto::RateLimitSnapshot {
                     limit_id: Some("primary".to_string()),
                     limit_name: Some("Primary".to_string()),
+                    normal_model_slug: None,
                     primary: Some(proto::RateLimitWindow {
                         used_percent: 42,
                         window_duration_mins: Some(60),
@@ -1915,6 +1952,7 @@ mod tests {
                         balance: Some("5.00".to_string()),
                     }),
                     individual_limit: None,
+                    spend_control_reached: None,
                     plan_type: Some(codex_protocol::account::PlanType::Plus),
                     rate_limit_reached_type: None,
                 },
@@ -1969,14 +2007,20 @@ mod tests {
             ServerNotification::ThreadStarted(proto::ThreadStartedNotification {
                 thread: proto::Thread {
                     id: "thr_1".to_string(),
+                    environments: None,
                     extra: None,
                     session_id: "session_1".to_string(),
                     forked_from_id: None,
                     parent_thread_id: None,
                     preview: String::new(),
                     ephemeral: false,
+                    section: None,
+                    section_entered_at: None,
+                    project_id: None,
                     history_mode: Default::default(),
                     model_provider: "openai".to_string(),
+                    model: None,
+                    reasoning_effort: None,
                     created_at: 1,
                     updated_at: 1,
                     recency_at: None,
@@ -1984,12 +2028,15 @@ mod tests {
                     path: None,
                     cwd: test_abs_path("/tmp"),
                     cli_version: "1.0.0".to_string(),
+                    originator: None,
                     source: proto::SessionSource::Cli,
+                    can_accept_direct_input: None,
                     thread_source: None,
                     agent_nickname: None,
                     agent_role: None,
                     git_info: None,
                     name: None,
+                    daybreak_enabled: None,
                     turns: Vec::new(),
                 },
             }),
@@ -2102,6 +2149,7 @@ mod tests {
         let request = ServerRequest::CommandExecutionRequestApproval {
             request_id: proto::RequestId::Integer(42),
             params: proto::CommandExecutionRequestApprovalParams {
+                kind: Default::default(),
                 thread_id: "thr_1".to_string(),
                 turn_id: "turn_1".to_string(),
                 item_id: "item_1".to_string(),
@@ -2164,7 +2212,7 @@ mod tests {
                 item_id: "item_1".to_string(),
                 environment_id: None,
                 started_at_ms: 0,
-                cwd: test_abs_path("/tmp"),
+                cwd: test_abs_path("/tmp").into(),
                 reason: Some("need network access".to_string()),
                 permissions: proto::RequestPermissionProfile {
                     network: None,
@@ -2234,6 +2282,7 @@ mod tests {
                 thread_id: "thr_1".to_string(),
                 turn_id: "turn_1".to_string(),
                 item_id: "item_1".to_string(),
+                is_blocking: true,
                 auto_resolution_ms: None,
                 questions: vec![proto::ToolRequestUserInputQuestion {
                     id: "q1".to_string(),
@@ -2279,6 +2328,7 @@ mod tests {
                 thread_id: "thr_1".to_string(),
                 turn_id: "turn_1".to_string(),
                 item_id: "item_1".to_string(),
+                is_blocking: true,
                 auto_resolution_ms: None,
                 questions: vec![
                     proto::ToolRequestUserInputQuestion {
@@ -2375,6 +2425,7 @@ mod tests {
         let req1 = ServerRequest::CommandExecutionRequestApproval {
             request_id: proto::RequestId::Integer(1),
             params: proto::CommandExecutionRequestApprovalParams {
+                kind: Default::default(),
                 thread_id: "thr_1".to_string(),
                 turn_id: "turn_1".to_string(),
                 item_id: "item_1".to_string(),
@@ -2414,6 +2465,7 @@ mod tests {
         let req1 = ServerRequest::CommandExecutionRequestApproval {
             request_id: proto::RequestId::Integer(1),
             params: proto::CommandExecutionRequestApprovalParams {
+                kind: Default::default(),
                 thread_id: "thr_1".to_string(),
                 turn_id: "turn_1".to_string(),
                 item_id: "item_1".to_string(),

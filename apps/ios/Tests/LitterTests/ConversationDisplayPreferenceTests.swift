@@ -63,4 +63,35 @@ final class ConversationDisplayPreferenceTests: XCTestCase {
             toolDisplayMode: .hidden
         ))
     }
+
+    func testSplitTurnsShareTranscriptWideExpansionChoices() {
+        func command(_ id: String) -> ConversationItem {
+            ConversationItem(
+                id: id,
+                content: .commandExecution(
+                    ConversationCommandExecutionData(
+                        command: "echo \(id)",
+                        cwd: "",
+                        status: .completed,
+                        output: id,
+                        exitCode: 0,
+                        durationMs: nil,
+                        processId: nil,
+                        actions: []
+                    )
+                )
+            )
+        }
+
+        let firstTurn = [command("first-command")]
+        let secondTurn = [command("second-command")]
+        let context = ConversationTimelineExpansionContext(items: firstTurn + secondTurn)
+
+        XCTAssertEqual(context.retainedRichDetailItemIDs, ["second-command"])
+        XCTAssertEqual(context.latestCommandExecutionItemId, "second-command")
+        XCTAssertNotEqual(
+            ConversationTimelineExpansionContext(items: firstTurn).retainedRichDetailItemIDs,
+            context.retainedRichDetailItemIDs
+        )
+    }
 }

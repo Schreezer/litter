@@ -1795,6 +1795,29 @@ enum CourseAgentSettingsDraftPolicy {
         current
     }
 
+    @MainActor
+    static func afterModelCatalogRefresh(
+        current: CourseAgentSettingsDraft,
+        models: [ModelInfo],
+        usesCustomEndpoint: Bool
+    ) -> CourseAgentSettingsDraft {
+        guard !usesCustomEndpoint, !models.isEmpty else { return current }
+        let selected = models.first {
+            modelMatchesSelection($0, current.modelID, runtime: current.agentID)
+        }
+        guard let model = selected ?? models.first(where: \.isDefault) ?? models.first else {
+            return current
+        }
+        return CourseAgentSettingsDraft(
+            agentID: current.agentID,
+            modelID: model.id,
+            effortID: CourseExperienceStore.normalizedReasoningEffortID(
+                current.effortID,
+                for: model
+            ) ?? model.defaultReasoningEffort.wireValue
+        )
+    }
+
     static func afterSave(
         current: CourseAgentSettingsDraft,
         persisted: CourseAgentSettingsDraft,
@@ -1860,20 +1883,42 @@ private struct CourseAgentModelSection: View {
     let models: [ModelInfo]
     let isLoading: Bool
     let selectedModel: String
+    let refreshFailed: Bool
+    let onRefresh: (() -> Void)?
     let onSelect: (ModelInfo) -> Void
+
+    init(
+        agentID: String,
+        models: [ModelInfo],
+        isLoading: Bool,
+        selectedModel: String,
+        refreshFailed: Bool = false,
+        onRefresh: (() -> Void)? = nil,
+        onSelect: @escaping (ModelInfo) -> Void
+    ) {
+        self.agentID = agentID
+        self.models = models
+        self.isLoading = isLoading
+        self.selectedModel = selectedModel
+        self.refreshFailed = refreshFailed
+        self.onRefresh = onRefresh
+        self.onSelect = onSelect
+    }
 
     var body: some View {
         Section {
-            if isLoading {
-                HStack {
-                    ProgressView()
-                    Text("Loading models…").foregroundStyle(.secondary)
+            if models.isEmpty {
+                if isLoading {
+                    HStack {
+                        ProgressView()
+                        Text("Loading models…").foregroundStyle(.secondary)
+                    }
+                    .accessibilityIdentifier("course-settings-model-loading")
+                } else {
+                    Text("This agent will choose its default model.")
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("course-settings-model-empty")
                 }
-                .accessibilityIdentifier("course-settings-model-loading")
-            } else if models.isEmpty {
-                Text("This agent will choose its default model.")
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("course-settings-model-empty")
             } else {
                 ForEach(models, id: \.id) { model in
                     let isSelected = modelMatchesSelection(
@@ -1916,6 +1961,27 @@ private struct CourseAgentModelSection: View {
                     .accessibilityValue(isSelected ? "selected" : "not-selected")
                     .accessibilityAddTraits(isSelected ? .isSelected : [])
                 }
+            }
+            if isLoading && !models.isEmpty {
+                HStack {
+                    ProgressView()
+                    Text("Refreshing models…").foregroundStyle(.secondary)
+                }
+                .accessibilityIdentifier("course-settings-model-refreshing")
+            }
+            if refreshFailed && !isLoading {
+                Text(models.isEmpty
+                    ? "Couldn’t load the model list. Check the connection and try again."
+                    : "Some models could not be refreshed. Choices may be out of date."
+                )
+                .font(.footnote)
+                .foregroundStyle(.orange)
+                .accessibilityIdentifier("course-settings-model-refresh-failed")
+            }
+            if let onRefresh {
+                Button(refreshFailed ? "Retry Model Refresh" : "Refresh Models", action: onRefresh)
+                    .disabled(isLoading)
+                    .accessibilityIdentifier("course-settings-model-refresh-retry")
             }
         } header: {
             Text("Model")
@@ -2171,6 +2237,10 @@ private struct CourseAgentSettingsView: View {
                         models: models,
                         isLoading: store.isLoadingAgentCatalog,
                         selectedModel: selectedModel,
+                        refreshFailed: store.agentCatalogRefreshFailed,
+                        onRefresh: {
+                            Task { await refreshPresentedCatalog() }
+                        },
                         onSelect: { model in
                             selectedModel = model.id
                             selectedEffort = model.defaultReasoningEffort.wireValue
@@ -2258,16 +2328,7 @@ private struct CourseAgentSettingsView: View {
                 }
             }
             .task {
-                await store.prepareLocalAgentCatalog(appModel: appModel)
-                let availableOptions = store.agentOptions.filter(\.available)
-                applyDraft(CourseAgentSettingsDraftPolicy.afterCatalogLoad(
-                    current: currentDraft,
-                    availableAgentIDs: Set(availableOptions.map(\.id))
-                ))
-                if availableOptions.contains(where: { $0.id == selectedAgent }),
-                   selectedModel.isEmpty {
-                    selectedModel = store.presentedDefaultModelID(for: selectedAgent) ?? ""
-                }
+                await refreshPresentedCatalog()
                 hasCustomEndpoint = OpenAIApiKeyStore.shared.hasStoredBaseURL
                 hasStoredAPIKey = OpenAIApiKeyStore.shared.hasStoredKey
                 configuredProviderModelID = (try? OpenAIApiKeyStore.shared.loadModelID()) ?? ""
@@ -2307,6 +2368,24 @@ private struct CourseAgentSettingsView: View {
                 signInTask = nil
             }
         }
+    }
+
+    @MainActor
+    private func refreshPresentedCatalog() async {
+        await store.prepareLocalAgentCatalog(appModel: appModel)
+        let availableOptions = store.agentOptions.filter(\.available)
+        applyDraft(CourseAgentSettingsDraftPolicy.afterCatalogLoad(
+            current: currentDraft,
+            availableAgentIDs: Set(availableOptions.map(\.id))
+        ))
+        guard availableOptions.contains(where: { $0.id == selectedAgent }) else {
+            return
+        }
+        applyDraft(CourseAgentSettingsDraftPolicy.afterModelCatalogRefresh(
+            current: currentDraft,
+            models: store.presentedModels(for: selectedAgent),
+            usesCustomEndpoint: selectedAgent == CourseAgentProvider.codex && usesCustomEndpoint
+        ))
     }
 
     @MainActor

@@ -7,9 +7,19 @@ import {
   COURSE_DISCUSSION_PROMPT,
   COURSE_EXPLORATION_PROMPT,
   QUESTION_FENCE,
+  LEGACY_COURSE_AGENT_PROMPT,
+  QUESTION_CHOICE_CAPABILITY,
 } from "../src/course-prompt"
 
 describe("course prompt", () => {
+  it("keeps the pre-choice prompt for clients without the question renderer", () => {
+    expect(QUESTION_CHOICE_CAPABILITY).toBe("learnfold-question-v1")
+    expect(LEGACY_COURSE_AGENT_PROMPT).toContain("assess the learner")
+    expect(LEGACY_COURSE_AGENT_PROMPT).toContain("present_course_plan")
+    expect(LEGACY_COURSE_AGENT_PROMPT).toContain("native-editor")
+    expect(LEGACY_COURSE_AGENT_PROMPT).not.toContain(QUESTION_FENCE)
+  })
+
   it("teaches the multiple-choice fence the iOS chat parses", () => {
     expect(QUESTION_FENCE).toBe("learnfold-question")
     expect(COURSE_AGENT_PROMPT).toContain(`\`\`\`${QUESTION_FENCE}\n`)

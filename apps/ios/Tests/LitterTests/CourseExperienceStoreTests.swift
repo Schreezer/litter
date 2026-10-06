@@ -207,6 +207,45 @@ private final class DelayedHermesListAppClient: AppClient, @unchecked Sendable {
     }
 }
 
+private final class RecordingModelRefreshAppClient: AppClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var requestedServerIDs: [String] = []
+    private var remainingFailures: Int
+
+    var refreshServerIDs: [String] {
+        lock.withLock { requestedServerIDs }
+    }
+
+    init(failuresRemaining: Int = 0) {
+        remainingFailures = failuresRemaining
+        super.init(noHandle: AppClient.NoHandle())
+    }
+
+    required init(unsafeFromHandle handle: UInt64) {
+        fatalError("RecordingModelRefreshAppClient is test-only")
+    }
+
+    override func setSavedAppsDirectory(directory: String) {}
+    override func setSlingshotCredentialsDirectory(directory: String) {}
+    override func agentMetadata(name: String) -> AppAgentMetadata? { nil }
+    override func allAgentMetadata() -> [AppAgentMetadata] { [] }
+
+    override func refreshModels(
+        serverId: String,
+        params: AppRefreshModelsRequest
+    ) async throws {
+        let shouldFail = lock.withLock {
+            requestedServerIDs.append(serverId)
+            guard remainingFailures > 0 else { return false }
+            remainingFailures -= 1
+            return true
+        }
+        if shouldFail {
+            throw NSError(domain: "TestModelRefreshFailure", code: 1)
+        }
+    }
+}
+
 private final class DelayedHermesReadAppClient: AppClient, @unchecked Sendable {
     let barrier: ContinuationHermesRecoveryBarrier
     let response: ThreadKey
@@ -5592,6 +5631,79 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
     }
 
+    func testModelCatalogRefreshReplacesRemovedSelectionWithNewDefault() {
+        let current = CourseAgentSettingsDraft(
+            agentID: CourseAgentProvider.codex,
+            modelID: "retired-model",
+            effortID: "high"
+        )
+        let newDefault = makeModel(
+            id: "new-default-model",
+            runtimeID: CourseAgentProvider.codex,
+            efforts: [.low, .medium],
+            defaultEffort: .medium
+        )
+
+        XCTAssertEqual(
+            CourseAgentSettingsDraftPolicy.afterModelCatalogRefresh(
+                current: current,
+                models: [newDefault],
+                usesCustomEndpoint: false
+            ),
+            CourseAgentSettingsDraft(
+                agentID: CourseAgentProvider.codex,
+                modelID: newDefault.id,
+                effortID: "medium"
+            )
+        )
+    }
+
+    func testModelCatalogRefreshPreservesAvailableSelectionAndEffort() {
+        let current = CourseAgentSettingsDraft(
+            agentID: CourseAgentProvider.codex,
+            modelID: "still-available-model",
+            effortID: "high"
+        )
+        let selectedModel = makeModel(
+            id: current.modelID,
+            runtimeID: CourseAgentProvider.codex,
+            efforts: [.medium, .high],
+            defaultEffort: .medium
+        )
+
+        XCTAssertEqual(
+            CourseAgentSettingsDraftPolicy.afterModelCatalogRefresh(
+                current: current,
+                models: [selectedModel],
+                usesCustomEndpoint: false
+            ),
+            current
+        )
+    }
+
+    func testModelCatalogRefreshPreservesCustomEndpointModelID() {
+        let current = CourseAgentSettingsDraft(
+            agentID: CourseAgentProvider.codex,
+            modelID: "my-provider-model",
+            effortID: ""
+        )
+        let codexCatalogModel = makeModel(
+            id: "hosted-codex-model",
+            runtimeID: CourseAgentProvider.codex,
+            efforts: [.medium],
+            defaultEffort: .medium
+        )
+
+        XCTAssertEqual(
+            CourseAgentSettingsDraftPolicy.afterModelCatalogRefresh(
+                current: current,
+                models: [codexCatalogModel],
+                usesCustomEndpoint: true
+            ),
+            current
+        )
+    }
+
     func testCourseAgentDraftPolicyRestoresPersistedSelectionAfterFailedSave() {
         let persisted = CourseAgentSettingsDraft(
             agentID: CourseAgentProvider.applePrivateCloud,
@@ -6727,6 +6839,131 @@ final class CourseExperienceStoreTests: XCTestCase {
             store.agentOptions.first(where: { $0.id == "hermes" })?.title,
             "Hermes B"
         )
+    }
+
+    func testRefreshedCatalogForSameServerReplacesPresentedModelChoices() throws {
+        let store = CourseExperienceStore(defaults: try makeDefaults(), environment: [:])
+        let serverID = "local-codex"
+        let oldModel = makeModel(
+            id: "old-codex-model",
+            runtimeID: CourseAgentProvider.codex,
+            efforts: [.medium],
+            defaultEffort: .medium
+        )
+        let newModel = makeModel(
+            id: "new-codex-model",
+            runtimeID: CourseAgentProvider.codex,
+            efforts: [.high],
+            defaultEffort: .high
+        )
+        let runtimeInfos = [
+            AgentRuntimeInfo(
+                kind: CourseAgentProvider.codex,
+                name: CourseAgentProvider.codex,
+                displayName: "Codex",
+                available: true
+            ),
+        ]
+
+        let firstRequest = store.requestAgentCatalogPresentation(for: serverID)
+        store.applyAgentCatalog(
+            serverID: serverID,
+            runtimeInfos: runtimeInfos,
+            models: [oldModel],
+            presentationRequestID: firstRequest
+        )
+        XCTAssertEqual(
+            store.presentedModels(for: CourseAgentProvider.codex).map(\.id),
+            [oldModel.id]
+        )
+        XCTAssertEqual(
+            store.presentedDefaultModelID(for: CourseAgentProvider.codex),
+            oldModel.id
+        )
+
+        let refreshRequest = store.requestAgentCatalogPresentation(for: serverID)
+        store.applyAgentCatalog(
+            serverID: serverID,
+            runtimeInfos: runtimeInfos,
+            models: [newModel],
+            presentationRequestID: refreshRequest
+        )
+
+        XCTAssertEqual(store.courseModels.map(\.id), [newModel.id])
+        XCTAssertEqual(
+            store.presentedModels(for: CourseAgentProvider.codex).map(\.id),
+            [newModel.id]
+        )
+        XCTAssertEqual(
+            store.presentedDefaultModelID(for: CourseAgentProvider.codex),
+            newModel.id
+        )
+        XCTAssertFalse(
+            store.presentedModels(for: CourseAgentProvider.codex).contains {
+                $0.id == oldModel.id
+            }
+        )
+    }
+
+    func testStaleCachedModelCatalogRefreshesAndExplicitRefreshBypassesInterval() async throws {
+        let serverID = "cached-model-server"
+        let cachedModel = makeModel(
+            id: "cached-model",
+            runtimeID: "hermes",
+            efforts: [.medium],
+            defaultEffort: .medium
+        )
+        let client = RecordingModelRefreshAppClient()
+        let appModel = AppModel(
+            store: HermesSnapshotAppStore(
+                serverID: serverID,
+                availableModels: [cachedModel]
+            ),
+            client: client
+        )
+        await appModel.refreshSnapshot()
+        XCTAssertEqual(appModel.availableModels(for: serverID).map(\.id), [cachedModel.id])
+
+        await appModel.loadAvailableModelsIfNeeded(serverId: serverID)
+        XCTAssertEqual(client.refreshServerIDs, [serverID])
+
+        await appModel.loadAvailableModelsIfNeeded(serverId: serverID)
+        XCTAssertEqual(client.refreshServerIDs, [serverID])
+
+        let refreshed = await appModel.refreshAvailableModels(serverId: serverID)
+        XCTAssertTrue(refreshed)
+        XCTAssertEqual(client.refreshServerIDs, [serverID, serverID])
+    }
+
+    func testFailedModelRefreshRetainsCachedListAndBacksOffAutomaticRetry() async throws {
+        let serverID = "cached-model-server"
+        let cachedModel = makeModel(
+            id: "cached-model",
+            runtimeID: "hermes",
+            efforts: [.medium],
+            defaultEffort: .medium
+        )
+        let client = RecordingModelRefreshAppClient(failuresRemaining: 1)
+        let appModel = AppModel(
+            store: HermesSnapshotAppStore(
+                serverID: serverID,
+                availableModels: [cachedModel]
+            ),
+            client: client
+        )
+        await appModel.refreshSnapshot()
+
+        await appModel.loadAvailableModelsIfNeeded(serverId: serverID)
+        XCTAssertEqual(client.refreshServerIDs, [serverID])
+        XCTAssertEqual(appModel.availableModels(for: serverID).map(\.id), [cachedModel.id])
+
+        await appModel.loadAvailableModelsIfNeeded(serverId: serverID)
+        XCTAssertEqual(client.refreshServerIDs, [serverID])
+
+        let retried = await appModel.refreshAvailableModels(serverId: serverID)
+        XCTAssertTrue(retried)
+        XCTAssertEqual(client.refreshServerIDs, [serverID, serverID])
+        XCTAssertEqual(appModel.availableModels(for: serverID).map(\.id), [cachedModel.id])
     }
 
     func testApplyingSecondServerCatalogNormalizesOnlyMatchingServerEfforts() throws {
@@ -19841,6 +20078,7 @@ private final class HermesSnapshotAppStore: AppStore, @unchecked Sendable {
 
     init(
         serverID: String,
+        availableModels: [ModelInfo]? = nil,
         startTurnBarrier: ContinuationHermesRecoveryBarrier? = nil,
         startTurnReceipt: AppTurnSubmissionReceipt? = nil
     ) {
@@ -19867,7 +20105,7 @@ private final class HermesSnapshotAppStore: AppStore, @unchecked Sendable {
                 requiresOpenaiAuth: false,
                 rateLimits: nil,
                 rateLimitsByRuntime: [],
-                availableModels: nil,
+                availableModels: availableModels,
                 agentRuntimes: [AgentRuntimeInfo(
                     kind: "hermes",
                     name: "hermes",
@@ -20626,6 +20864,115 @@ final class CourseChatTimelinePolicyTests: XCTestCase {
         )
 
         XCTAssertTrue(CourseChatTimelinePolicy.projectLiveItems([call, result]).isEmpty)
+    }
+
+    func testTurnsMarkOnlyTheStreamingTurnLive() {
+        let items = [
+            userItem(id: "user-1", turnID: "turn-1"),
+            assistantItem(id: "agent-1", turnID: "turn-1"),
+            userItem(id: "user-2", turnID: "turn-2"),
+            assistantItem(id: "agent-2", turnID: "turn-2"),
+        ]
+
+        let turns = CourseChatTimelinePolicy.turns(
+            from: items,
+            threadHasActiveTurn: true,
+            activeTurnID: "turn-2"
+        )
+
+        XCTAssertEqual(turns.map(\.id), ["course-turn-user-1", "course-turn-user-2"])
+        XCTAssertEqual(turns.map { $0.items.map(\.id) }, [
+            ["user-1", "agent-1"],
+            ["user-2", "agent-2"],
+        ])
+        XCTAssertEqual(turns.map(\.isLive), [false, true])
+    }
+
+    func testTurnsKeepPreviousReplyStaticBeforeNewReplyArrives() {
+        let items = [
+            userItem(id: "user-1", turnID: "turn-1"),
+            assistantItem(id: "agent-1", turnID: "turn-1"),
+            userItem(id: "course-local-pending", turnID: nil),
+        ]
+
+        let turns = CourseChatTimelinePolicy.turns(
+            from: items,
+            threadHasActiveTurn: true,
+            activeTurnID: "turn-2"
+        )
+
+        XCTAssertEqual(turns.map(\.isLive), [false, true])
+        XCTAssertEqual(turns.first?.items.map(\.id), ["user-1", "agent-1"])
+    }
+
+    func testTurnsDoNotReviveFinishedTurnWhileHiddenTurnStreams() {
+        let items = [
+            userItem(id: "user-1", turnID: "turn-1"),
+            assistantItem(id: "agent-1", turnID: "turn-1"),
+        ]
+
+        let turns = CourseChatTimelinePolicy.turns(
+            from: items,
+            threadHasActiveTurn: true,
+            activeTurnID: "hidden-internal-turn"
+        )
+
+        XCTAssertEqual(turns.map(\.isLive), [false])
+    }
+
+    func testTurnsKeepStreamingTurnLiveWhenUnmatchedLocalMessageTrails() {
+        let items = [
+            userItem(id: "user-1", turnID: "turn-1"),
+            assistantItem(id: "agent-1", turnID: "turn-1"),
+            userItem(id: "user-2", turnID: "turn-2"),
+            assistantItem(id: "agent-2", turnID: "turn-2"),
+            userItem(id: "course-local-unmatched", turnID: nil),
+        ]
+
+        let turns = CourseChatTimelinePolicy.turns(
+            from: items,
+            threadHasActiveTurn: true,
+            activeTurnID: "turn-2"
+        )
+
+        XCTAssertEqual(turns.map(\.isLive), [false, true, false])
+    }
+
+    func testTurnsAreStaticWhenThreadIsIdle() {
+        let turns = CourseChatTimelinePolicy.turns(
+            from: [
+                userItem(id: "user-1", turnID: "turn-1"),
+                assistantItem(id: "agent-1", turnID: "turn-1"),
+            ],
+            threadHasActiveTurn: false,
+            activeTurnID: nil
+        )
+
+        XCTAssertEqual(turns.map(\.isLive), [false])
+    }
+
+    private func userItem(id: String, turnID: String?) -> ConversationItem {
+        ConversationItem(
+            id: id,
+            content: .user(ConversationUserMessageData(text: id, images: [])),
+            sourceTurnId: turnID,
+            isFromUserTurnBoundary: true
+        )
+    }
+
+    private func assistantItem(id: String, turnID: String?) -> ConversationItem {
+        ConversationItem(
+            id: id,
+            content: .assistant(
+                ConversationAssistantMessageData(
+                    text: id,
+                    agentNickname: nil,
+                    agentRole: nil,
+                    phase: nil
+                )
+            ),
+            sourceTurnId: turnID
+        )
     }
 
     private func mcpItem(

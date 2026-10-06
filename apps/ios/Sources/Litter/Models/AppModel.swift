@@ -97,8 +97,27 @@ final class AppModel {
         var upsertItem: HydratedConversationItem?
     }
 
+    /// Accumulated streaming-text deltas keyed by `(threadKey, itemId, kind)`.
+    /// Each batch entry holds the running concatenation of text for that item
+    /// so we can flush all accumulated tokens in a single `snapshot`
+    /// mutation (~8 fps) instead of reassigning `snapshot` per token.
+    private struct PendingStreamingDelta: Sendable {
+        var text: String = ""
+    }
+
+    /// Dictionary key for streaming-delta batches. Bundles the identifying
+    /// tuple so flush logic never has to re-parse a concatenated string.
+    private struct StreamingDeltaBatchKey: Hashable, Sendable {
+        let key: ThreadKey
+        let itemId: String
+        let kind: ThreadStreamingDeltaKind
+    }
+
     private static let liveItemMutationCoalescingNanoseconds: UInt64 = 120_000_000 // ~8fps commands
     private static let liveThreadStateCoalescingNanoseconds: UInt64 = 150_000_000  // ~6fps metadata
+    private static let streamingDeltaCoalescingNanoseconds: UInt64 = 120_000_000   // ~8fps streamed text
+    private static let modelRefreshInterval: TimeInterval = 5 * 60
+    private static let modelRefreshFailureRetryInterval: TimeInterval = 30
     private static let localAuthRestoreRetryDelays: [Duration] = [
         .seconds(1),
         .seconds(2),
@@ -176,7 +195,9 @@ final class AppModel {
 
     @ObservationIgnored private var subscription: AppStoreSubscription?
     @ObservationIgnored private var updateTask: Task<Void, Never>?
-    @ObservationIgnored private var loadingModelServerIds: Set<String> = []
+    @ObservationIgnored private var modelRefreshTasks: [String: (id: UUID, task: Task<Bool, Never>)] = [:]
+    @ObservationIgnored private var recentModelRefreshAttempts: [String: Date] = [:]
+    @ObservationIgnored private var failedModelRefreshServerIds: Set<String> = []
     @ObservationIgnored private var loadingRateLimitServerIds: Set<String> = []
     @ObservationIgnored private var recentConversationMetadataLoads: [String: Date] = [:]
     @ObservationIgnored private var pendingThreadRefreshKeys: Set<ThreadKey> = []
@@ -188,6 +209,8 @@ final class AppModel {
     @ObservationIgnored private var pendingThreadStateTask: Task<Void, Never>?
     @ObservationIgnored private var pendingCommandRowMutations: [String: PendingCommandRowMutation] = [:]
     @ObservationIgnored private var pendingCommandRowMutationTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingStreamingDeltas: [StreamingDeltaBatchKey: PendingStreamingDelta] = [:]
+    @ObservationIgnored private var pendingStreamingDeltaTask: Task<Void, Never>?
     @ObservationIgnored private var cachedThreadSnapshots: [ThreadKey: AppThreadSnapshot] = [:]
     @ObservationIgnored private var loadingTurnPageThreadKeys: Set<ThreadKey> = []
 
@@ -223,12 +246,14 @@ final class AppModel {
     }
 
     deinit {
+        modelRefreshTasks.values.forEach { $0.task.cancel() }
         updateTask?.cancel()
         pendingThreadRefreshTask?.cancel()
         pendingActiveThreadHydrationTask?.cancel()
         pendingSnapshotRefreshTask?.cancel()
         pendingThreadStateTask?.cancel()
         pendingCommandRowMutationTask?.cancel()
+        pendingStreamingDeltaTask?.cancel()
     }
 
     func start() {
@@ -268,6 +293,9 @@ final class AppModel {
         pendingCommandRowMutationTask?.cancel()
         pendingCommandRowMutationTask = nil
         pendingCommandRowMutations.removeAll()
+        pendingStreamingDeltaTask?.cancel()
+        pendingStreamingDeltaTask = nil
+        pendingStreamingDeltas.removeAll()
         subscription = nil
     }
 
@@ -1062,6 +1090,7 @@ final class AppModel {
     }
 
     func applySnapshot(_ snapshot: AppSnapshotRecord?) {
+        flushPendingStreamingDeltas()
         let normalizedSnapshot = snapshot.map(normalizingLocalServerDisplayNames)
         let mergedSnapshot = normalizedSnapshot.map(mergingCachedThreadSnapshots)
         self.snapshot = mergedSnapshot
@@ -1098,12 +1127,19 @@ final class AppModel {
     private func handleStoreUpdate(_ update: AppStoreUpdateRecord) async {
         switch update {
         case .threadUpserted(let thread, let sessionSummary, let agentDirectoryVersion):
+            // Apply queued text first so the upsert's streaming-text
+            // preservation compares against everything received so far.
+            flushPendingStreamingDeltas(for: thread.key)
             applyThreadUpsert(
                 thread,
                 sessionSummary: sessionSummary,
                 agentDirectoryVersion: agentDirectoryVersion
             )
         case .threadMetadataChanged(let state, let sessionSummary, let agentDirectoryVersion):
+            // A turn finishing arrives as a metadata update. Flush any
+            // pending streamed text for this thread first so the final
+            // token is never lost behind the coalescer window.
+            flushPendingStreamingDeltas(for: state.key)
             if shouldBatchLiveThreadStateUpdate(for: state.key) {
                 enqueueThreadStateUpdate(
                     state,
@@ -1118,6 +1154,9 @@ final class AppModel {
                 )
             }
         case .threadItemChanged(let key, let item, let sessionSummary):
+            // The finalized assistant/command item supersedes the streamed
+            // placeholder; flush any pending deltas for this thread first.
+            flushPendingStreamingDeltas(for: key)
             let isBatched = shouldBatchCommandRowMutation(for: key, item: item)
             if isBatched {
                 enqueueCommandRowUpsert(key: key, item: item)
@@ -1130,18 +1169,26 @@ final class AppModel {
             // stream without waiting for a full snapshot rebuild.
             applySessionSummary(sessionSummary)
         case .threadStreamingDelta(let key, let itemId, let kind, let text):
-            switch kind {
-            case .assistantText:
-                if !applyThreadStreamingDelta(key: key, itemId: itemId, kind: kind, text: text) {
-                    scheduleThreadSnapshotRefresh(for: key)
-                }
-                StreamingRendererCoordinator.shared.appendDelta(text, for: itemId)
-            default:
+            // A visible streaming bubble owns a renderer and receives every
+            // token directly, so its snapshot text can be coalesced to ~8 fps
+            // and the rest of the UI stops re-rendering per token. Without a
+            // renderer, apply immediately: a bubble created later seeds its
+            // renderer from the snapshot text, which must not lag behind.
+            let rendersDirectly = kind == .assistantText
+                && StreamingRendererCoordinator.shared.hasRenderer(for: itemId)
+            if rendersDirectly {
+                enqueueStreamingDelta(key: key, itemId: itemId, kind: kind, text: text)
+            } else {
+                flushPendingStreamingDeltas(for: key)
                 if !applyThreadStreamingDelta(key: key, itemId: itemId, kind: kind, text: text) {
                     scheduleThreadSnapshotRefresh(for: key)
                 }
             }
+            if kind == .assistantText {
+                StreamingRendererCoordinator.shared.appendDelta(text, for: itemId)
+            }
         case .threadRemoved(let key, let agentDirectoryVersion):
+            flushPendingStreamingDeltas(for: key)
             removeThreadSnapshot(for: key, agentDirectoryVersion: agentDirectoryVersion)
         case .activeThreadChanged(let key):
             updateActiveThread(key)
@@ -1269,6 +1316,108 @@ final class AppModel {
         cacheThreadSnapshot(thread)
         lastError = nil
         return true
+    }
+
+    /// Queue a streaming-text delta for coalesced application. The delta is
+    /// accumulated per `(thread, item, kind)` and flushed at ~8 fps, so
+    /// `snapshot` (and therefore every observing view) bumps once per window
+    /// instead of once per token.
+    private func enqueueStreamingDelta(
+        key: ThreadKey,
+        itemId: String,
+        kind: ThreadStreamingDeltaKind,
+        text: String
+    ) {
+        // If the target item is not yet in the snapshot, batching would just
+        // accumulate text against a missing row; apply what is queued and
+        // fall back to the per-delta path, which schedules a thread refresh.
+        guard canApplyStreamingDelta(key: key, itemId: itemId) else {
+            flushPendingStreamingDeltas(for: key)
+            if !applyThreadStreamingDelta(key: key, itemId: itemId, kind: kind, text: text) {
+                scheduleThreadSnapshotRefresh(for: key)
+            }
+            return
+        }
+
+        let batchKey = StreamingDeltaBatchKey(key: key, itemId: itemId, kind: kind)
+        var pending = pendingStreamingDeltas[batchKey] ?? PendingStreamingDelta()
+        pending.text += text
+        pendingStreamingDeltas[batchKey] = pending
+
+        guard pendingStreamingDeltaTask == nil else { return }
+        pendingStreamingDeltaTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.streamingDeltaCoalescingNanoseconds)
+            guard let self, !Task.isCancelled else { return }
+            self.flushPendingStreamingDeltas()
+        }
+    }
+
+    private func canApplyStreamingDelta(key: ThreadKey, itemId: String) -> Bool {
+        snapshot?.threads
+            .first(where: { $0.key == key })?
+            .hydratedConversationItems
+            .contains(where: { $0.id == itemId }) == true
+    }
+
+    /// Apply accumulated streaming deltas in a single `snapshot` mutation,
+    /// bumping `snapshotRevision` once per flush instead of per token.
+    /// Passing a `ThreadKey` flushes only that thread's deltas (used before
+    /// any other update for that thread); passing `nil` flushes everything.
+    private func flushPendingStreamingDeltas(for key: ThreadKey? = nil) {
+        guard !pendingStreamingDeltas.isEmpty else { return }
+
+        let drained = pendingStreamingDeltas.filter { batchKey, _ in
+            key == nil || batchKey.key == key
+        }
+        guard !drained.isEmpty else { return }
+        for batchKey in drained.keys {
+            pendingStreamingDeltas.removeValue(forKey: batchKey)
+        }
+        if pendingStreamingDeltas.isEmpty {
+            pendingStreamingDeltaTask?.cancel()
+            pendingStreamingDeltaTask = nil
+        }
+
+        guard var snapshot else { return }
+
+        var touchedThreadIndices: Set<Int> = []
+        var droppedThreadKeys: Set<ThreadKey> = []
+        for (batchKey, pending) in drained {
+            guard let threadIndex = snapshot.threads.firstIndex(where: { $0.key == batchKey.key }),
+                  let itemIndex = snapshot.threads[threadIndex].hydratedConversationItems
+                      .firstIndex(where: { $0.id == batchKey.itemId }) else {
+                droppedThreadKeys.insert(batchKey.key)
+                continue
+            }
+            var item = snapshot.threads[threadIndex].hydratedConversationItems[itemIndex]
+            guard let updatedContent = applyingStreamingDelta(
+                kind: batchKey.kind,
+                text: pending.text,
+                to: item.content
+            ) else {
+                droppedThreadKeys.insert(batchKey.key)
+                continue
+            }
+            item.content = updatedContent
+            guard snapshot.threads[threadIndex].hydratedConversationItems[itemIndex] != item else {
+                continue
+            }
+            snapshot.threads[threadIndex].hydratedConversationItems[itemIndex] = item
+            touchedThreadIndices.insert(threadIndex)
+        }
+
+        // The old per-token path refreshed the thread when its item vanished
+        // (e.g. a full resync replaced the snapshot between enqueue and flush).
+        for droppedKey in droppedThreadKeys {
+            scheduleThreadSnapshotRefresh(for: droppedKey)
+        }
+
+        guard !touchedThreadIndices.isEmpty else { return }
+        self.snapshot = snapshot
+        for threadIndex in touchedThreadIndices {
+            cacheThreadSnapshot(snapshot.threads[threadIndex])
+        }
+        lastError = nil
     }
 
     private func applyingStreamingDelta(
@@ -1762,6 +1911,7 @@ final class AppModel {
     }
 
     private func applyThreadSnapshot(_ thread: AppThreadSnapshot) {
+        flushPendingStreamingDeltas(for: thread.key)
         let thread = mergedThreadSnapshotPreservingHydratedItems(thread)
         guard var snapshot else {
             cacheThreadSnapshot(thread)
@@ -2080,19 +2230,60 @@ final class AppModel {
 
     func loadAvailableModelsIfNeeded(serverId: String) async {
         guard let server = snapshot?.serverSnapshot(for: serverId), server.isConnected else { return }
-        guard server.availableModels == nil else { return }
-        guard !loadingModelServerIds.contains(serverId) else { return }
-        loadingModelServerIds.insert(serverId)
-        defer { loadingModelServerIds.remove(serverId) }
-        do {
-            _ = try await client.refreshModels(
-                serverId: serverId,
-                params: AppRefreshModelsRequest(cursor: nil, limit: nil, includeHidden: false)
-            )
-            await refreshSnapshot()
-        } catch {
-            lastError = error.localizedDescription
+        guard modelCatalogNeedsRefresh(
+            serverId: serverId,
+            hasCachedModels: server.availableModels != nil
+        ) else { return }
+        if !(await refreshAvailableModels(serverId: serverId)) {
+            lastError = "Models could not be refreshed."
         }
+    }
+
+    /// An explicit picker presentation must re-query model/list even when the
+    /// Rust store already has a list. Coalesce concurrent callers for the same
+    /// server and always project the store snapshot, including partial updates.
+    @discardableResult
+    func refreshAvailableModels(serverId: String) async -> Bool {
+        guard snapshot?.serverSnapshot(for: serverId)?.isConnected == true else { return false }
+        if let pending = modelRefreshTasks[serverId] {
+            return await pending.task.value
+        }
+        recentModelRefreshAttempts[serverId] = Date()
+        let requestID = UUID()
+        let task = Task { @MainActor in
+            let succeeded: Bool
+            do {
+                _ = try await client.refreshModels(
+                    serverId: serverId,
+                    params: AppRefreshModelsRequest(cursor: nil, limit: nil, includeHidden: false)
+                )
+                succeeded = true
+            } catch {
+                succeeded = false
+            }
+            recentModelRefreshAttempts[serverId] = Date()
+            if succeeded {
+                failedModelRefreshServerIds.remove(serverId)
+            } else {
+                failedModelRefreshServerIds.insert(serverId)
+            }
+            await refreshSnapshot()
+            return succeeded
+        }
+        modelRefreshTasks[serverId] = (requestID, task)
+        let succeeded = await task.value
+        if modelRefreshTasks[serverId]?.id == requestID {
+            modelRefreshTasks.removeValue(forKey: serverId)
+        }
+        return succeeded
+    }
+
+    private func modelCatalogNeedsRefresh(serverId: String, hasCachedModels: Bool) -> Bool {
+        guard let lastAttempt = recentModelRefreshAttempts[serverId] else { return true }
+        let interval = failedModelRefreshServerIds.contains(serverId) || !hasCachedModels
+            ? Self.modelRefreshFailureRetryInterval
+            : Self.modelRefreshInterval
+        return Date().timeIntervalSince(lastAttempt) >= interval
     }
 
     func loadRateLimitsIfNeeded(serverId: String) async {
@@ -2346,6 +2537,7 @@ final class AppModel {
     private func hasFreshConversationMetadata(for serverId: String) -> Bool {
         guard let server = snapshot?.serverSnapshot(for: serverId) else { return false }
         let hasModels = server.availableModels != nil
+            && !modelCatalogNeedsRefresh(serverId: serverId, hasCachedModels: true)
         let hasRateLimits = server.account == nil || server.rateLimits != nil
         if hasModels && hasRateLimits {
             return true

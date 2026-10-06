@@ -291,6 +291,51 @@ fn append_cached_models_for_failed_runtimes(
     }
 }
 
+fn finish_model_refresh(
+    client: &MobileClient,
+    server_id: &str,
+    mut models: Vec<types::ModelInfo>,
+    mut seen_model_ids: HashSet<(types::AgentRuntimeKind, String)>,
+    failed_runtime_kinds: HashSet<types::AgentRuntimeKind>,
+) -> Result<(), ClientError> {
+    if !failed_runtime_kinds.is_empty() {
+        // Amp's built-in fallback modes are appended outside the paginated RPC loop.
+        // Include them in the dedupe set before restoring cached choices.
+        seen_model_ids.extend(
+            models
+                .iter()
+                .map(|model| (model.agent_runtime_kind.clone(), model.id.clone())),
+        );
+        let cached_models = client
+            .app_store
+            .snapshot()
+            .servers
+            .get(server_id)
+            .and_then(|server| server.available_models.clone());
+        if let Some(cached_models) = cached_models {
+            append_cached_models_for_failed_runtimes(
+                &mut models,
+                &mut seen_model_ids,
+                &cached_models,
+                &failed_runtime_kinds,
+            );
+        }
+    }
+    client
+        .app_store
+        .update_server_models(server_id, Some(models));
+
+    if failed_runtime_kinds.is_empty() {
+        Ok(())
+    } else {
+        // The server's error may include a URL, account response, or credential details.
+        // Keep the cached choices visible, but tell callers that they are not fresh.
+        Err(ClientError::Rpc(
+            "Could not refresh all model lists. Some choices may be out of date.".to_string(),
+        ))
+    }
+}
+
 fn apply_thread_goal_to_store(
     client: &MobileClient,
     key: &types::ThreadKey,
@@ -1253,24 +1298,13 @@ impl AppClient {
                     append_missing_amp_mode_models(&mut models);
                 }
             }
-            if !failed_runtime_kinds.is_empty() {
-                let cached_models = c
-                    .app_store
-                    .snapshot()
-                    .servers
-                    .get(&server_id)
-                    .and_then(|server| server.available_models.clone());
-                if let Some(cached_models) = cached_models {
-                    append_cached_models_for_failed_runtimes(
-                        &mut models,
-                        &mut seen_model_ids,
-                        &cached_models,
-                        &failed_runtime_kinds,
-                    );
-                }
-            }
-            c.app_store.update_server_models(&server_id, Some(models));
-            Ok(())
+            finish_model_refresh(
+                c.as_ref(),
+                &server_id,
+                models,
+                seen_model_ids,
+                failed_runtime_kinds,
+            )
         })
     }
 
@@ -2574,6 +2608,7 @@ async fn start_ephemeral_thread_for_structured(
         history_mode: None,
         session_start_source: None,
         thread_source: None,
+        project_id: None,
         environments: None,
         dynamic_tools: None,
         mock_experimental_field: None,
@@ -2612,6 +2647,8 @@ async fn run_structured_turn(
             text: prompt.to_string(),
             text_elements: Vec::new(),
         }],
+        turn_trigger: None,
+        tool_output: None,
         responsesapi_client_metadata: None,
         additional_context: None,
         cwd: None,
@@ -2623,12 +2660,14 @@ async fn run_structured_turn(
         permissions: None,
         model: None,
         service_tier: None,
+        service_tier_for_turn: None,
         effort: None,
         summary: None,
         personality: None,
         output_schema: Some(output_schema),
         collaboration_mode: None,
         multi_agent_mode: None,
+        cyber_access_program: None,
     };
     let turn_outcome: Result<upstream::TurnStartResponse, _> = client
         .request_typed_for_server(
@@ -3171,6 +3210,7 @@ async fn perform_update_saved_app(
         history_mode: None,
         session_start_source: None,
         thread_source: None,
+        project_id: None,
         environments: None,
         dynamic_tools: None,
         mock_experimental_field: None,
@@ -3210,6 +3250,8 @@ async fn perform_update_saved_app(
             text: user_prompt.clone(),
             text_elements: Vec::new(),
         }],
+        turn_trigger: None,
+        tool_output: None,
         responsesapi_client_metadata: None,
         additional_context: None,
         cwd: None,
@@ -3221,6 +3263,7 @@ async fn perform_update_saved_app(
         permissions: None,
         model: Some(model),
         service_tier,
+        service_tier_for_turn: None,
         effort: Some(
             crate::types::server_requests::reasoning_effort_into_upstream(reasoning_effort),
         ),
@@ -3229,6 +3272,7 @@ async fn perform_update_saved_app(
         output_schema: None,
         collaboration_mode: None,
         multi_agent_mode: None,
+        cyber_access_program: None,
     };
     let turn_start_outcome: Result<upstream::TurnStartResponse, _> = client
         .request_typed_for_server(
@@ -3521,7 +3565,9 @@ mod tests {
         probe_openai_compatible_credentials_request, runtime_exposes_model_choices,
         splice_generative_ui_preamble,
     };
+    use crate::MobileClient;
     use crate::ffi::ClientError;
+    use crate::session::connection::ServerConfig;
     use crate::store::snapshot::ServerTransportDiagnostics;
     use crate::store::{AppSnapshot, ServerHealthSnapshot, ServerSnapshot};
     use crate::types::models::{AbsolutePath, AppDynamicToolSpec, SkillMetadata, SkillScope};
@@ -4185,6 +4231,128 @@ mod tests {
     }
 
     #[test]
+    fn failed_model_refresh_updates_successful_runtimes_but_reports_stale_choices() {
+        let client = MobileClient::new();
+        client.app_store.upsert_server(
+            &ServerConfig {
+                server_id: "srv".to_string(),
+                display_name: "Server".to_string(),
+                host: "localhost".to_string(),
+                port: 8390,
+                websocket_url: None,
+                is_local: true,
+                tls: false,
+            },
+            ServerHealthSnapshot::Connected,
+        );
+        client.app_store.update_server_models(
+            "srv",
+            Some(vec![
+                test_model("old-codex", "codex".to_string()),
+                test_model("old-claude", "claude".to_string()),
+            ]),
+        );
+
+        let fresh_models = vec![test_model("new-claude", "claude".to_string())];
+        let seen_model_ids = HashSet::from([("claude".to_string(), "new-claude".to_string())]);
+        let error = finish_model_refresh(
+            &client,
+            "srv",
+            fresh_models,
+            seen_model_ids,
+            HashSet::from(["codex".to_string()]),
+        )
+        .expect_err("a failed Codex catalog request must be visible to callers");
+
+        assert!(matches!(
+            error,
+            ClientError::Rpc(message)
+                if message.contains("out of date")
+                    && !message.contains("old-codex")
+                    && !message.contains("server")
+        ));
+        let models = client.app_store.snapshot().servers["srv"]
+            .available_models
+            .clone()
+            .expect("cached and refreshed choices remain visible");
+        assert!(models.iter().any(|model| model.id == "old-codex"));
+        assert!(models.iter().any(|model| model.id == "new-claude"));
+        assert!(!models.iter().any(|model| model.id == "old-claude"));
+    }
+
+    #[test]
+    fn successful_model_refresh_replaces_cached_choices() {
+        let client = MobileClient::new();
+        client.app_store.upsert_server(
+            &ServerConfig {
+                server_id: "srv".to_string(),
+                display_name: "Server".to_string(),
+                host: "localhost".to_string(),
+                port: 8390,
+                websocket_url: None,
+                is_local: true,
+                tls: false,
+            },
+            ServerHealthSnapshot::Connected,
+        );
+        client.app_store.update_server_models(
+            "srv",
+            Some(vec![test_model("old-codex", "codex".to_string())]),
+        );
+
+        finish_model_refresh(
+            &client,
+            "srv",
+            vec![test_model("new-codex", "codex".to_string())],
+            HashSet::from([("codex".to_string(), "new-codex".to_string())]),
+            HashSet::new(),
+        )
+        .expect("successful catalog refresh should not report an error");
+
+        let models = client.app_store.snapshot().servers["srv"]
+            .available_models
+            .clone()
+            .expect("fresh choices remain visible");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "new-codex");
+    }
+
+    #[test]
+    fn amp_fallback_replaces_cached_mode_without_reporting_an_error() {
+        let client = MobileClient::new();
+        client.app_store.upsert_server(
+            &ServerConfig {
+                server_id: "srv".to_string(),
+                display_name: "Server".to_string(),
+                host: "localhost".to_string(),
+                port: 8390,
+                websocket_url: None,
+                is_local: true,
+                tls: false,
+            },
+            ServerHealthSnapshot::Connected,
+        );
+        client
+            .app_store
+            .update_server_models("srv", Some(vec![test_model("smart", "amp".to_string())]));
+
+        finish_model_refresh(
+            &client,
+            "srv",
+            amp_mode_models(),
+            HashSet::new(),
+            HashSet::new(),
+        )
+        .expect("built-in Amp modes are a valid fallback");
+
+        let models = client.app_store.snapshot().servers["srv"]
+            .available_models
+            .clone()
+            .expect("built-in Amp modes remain visible");
+        assert_eq!(models.iter().filter(|model| model.id == "smart").count(), 1);
+    }
+
+    #[test]
     fn preamble_prepended_when_show_widget_registered() {
         let tools = Some(vec![show_widget_spec()]);
         let result = splice_generative_ui_preamble(&tools, Some("user instructions".to_string()));
@@ -4355,11 +4523,15 @@ mod tests {
                 share_context: None,
                 source: upstream::PluginSource::Remote,
                 installed,
+                installed_at: None,
                 enabled,
                 install_policy,
                 install_policy_source: None,
+                must_show_installation_interstitial: None,
                 auth_policy: upstream::PluginAuthPolicy::OnUse,
                 availability: upstream::PluginAvailability::default(),
+                disabled_reason: None,
+                eligible_plan_types: None,
                 interface: display.map(|d| iface(d, "")),
                 keywords: Vec::new(),
             }

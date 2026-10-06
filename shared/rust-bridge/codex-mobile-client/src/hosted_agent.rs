@@ -20,6 +20,7 @@ use url::Url;
 use uuid::Uuid;
 
 const AGENT_ROUTE: &str = "agents/hosted-course-agent";
+const QUESTION_CHOICE_CAPABILITY: &str = "learnfold-question-v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_TOOL_SCHEMA_BYTES: usize = 256 * 1024;
@@ -404,6 +405,7 @@ impl HostedAgentClient {
         let body = json!({
             "messages": messages,
             "clientTools": client_tools,
+            "clientCapabilities": [QUESTION_CHOICE_CAPABILITY],
             "workspaceId": workspace_id,
         });
         send_json(
@@ -1374,6 +1376,12 @@ mod tests {
                 let request: Value =
                     serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap())
                         .unwrap();
+                let body: Value =
+                    serde_json::from_str(request["init"]["body"].as_str().unwrap()).unwrap();
+                assert_eq!(
+                    body["clientCapabilities"],
+                    json!([QUESTION_CHOICE_CAPABILITY])
+                );
                 let initial = request["id"].as_str().unwrap().to_string();
                 // The learner message keeps the platform's optimistic id.
                 let body: Value =

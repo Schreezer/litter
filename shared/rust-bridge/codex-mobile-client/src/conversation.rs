@@ -300,6 +300,26 @@ fn convert_thread_item(
             }),
             false,
         ),
+        ThreadItem::FunctionCallOutput {
+            name,
+            namespace,
+            output,
+            ..
+        } => (
+            HydratedConversationItemContent::DynamicToolCall(HydratedDynamicToolCallData {
+                namespace: namespace.clone(),
+                tool: name.clone(),
+                status: AppOperationStatus::Completed,
+                duration_ms: None,
+                success: None,
+                arguments_json: None,
+                content_summary: output
+                    .to_text()
+                    .map(|output| truncate_command_output_text(&output)),
+                display: None,
+            }),
+            false,
+        ),
         ThreadItem::CommandExecution {
             command,
             cwd,
@@ -434,6 +454,9 @@ fn convert_thread_item(
                         DynamicToolCallOutputContentItem::InputText { text } => text.clone(),
                         DynamicToolCallOutputContentItem::InputImage { image_url } => {
                             format!("[image: {}]", image_url)
+                        }
+                        DynamicToolCallOutputContentItem::InputAudio { .. } => {
+                            "[audio]".to_string()
                         }
                     })
                     .collect::<Vec<_>>()
@@ -716,6 +739,10 @@ fn convert_collab_tool(tool: &CollabAgentTool) -> String {
         CollabAgentTool::ResumeAgent => "resumeAgent".to_string(),
         CollabAgentTool::Wait => "wait".to_string(),
         CollabAgentTool::CloseAgent => "closeAgent".to_string(),
+        CollabAgentTool::SendMessage => "sendMessage".to_string(),
+        CollabAgentTool::FollowupTask => "followupTask".to_string(),
+        CollabAgentTool::InterruptAgent => "interruptAgent".to_string(),
+        CollabAgentTool::ListAgents => "listAgents".to_string(),
     }
 }
 
@@ -724,6 +751,7 @@ fn convert_collab_status(status: &CollabAgentToolCallStatus) -> AppOperationStat
         CollabAgentToolCallStatus::InProgress => AppOperationStatus::InProgress,
         CollabAgentToolCallStatus::Completed => AppOperationStatus::Completed,
         CollabAgentToolCallStatus::Failed => AppOperationStatus::Failed,
+        CollabAgentToolCallStatus::Interrupted => AppOperationStatus::Failed,
     }
 }
 
@@ -749,7 +777,7 @@ fn convert_command_action(action: &CommandAction) -> HydratedCommandActionData {
             kind: HydratedCommandActionKind::Read,
             command: truncate_command_action_field(command),
             name: Some(truncate_command_action_field(name)),
-            path: Some(truncate_command_action_field(&path.display().to_string())),
+            path: Some(truncate_command_action_field(path.as_str())),
             query: None,
         },
         CommandAction::Search {
@@ -1218,6 +1246,9 @@ fn render_user_input(inputs: &[UserInput]) -> (String, Vec<String>) {
             UserInput::LocalImage { path, .. } => {
                 images.push(format!("file://{}", path.display()));
             }
+            UserInput::Audio { .. } | UserInput::LocalAudio { .. } => {
+                text_parts.push("[Audio]".to_string());
+            }
             UserInput::Skill { name, path } => {
                 if !name.is_empty() && path != &PathBuf::new() {
                     text_parts.push(format!("[Skill] {} ({})", name, path.display()));
@@ -1299,7 +1330,8 @@ fn widget_data_from_dynamic_tool_call(
             content_items.and_then(|items| {
                 items.iter().find_map(|item| match item {
                     DynamicToolCallOutputContentItem::InputText { text } => Some(text.clone()),
-                    DynamicToolCallOutputContentItem::InputImage { .. } => None,
+                    DynamicToolCallOutputContentItem::InputImage { .. }
+                    | DynamicToolCallOutputContentItem::InputAudio { .. } => None,
                 })
             })
         })?;
@@ -1985,6 +2017,8 @@ mod tests {
                 text: " Response text ".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             }],
         )];
         let opts = HydrationOptions {
@@ -2031,6 +2065,8 @@ mod tests {
                 .to_string(),
                 phase: Some(codex_protocol::models::MessagePhase::FinalAnswer),
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             }],
         )];
 
@@ -2074,6 +2110,8 @@ diff --git a/parser.rs b/parser.rs\n\
                 text: "Here is a regular markdown answer.".into(),
                 phase: Some(codex_protocol::models::MessagePhase::FinalAnswer),
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             }],
         )];
 
@@ -2092,6 +2130,8 @@ diff --git a/parser.rs b/parser.rs\n\
             "t1",
             vec![ThreadItem::CommandExecution {
                 id: "c1".into(),
+                plugin_id: None,
+                script_path: None,
                 command: "ls -la".into(),
                 cwd: test_abs_path("/tmp").into(),
                 process_id: Some("p1".into()),
@@ -2100,7 +2140,7 @@ diff --git a/parser.rs b/parser.rs\n\
                 command_actions: vec![CommandAction::Read {
                     command: "cat foo.rs".into(),
                     name: "foo.rs".into(),
-                    path: test_abs_path("/src/foo.rs"),
+                    path: test_abs_path("/src/foo.rs").into(),
                 }],
                 aggregated_output: Some("file contents".into()),
                 exit_code: Some(0),
@@ -2148,6 +2188,8 @@ diff --git a/parser.rs b/parser.rs\n\
             "t1",
             vec![ThreadItem::CommandExecution {
                 id: "c1".into(),
+                plugin_id: None,
+                script_path: None,
                 command: "/bin/zsh -lc 'npm test'".into(),
                 cwd: test_abs_path("/tmp").into(),
                 process_id: None,
@@ -2238,6 +2280,8 @@ diff --git a/parser.rs b/parser.rs\n\
                     text: "World".into(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
+                    questions: None,
                 }],
             ),
         ];
@@ -2272,6 +2316,7 @@ diff --git a/parser.rs b/parser.rs\n\
                     app_context: None,
                     mcp_app_resource_uri: None,
                     plugin_id: None,
+                    read_only_hint: None,
                     result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
                         content: vec![serde_json::json!("contents")],
                         structured_content: None,
@@ -2312,6 +2357,7 @@ diff --git a/parser.rs b/parser.rs\n\
                     id: "web-1".into(),
                     query: "swiftui subagent cards".into(),
                     action: None,
+                    results: None,
                 }),
                 ThreadItem::ImageView {
                     id: "img-1".into(),
@@ -2482,6 +2528,7 @@ diff --git a/parser.rs b/parser.rs\n\
                     app_context: None,
                     mcp_app_resource_uri: None,
                     plugin_id: None,
+                    read_only_hint: None,
                     result: None,
                     error: None,
                     duration_ms: Some(42),
@@ -2544,6 +2591,7 @@ diff --git a/parser.rs b/parser.rs\n\
                     app_context: None,
                     mcp_app_resource_uri: None,
                     plugin_id: None,
+                    read_only_hint: None,
                     result: None,
                     error: None,
                     duration_ms: None,
@@ -2598,6 +2646,7 @@ diff --git a/parser.rs b/parser.rs\n\
                 app_context: None,
                 mcp_app_resource_uri: None,
                 plugin_id: None,
+                read_only_hint: None,
                 result: None,
                 error: None,
                 duration_ms: None,
@@ -2630,6 +2679,7 @@ diff --git a/parser.rs b/parser.rs\n\
                     app_context: None,
                     mcp_app_resource_uri: None,
                     plugin_id: None,
+                    read_only_hint: None,
                     result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
                         content: vec![
                             serde_json::json!({
@@ -2658,6 +2708,7 @@ diff --git a/parser.rs b/parser.rs\n\
                     app_context: None,
                     mcp_app_resource_uri: None,
                     plugin_id: None,
+                    read_only_hint: None,
                     result: None,
                     error: None,
                     duration_ms: None,
@@ -2712,6 +2763,10 @@ diff --git a/parser.rs b/parser.rs\n\
                     revised_prompt: Some("a grumpy pirate kitty".into()),
                     result: png_base64.into(),
                     saved_path: Some(test_abs_path("/tmp/ig-1.png")),
+                    transparent_background: None,
+                    failure: None,
+                    imagegen_request_id: None,
+                    generation_id: None,
                 }),
                 // A still-streaming item should stay InProgress with no bytes.
                 ThreadItem::ImageGeneration(codex_app_server_protocol::ImageGenerationItem {
@@ -2720,6 +2775,10 @@ diff --git a/parser.rs b/parser.rs\n\
                     revised_prompt: None,
                     result: String::new(),
                     saved_path: None,
+                    transparent_background: None,
+                    failure: None,
+                    imagegen_request_id: None,
+                    generation_id: None,
                 }),
                 // Codex Desktop has been observed to emit status="generating"
                 // even on the final end event. Presence of bytes or a saved
@@ -2730,6 +2789,10 @@ diff --git a/parser.rs b/parser.rs\n\
                     revised_prompt: None,
                     result: png_base64.into(),
                     saved_path: Some(test_abs_path("/tmp/ig-3.png")),
+                    transparent_background: None,
+                    failure: None,
+                    imagegen_request_id: None,
+                    generation_id: None,
                 }),
             ],
         )];
@@ -2772,6 +2835,8 @@ diff --git a/parser.rs b/parser.rs\n\
             "t-command-truncate",
             vec![ThreadItem::CommandExecution {
                 id: "cmd-1".into(),
+                plugin_id: None,
+                script_path: None,
                 command: long_command,
                 cwd: test_abs_path("/tmp").into(),
                 source: Default::default(),

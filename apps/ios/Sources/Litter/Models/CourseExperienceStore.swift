@@ -2826,6 +2826,7 @@ final class CourseExperienceStore {
     private static let setupKey = "snappy.course.agentSetupComplete"
     private static let agentKey = "snappy.course.selectedAgent"
     private static let agentServerKey = "snappy.course.selectedAgentServer"
+    private static let agentCatalogLoadError = "Course agents could not be loaded. Check the connection and try again."
     private static let modelKey = "snappy.course.selectedModel"
     private static let effortKey = "snappy.course.selectedReasoningEffort"
     private static let coursesKey = "snappy.course.savedCourses"
@@ -2953,6 +2954,7 @@ final class CourseExperienceStore {
         return courseModelsByServerID[serverID] ?? []
     }
     var isLoadingAgentCatalog = false
+    var agentCatalogRefreshFailed = false
     var hasCompletedIntro: Bool
     var setupComplete: Bool
     var connectionState: AgentConnectionState = .idle
@@ -3732,6 +3734,7 @@ final class CourseExperienceStore {
         guard !isLoadingAgentCatalog else { return }
         isLoadingAgentCatalog = true
         defer { isLoadingAgentCatalog = false }
+        agentCatalogRefreshFailed = false
         refreshHostedAvailability()
         refreshAppleAvailability()
         LitterPlatform.bootstrapLocalRuntimeIfNeeded()
@@ -3744,12 +3747,16 @@ final class CourseExperienceStore {
             let presentationRequestID = requestAgentCatalogPresentation(
                 for: serverID
             )
-            await appModel.loadAvailableModelsIfNeeded(serverId: serverID)
+            agentCatalogRefreshFailed = !(await appModel.refreshAvailableModels(serverId: serverID))
             refreshAgentCatalog(
                 appModel: appModel,
                 serverID: serverID,
                 presentationRequestID: presentationRequestID
             )
+            if !agentCatalogRefreshFailed,
+               agentError == Self.agentCatalogLoadError {
+                agentError = nil
+            }
         } catch {
             agentError = "Course agents could not be loaded. Check the connection and try again."
         }
@@ -3772,7 +3779,7 @@ final class CourseExperienceStore {
         selectedAgentServerID = serverID
         defaults.set(serverID, forKey: Self.agentServerKey)
         let presentationRequestID = requestAgentCatalogPresentation(for: serverID)
-        await appModel.loadAvailableModelsIfNeeded(serverId: serverID)
+        agentCatalogRefreshFailed = !(await appModel.refreshAvailableModels(serverId: serverID))
         let serverOptions = refreshAgentCatalog(
             appModel: appModel,
             serverID: serverID,

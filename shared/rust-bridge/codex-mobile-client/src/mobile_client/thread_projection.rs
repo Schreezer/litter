@@ -106,6 +106,9 @@ pub(super) fn queued_follow_up_text_from_inputs(inputs: &[upstream::UserInput]) 
             upstream::UserInput::Image { .. } | upstream::UserInput::LocalImage { .. } => {
                 attachment_count += 1;
             }
+            upstream::UserInput::Audio { .. } | upstream::UserInput::LocalAudio { .. } => {
+                text_parts.push("[Audio attachment]".to_string());
+            }
             upstream::UserInput::Skill { .. } | upstream::UserInput::Mention { .. } => {}
         }
     }
@@ -306,6 +309,10 @@ pub(super) fn queued_follow_up_message_json_from_inputs(
                     "placeholder": placeholder,
                     "path": path,
                 }));
+            }
+            upstream::UserInput::Audio { .. } | upstream::UserInput::LocalAudio { .. } => {
+                // The queued draft retains the original typed inputs for replay.
+                // The message JSON is only a display projection.
             }
             upstream::UserInput::Mention { name, path } => {
                 mention_bindings.push(serde_json::json!({

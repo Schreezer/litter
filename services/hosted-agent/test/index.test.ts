@@ -1,3 +1,4 @@
+import { LEGACY_COURSE_AGENT_PROMPT, QUESTION_CHOICE_CAPABILITY, QUESTION_FENCE } from "../src/course-prompt"
 import { generateText, jsonSchema, tool } from "ai"
 import { getAgentByName } from "agents"
 import type { TurnContext } from "@cloudflare/think"
@@ -186,6 +187,33 @@ describe("hosted agent worker", () => {
 
 
 describe("Hosted course workspace continuity", () => {
+  it("gates choice instructions by client support across turns and body-less continuations", async () => {
+    const stub = await getAgentByName(env.HostedCourseAgent, `test-${crypto.randomUUID()}`)
+    await runInDurableObject(stub, async (agent, state) => {
+      expect(agent.getSystemPrompt()).toBe(LEGACY_COURSE_AGENT_PROMPT)
+      const legacy = await agent.beforeTurn(context({ workspaceId: "course-a" }))
+      expect(legacy.instructions).toContain("Ask concise questions")
+      expect(legacy.instructions).not.toContain(QUESTION_FENCE)
+
+      const supported = await agent.beforeTurn(context({
+        workspaceId: "course-a", clientCapabilities: [QUESTION_CHOICE_CAPABILITY],
+      }))
+      expect(supported.instructions).toContain(QUESTION_FENCE)
+      expect(supported.instructions).toContain("works in New Course and course-building chat")
+      expect(await state.storage.get("learnfold.questionChoices")).toBe(true)
+    })
+    await runInDurableObject(stub, async (agent) => {
+      const continuation = await agent.beforeTurn(context(undefined, true))
+      expect(continuation.instructions).toContain(QUESTION_FENCE)
+
+      const downgraded = await agent.beforeTurn(context({ workspaceId: "course-a" }))
+      expect(downgraded.instructions).toContain("Ask concise questions")
+      expect(downgraded.instructions).not.toContain(QUESTION_FENCE)
+      expect((await agent.beforeTurn(context(undefined, true))).instructions).not.toContain(QUESTION_FENCE)
+    })
+  })
+
+
   function context(body?: Record<string, unknown>, continuation = false): TurnContext {
     return { body, continuation, messages: [], tools: {}, system: "Course agent", model: createHostedModel("test-key") }
   }

@@ -2286,6 +2286,9 @@ impl AppStoreReducer {
                         codex_protocol::protocol::RealtimeConversationVersion::V2 => {
                             "v2".to_string()
                         }
+                        codex_protocol::protocol::RealtimeConversationVersion::V3 => {
+                            "v3".to_string()
+                        }
                     },
                 };
                 self.emit(AppStoreUpdateRecord::RealtimeStarted {
@@ -3565,6 +3568,7 @@ fn render_user_input(inputs: &[upstream::UserInput]) -> (String, Vec<String>) {
             upstream::UserInput::LocalImage { path, .. } => {
                 images.push(format!("file://{}", path.display()));
             }
+            upstream::UserInput::Audio { .. } | upstream::UserInput::LocalAudio { .. } => {}
             upstream::UserInput::Skill { name, path } => {
                 if !name.is_empty() && path != &PathBuf::new() {
                     text_parts.push(format!("[Skill] {} ({})", name, path.display()));
@@ -5254,14 +5258,20 @@ mod tests {
         // helper apply_thread_read_response uses, then upsert.
         let upstream_thread = upstream::Thread {
             id: "thread-1".to_string(),
+            environments: None,
             extra: None,
             session_id: "session-1".to_string(),
             forked_from_id: None,
             parent_thread_id: None,
             preview: "run some tools im testing".to_string(),
             ephemeral: false,
+            section: None,
+            section_entered_at: None,
+            project_id: None,
             history_mode: Default::default(),
             model_provider: "openai".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 1,
             updated_at: 2,
             recency_at: None,
@@ -5270,12 +5280,15 @@ mod tests {
             cwd: codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path_checked("/tmp")
                 .expect("absolute path"),
             cli_version: "0.125.0".to_string(),
+            originator: None,
             source: upstream::SessionSource::default(),
+            can_accept_direct_input: None,
             thread_source: None,
             agent_nickname: None,
             agent_role: None,
             git_info: None,
             name: Some("Thread".to_string()),
+            daybreak_enabled: None,
             turns: vec![upstream::Turn {
                 id: "turn-1".to_string(),
                 status: upstream::TurnStatus::Completed,

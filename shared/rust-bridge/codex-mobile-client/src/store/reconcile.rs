@@ -901,14 +901,20 @@ mod tests {
     fn test_upstream_thread(id: &str) -> upstream::Thread {
         upstream::Thread {
             id: id.to_string(),
+            environments: None,
             extra: None,
             session_id: format!("session-{id}"),
             forked_from_id: None,
             parent_thread_id: None,
             preview: "hello".to_string(),
             ephemeral: false,
+            section: None,
+            section_entered_at: None,
+            project_id: None,
             history_mode: Default::default(),
             model_provider: "openai".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 1,
             updated_at: 2,
             recency_at: None,
@@ -916,12 +922,15 @@ mod tests {
             path: Some(PathBuf::from("/tmp/thread.jsonl")),
             cwd: test_abs_path("/tmp"),
             cli_version: "1.0.0".to_string(),
+            originator: None,
             source: upstream::SessionSource::default(),
+            can_accept_direct_input: None,
             thread_source: None,
             agent_nickname: None,
             agent_role: None,
             git_info: None,
             name: Some("Thread".to_string()),
+            daybreak_enabled: None,
             turns: Vec::new(),
         }
     }
@@ -981,9 +990,11 @@ mod tests {
         );
 
         let response = upstream::GetAccountRateLimitsResponse {
+            ordinary_usage_allowed: None,
             rate_limits: upstream::RateLimitSnapshot {
                 limit_id: Some("primary".to_string()),
                 limit_name: Some("Primary".to_string()),
+                normal_model_slug: None,
                 primary: Some(upstream::RateLimitWindow {
                     used_percent: 42,
                     window_duration_mins: Some(60),
@@ -996,11 +1007,14 @@ mod tests {
                     balance: Some("5.00".to_string()),
                 }),
                 individual_limit: None,
+                spend_control_reached: None,
                 plan_type: Some(codex_protocol::account::PlanType::Plus),
                 rate_limit_reached_type: None,
             },
             rate_limits_by_limit_id: None,
             rate_limit_reset_credits: None,
+            account_id: None,
+            rate_limit_upsell: None,
         };
 
         client
@@ -1047,6 +1061,7 @@ mod tests {
                 upgrade: None,
                 display_name: "gpt-5.4".to_string(),
                 description: "Balanced flagship".to_string(),
+                model_specialty: None,
                 hidden: false,
                 supported_reasoning_efforts: vec![upstream::ReasoningEffortOption {
                     reasoning_effort: codex_protocol::openai_models::ReasoningEffort::Medium,
@@ -1055,6 +1070,7 @@ mod tests {
                 default_reasoning_effort: codex_protocol::openai_models::ReasoningEffort::Medium,
                 input_modalities: vec![codex_protocol::openai_models::InputModality::Text],
                 supports_personality: true,
+                multi_agent_version: None,
                 additional_speed_tiers: Vec::new(),
                 service_tiers: Vec::new(),
                 default_service_tier: None,

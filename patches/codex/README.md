@@ -2,8 +2,8 @@
 
 Patches applied to `shared/third_party/codex` by `apps/ios/scripts/sync-codex.sh` during build.
 
-The active compatibility patch is `mobile-0.144.6.patch`, based on Codex tag
-`rust-v0.144.6` (`5d1fbf26c43abc65a203928b2e31561cb039e06d`). It consolidates the mobile and
+The active compatibility patch is `mobile-0.155.1.patch`, based on Codex tag
+`rust-v0.155.1` (`be2951ea34f0d295ed0becf97079f92fa5f6950e`). It consolidates the mobile and
 Litter transport extensions described below into one atomically applicable patch. The older split
 patches remain as intent/history for future rebases, but the sync script does not apply them.
 
@@ -30,12 +30,10 @@ Touches `core/src/exec.rs` and `core/src/unified_exec/process_manager.rs`.
 
 Consumed by `shared/rust-bridge/codex-mobile-client/src/ish_exec.rs` (`set_ios_exec_hook`), `android_exec.rs` (`set_android_tool_resolver`), and `shell_preflight.rs` (`set_mobile_exec_preflight`).
 
-## `mobile-code-mode-stub.patch`
-Replaces the V8 JavaScript runtime in `code-mode` with a stub on iOS, Android, and Linux. Mobile builds can't link `v8` (binary size, JIT entitlements), and the stub returns "exec is unavailable on mobile targets in this build" when invoked.
-
-Touches `code-mode/Cargo.toml`, `code-mode/src/lib.rs`, adds `code-mode/src/runtime_stub.rs` and `service_stub.rs`.
-
-When upstream changes the `runtime` or `service` API surface, audit the stubs to keep their type signatures in sync with the live (non-mobile) versions.
+## Code mode on mobile
+Codex 0.155.1 no longer embeds the V8 runtime that required the old mobile code-mode stub. The
+upstream code-mode implementation uses a separate runtime process, so the consolidated patch no
+longer carries `mobile-code-mode-stub.patch`.
 
 ## `thread-read-permissions.patch`
 Adds `approval_policy` and `sandbox` to `ThreadReadResponse` so mobile clients can render the live permission state of a thread without doing a separate config fetch.
@@ -72,7 +70,7 @@ Touches `core/src/installation_id.rs`.
 ## `dynamic-tool-call-arguments-delta.patch`
 Adds streaming delta notifications for dynamic tool-call argument JSON. The model emits `response.function_call_arguments.delta` SSE events; this patch surfaces them as `EventMsg::DynamicToolCallArgumentsDelta` and `ServerNotification::DynamicToolCallArgumentsDelta` so mobile clients can render partial tool-call output before the call finalizes.
 
-Touches `protocol/src/protocol.rs`, `app-server-protocol/src/protocol/{common.rs,event_mapping.rs,v2/item.rs}`, `app-server/src/bespoke_event_handling.rs`, `codex-api/src/sse/responses.rs`, `core/src/session/turn.rs`, `mcp-server/src/codex_tool_runner.rs`, `rollout-trace/src/protocol_event.rs`, `rollout/src/policy.rs`, `tui/src/app/app_server_event_targets.rs`, `tui/src/chatwidget/protocol.rs`.
+Touches `protocol/src/protocol.rs`, `app-server-protocol/src/protocol/{common.rs,event_mapping.rs,v2/item.rs}`, `app-server/src/{bespoke_event_handling.rs,notification_media.rs}`, `codex-api/src/sse/responses.rs`, `core/src/session/turn.rs`, `rollout-trace/src/protocol_event.rs`, `rollout/src/policy.rs`, `tui/src/app/app_server_event_targets.rs`, `tui/src/chatwidget/protocol.rs`.
 
 The TUI hunks are no-op match arms required only because upstream's `ServerNotification` matches are exhaustive. Upstream moved the consolidated `handle_server_notification` match from `tui/src/chatwidget.rs` into `tui/src/chatwidget/protocol.rs`; this patch targets the new location.
 

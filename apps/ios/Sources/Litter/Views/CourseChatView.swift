@@ -343,6 +343,67 @@ enum CourseChatTimelinePolicy {
         return merged
     }
 
+    struct Turn: Identifiable, Equatable {
+        let id: String
+        let items: [ConversationItem]
+        let isLive: Bool
+    }
+
+    /// Splits the course transcript into learner-initiated turns so only the
+    /// turn that is actually streaming renders as live. `ConversationTurnTimeline`
+    /// treats every row it receives as part of one turn: handing it the whole
+    /// thread while a turn is active marks the previous reply as the streaming
+    /// message (replaying its token reveal) and flips live-only layout on every
+    /// historical row, which reads as the transcript flickering.
+    static func turns(
+        from items: [ConversationItem],
+        threadHasActiveTurn: Bool,
+        activeTurnID: String?
+    ) -> [Turn] {
+        var groups: [[ConversationItem]] = []
+        for item in items {
+            if item.isUserItem || item.isFromUserTurnBoundary || groups.isEmpty {
+                groups.append([item])
+            } else {
+                groups[groups.count - 1].append(item)
+            }
+        }
+
+        let liveIndex = liveTurnIndex(
+            in: groups,
+            threadHasActiveTurn: threadHasActiveTurn,
+            activeTurnID: activeTurnID
+        )
+        return groups.enumerated().map { index, turnItems in
+            Turn(
+                id: "course-turn-\(turnItems[0].id)",
+                items: turnItems,
+                isLive: index == liveIndex
+            )
+        }
+    }
+
+    private static func liveTurnIndex(
+        in groups: [[ConversationItem]],
+        threadHasActiveTurn: Bool,
+        activeTurnID: String?
+    ) -> Int? {
+        guard threadHasActiveTurn, let lastIndex = groups.indices.last else { return nil }
+        guard let activeTurnID else { return lastIndex }
+        // An optimistic learner message whose text differs from the live
+        // prompt (for example, appended link sources) trails the live turn,
+        // so prefer the turn that actually carries the active turn's items.
+        if let index = groups.lastIndex(where: { turnItems in
+            turnItems.contains { $0.sourceTurnId == activeTurnID }
+        }) {
+            return index
+        }
+        // Nothing from the active turn is visible yet: either the learner's
+        // message is still optimistic, or an internal course action is
+        // streaming a hidden turn and the last visible turn already finished.
+        return groups[lastIndex].allSatisfy { $0.sourceTurnId == nil } ? lastIndex : nil
+    }
+
     static func hasAssistantContentAfterLatestLearner(
         in items: [ConversationItem]
     ) -> Bool {
@@ -917,6 +978,18 @@ struct CourseChatView: View {
         CourseChatTimelinePolicy.mergedConversationItems(
             localMessages: localMessages,
             liveItems: liveConversationItems
+        )
+    }
+
+    private var visibleRemoteTimelineItems: [ConversationItem] {
+        CourseChatQuestionPolicy.strippingQuestions(from: remoteTimelineItems)
+    }
+
+    private var remoteTimelineTurns: [CourseChatTimelinePolicy.Turn] {
+        CourseChatTimelinePolicy.turns(
+            from: visibleRemoteTimelineItems,
+            threadHasActiveTurn: liveThread?.hasActiveTurn == true,
+            activeTurnID: liveThread?.activeTurnId
         )
     }
 
@@ -1511,34 +1584,41 @@ struct CourseChatView: View {
                                     .id(message.id)
                             }
                         } else if !remoteTimelineItems.isEmpty || liveThread != nil {
-                            ConversationTurnTimeline(
-                                items: CourseChatQuestionPolicy.strippingQuestions(
-                                    from: remoteTimelineItems
-                                ),
-                                isLive: liveThread?.hasActiveTurn == true,
-                                serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? "",
-                                originThreadId: liveThread?.key.threadId ?? activeThreadKey?.threadId,
-                                agentDirectoryVersion: appModel.snapshot?.agentDirectoryVersion ?? 0,
-                                messageActionsDisabled: true,
-                                onStreamingSnapshotRendered: {
-                                    requestFollowScrollAfterLayout(proxy)
-                                },
-                                onLiveContentLayoutChanged: {
-                                    requestFollowScrollAfterLayout(proxy)
-                                },
-                                resolveTargetLabel: { target in
-                                    appModel.snapshot?.resolvedAgentTargetLabel(
-                                        for: target,
-                                        serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? ""
+                            VStack(alignment: .leading, spacing: 10) {
+                                let expansionContext = ConversationTimelineExpansionContext(
+                                    items: visibleRemoteTimelineItems
+                                )
+                                ForEach(remoteTimelineTurns) { turn in
+                                    ConversationTurnTimeline(
+                                        items: turn.items,
+                                        isLive: turn.isLive,
+                                        serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? "",
+                                        originThreadId: liveThread?.key.threadId ?? activeThreadKey?.threadId,
+                                        agentDirectoryVersion: appModel.snapshot?.agentDirectoryVersion ?? 0,
+                                        messageActionsDisabled: true,
+                                        onStreamingSnapshotRendered: {
+                                            requestFollowScrollAfterLayout(proxy)
+                                        },
+                                        onLiveContentLayoutChanged: {
+                                            requestFollowScrollAfterLayout(proxy)
+                                        },
+                                        resolveTargetLabel: { target in
+                                            appModel.snapshot?.resolvedAgentTargetLabel(
+                                                for: target,
+                                                serverId: liveThread?.key.serverId ?? activeThreadKey?.serverId ?? ""
+                                            )
+                                        },
+                                        onWidgetPrompt: { prompt in
+                                            inputText = prompt
+                                            composerFocused = true
+                                        },
+                                        onEditUserItem: { _ in },
+                                        onForkFromUserItem: { _ in },
+                                        expansionContext: expansionContext
                                     )
-                                },
-                                onWidgetPrompt: { prompt in
-                                    inputText = prompt
-                                    composerFocused = true
-                                },
-                                onEditUserItem: { _ in },
-                                onForkFromUserItem: { _ in }
-                            )
+                                    .id(turn.id)
+                                }
+                            }
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .id("course-live-timeline")
                         }
@@ -4187,6 +4267,87 @@ struct CourseSourceCheckpointUITestHarnessView: View {
         }
         return reference
     }()
+}
+#endif
+
+#if DEBUG
+/// Debug-only transcript for verifying inline multiple-choice questions
+/// without a live agent. Launch with `--ui-test-course-chat-question`.
+struct CourseChatQuestionUITestHarnessView: View {
+    static var isEnabled: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-test-course-chat-question")
+    }
+
+    @State private var messages: [CourseChatMessage] = [
+        CourseChatMessage(role: .learner, text: "Zk snarks"),
+        CourseChatMessage(
+            role: .agent,
+            text: """
+            Great topic. To personalize your course, let's understand your learning goal and background knowledge.
+
+            \(CourseChatQuestionPromptPolicy.exampleBlock)
+            """
+        ),
+    ]
+    @State private var inputText = ""
+    @State private var selectedPhoto: PhotosPickerItem?
+    @FocusState private var composerFocused: Bool
+
+    private var pendingQuestion: CourseChatQuestion? {
+        CourseChatQuestionPolicy.pendingQuestion(in: messages)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(messages) { message in
+                        CourseMessageRow(message: message, agentID: CourseAgentProvider.hosted)
+                    }
+                    if let pendingQuestion {
+                        CourseChatQuestionOptionsView(
+                            question: pendingQuestion,
+                            isEnabled: true,
+                            onSelect: send
+                        )
+                        .padding(.top, 2)
+                    }
+                }
+                .padding(16)
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                CourseChatComposer(
+                    inputText: $inputText,
+                    prompt: pendingQuestion != nil
+                        ? CourseChatQuestion.freeTextPrompt
+                        : "Message your course agent",
+                    sources: [],
+                    isFocused: $composerFocused,
+                    onRemoveSource: { _ in },
+                    onSend: { send(inputText) },
+                    isAgentWorking: false,
+                    isPreparing: false,
+                    isEditingEnabled: true,
+                    isAgentReady: true,
+                    isStopping: false,
+                    onStop: {},
+                    supportsBinarySources: true,
+                    selectedPhoto: $selectedPhoto,
+                    onChooseFile: {},
+                    onPasteLink: {}
+                )
+            }
+            .navigationTitle("New Course")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+
+    private func send(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        messages.append(CourseChatMessage(role: .learner, text: trimmed))
+        inputText = ""
+    }
 }
 #endif
 
