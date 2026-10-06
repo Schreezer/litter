@@ -1785,7 +1785,6 @@ mod tests {
     fn error_notification() {
         let notification = ServerNotification::Error(proto::ErrorNotification {
             error: proto::TurnError {
-                misalignment: None,
                 message: "rate limited".to_string(),
                 codex_error_info: None,
                 additional_details: None,
@@ -1832,6 +1831,7 @@ mod tests {
         let notification = ServerNotification::Error(proto::ErrorNotification {
             error: proto::TurnError {
                 message: "Reconnecting... 1/5".to_string(),
+                misalignment: None,
                 codex_error_info: None,
                 additional_details: None,
             },
