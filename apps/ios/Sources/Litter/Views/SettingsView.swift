@@ -78,6 +78,7 @@ struct SettingsView: View {
                     } footer: {
                         Text("Help improve Learnfold by sharing which features you use with PostHog. Course content, questions, email addresses and recordings are never included.")
                     }
+                    planSection
                     accountSection
                     serversSection
                 }
@@ -157,6 +158,34 @@ struct SettingsView: View {
             Task { await refreshNotificationAuthorizationStatus() }
         }
         #endif
+    }
+
+    // MARK: - Plan Section
+
+    private var planSection: some View {
+        Section {
+            NavigationLink {
+                PlanSettingsView()
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "creditcard")
+                        .foregroundColor(LitterTheme.accent)
+                        .frame(width: 20)
+                    Text("Plan")
+                        .litterFont(.subheadline)
+                        .foregroundColor(LitterTheme.textPrimary)
+                    Spacer(minLength: 12)
+                    Text(SubscriptionStore.shared.activePlan?.title ?? "Free")
+                        .litterFont(.caption)
+                        .foregroundColor(LitterTheme.textSecondary)
+                }
+            }
+            .accessibilityIdentifier("settings.plan.row")
+            .listRowBackground(LitterTheme.surface.opacity(0.6))
+        } header: {
+            Text("Subscription")
+                .foregroundColor(LitterTheme.textSecondary)
+        }
     }
 
     // MARK: - Appearance Section

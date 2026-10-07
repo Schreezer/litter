@@ -89,6 +89,8 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
     private let baseURL: String?
     private let accessToken: String?
     private let clientFactory: (() throws -> HostedAgentClient)?
+    private let entitlements: (any EntitlementProviding)?
+    private let subscriptionExchange: HostedSubscriptionExchange
     private var activeTasks: [UUID: Task<HostedAgentTurnResult, Error>] = [:]
     private var activeClients: [UUID: HostedAgentClient] = [:]
     private var sessionBindings: [UUID: HostedCourseIdentityBinding] = [:]
@@ -96,9 +98,13 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
     init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         bundle: Bundle = .main,
+        entitlements: (any EntitlementProviding)? = nil,
+        subscriptionExchange: HostedSubscriptionExchange = HostedSubscriptionExchange(),
         clientFactory: (() throws -> HostedAgentClient)? = nil
     ) {
         self.clientFactory = clientFactory
+        self.entitlements = entitlements
+        self.subscriptionExchange = subscriptionExchange
         baseURL = Self.configurationValue(
             environmentKey: "LEARNFOLD_HOSTED_AGENT_URL",
             bundleKey: "LearnfoldHostedAgentURL",
@@ -129,7 +135,7 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
     }
 
     func restoredMessages(sessionID: UUID) async throws -> [HostedCourseAgentStoredMessage] {
-        try await client(sessionID: sessionID).loadMessages(sessionId: sessionID.uuidString.lowercased()).compactMap {
+        try await resolvedClient(sessionID: sessionID).loadMessages(sessionId: sessionID.uuidString.lowercased()).compactMap {
             switch $0.role {
             case "user": .init(id: $0.id, role: .learner, text: $0.text)
             case "assistant": .init(id: $0.id, role: .agent, text: $0.text)
@@ -142,7 +148,7 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
         guard Self.processActiveSessions[sessionID] == nil else { return false }
         let ownership = try claimSession(sessionID)
         defer { releaseSession(sessionID, ownership: ownership) }
-        let client = try client(sessionID: sessionID)
+        let client = try await resolvedClient(sessionID: sessionID)
         let session = try await client.loadSession(sessionId: sessionID.uuidString.lowercased())
         guard session.active, session.originatingDevice, session.waitingForTools else { return false }
         let databaseURL = courseDirectory.appendingPathComponent(".course/course-library.sqlite")
@@ -171,7 +177,7 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
     func review(sessionID: UUID, workspaceID: String, prompt: String) async throws -> String {
         let ownership = try claimSession(sessionID)
         defer { releaseSession(sessionID, ownership: ownership) }
-        let client = try client(sessionID: sessionID)
+        let client = try await resolvedClient(sessionID: sessionID)
         let task = Task {
             try await client.send(
                 sessionId: sessionID.uuidString.lowercased(),
@@ -229,7 +235,7 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
             onPartialResponse: onPartialResponse,
             onRecoveringChanged: onRecoveringChanged
         )
-        let client = try client(sessionID: sessionID)
+        let client = try await resolvedClient(sessionID: sessionID)
         let task = Task {
             try await client.send(
                 sessionId: sessionID.uuidString.lowercased(),
@@ -300,6 +306,31 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
         // never make a subsequent retry fall back to a fresh guest identity.
         sessionBindings[sessionID] = binding
         if binding != nil { _ = try client(sessionID: sessionID) }
+    }
+
+    /// Subscribers authenticate with their signed App Store transaction. Everyone
+    /// else (and the shared-token private beta) keeps the original path.
+    private func resolvedClient(sessionID: UUID) async throws -> HostedAgentClient {
+        guard clientFactory == nil, accessToken == nil, let baseURL, let entitlements,
+              let signedTransaction = await entitlements.hostedSignedTransaction() else {
+            return try client(sessionID: sessionID)
+        }
+        let binding = sessionBindings[sessionID]
+        if let binding, binding.serviceBaseURL != baseURL {
+            throw HostedCourseAgentRuntimeError.unavailable(
+                "This conversation uses a different Hosted service. Reconnect that service to continue its saved history."
+            )
+        }
+        let identity = try HostedGuestIdentity.identity(serviceURL: baseURL, ownerSubject: binding?.ownerSubject)
+        let token = try await subscriptionExchange.accessToken(
+            serviceURL: baseURL,
+            guestSecret: identity.secret,
+            sessionID: sessionID.uuidString.lowercased(),
+            signedTransaction: signedTransaction
+        )
+        let client = try HostedAgentClient(baseUrl: baseURL, accessToken: token)
+        try client.setOriginId(originId: HostedGuestIdentity.deviceOriginID())
+        return client
     }
 
     private func client(sessionID: UUID) throws -> HostedAgentClient {
@@ -542,10 +573,13 @@ enum HostedCourseAgentRuntimeError: LocalizedError {
     case unavailable(String)
     case invalidTool(String)
     case toolFailed(String)
+    /// The Worker refused Hosted because there is no verified subscription.
+    case subscriptionRequired(String)
 
     var errorDescription: String? {
         switch self {
-        case .unavailable(let message), .invalidTool(let message), .toolFailed(let message):
+        case .unavailable(let message), .invalidTool(let message), .toolFailed(let message),
+             .subscriptionRequired(let message):
             message
         }
     }
