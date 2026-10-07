@@ -9,7 +9,7 @@
   "settings" : {
     "_applicationInternalID" : "6745000001",
     "_askToBuyEnabled" : false,
-    "_billingGracePeriodEnabled" : true,
+    "_billingGracePeriodEnabled" : false,
     "_billingIssuesEnabled" : false,
     "_disableDialogs" : false,
     "_failTransactionsEnabled" : false,

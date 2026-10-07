@@ -211,6 +211,7 @@ enum DebugLaunchSignalAuthorityInventory {
         "--ui-test-course-reading",
         "--ui-test-course-submission-recovery",
         "--ui-test-starter-course",
+        "--ui-test-subscription-paywall",
         "--ui-test-course-generation-control",
         "--ui-test-course-learning-path",
         "--ui-test-visualization-gallery",
