@@ -1,0 +1,95 @@
+{
+  "identifier" : "7C2D1E40",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+
+  ],
+  "settings" : {
+    "_applicationInternalID" : "6745000001",
+    "_askToBuyEnabled" : false,
+    "_billingGracePeriodEnabled" : false,
+    "_billingIssuesEnabled" : false,
+    "_disableDialogs" : false,
+    "_failTransactionsEnabled" : false,
+    "_locale" : "en_US",
+    "_renewalBillingIssuesEnabled" : false,
+    "_storefront" : "USA",
+    "_storeKitErrors" : [
+
+    ],
+    "_timeRate" : 0
+  },
+  "subscriptionGroups" : [
+    {
+      "id" : "21500000",
+      "localizations" : [
+
+      ],
+      "name" : "Learnfold Plans",
+      "subscriptions" : [
+        {
+          "adHocOffers" : [
+
+          ],
+          "codeOffers" : [
+
+          ],
+          "displayPrice" : "5.00",
+          "familyShareable" : false,
+          "groupNumber" : 1,
+          "internalID" : "6745000011",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {
+              "description" : "Learnfold's Hosted agent. Nothing to set up. Includes everything in Plus.",
+              "displayName" : "Learnfold Hosted",
+              "locale" : "en_US"
+            }
+          ],
+          "productID" : "com.chirag.learnfold.hosted.monthly",
+          "recurringSubscriptionPeriod" : "P1M",
+          "referenceName" : "Learnfold Hosted Monthly",
+          "subscriptionGroupID" : "21500000",
+          "type" : "RecurringSubscription",
+          "winbackOffers" : [
+
+          ]
+        },
+        {
+          "adHocOffers" : [
+
+          ],
+          "codeOffers" : [
+
+          ],
+          "displayPrice" : "1.00",
+          "familyShareable" : false,
+          "groupNumber" : 2,
+          "internalID" : "6745000012",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {
+              "description" : "Bring your own runtime: Codex, Hermes, or your own API key and endpoint.",
+              "displayName" : "Learnfold Plus",
+              "locale" : "en_US"
+            }
+          ],
+          "productID" : "com.chirag.learnfold.plus.monthly",
+          "recurringSubscriptionPeriod" : "P1M",
+          "referenceName" : "Learnfold Plus Monthly",
+          "subscriptionGroupID" : "21500000",
+          "type" : "RecurringSubscription",
+          "winbackOffers" : [
+
+          ]
+        }
+      ]
+    }
+  ],
+  "version" : {
+    "major" : 4,
+    "minor" : 0
+  }
+}

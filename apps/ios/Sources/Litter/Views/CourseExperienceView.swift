@@ -472,7 +472,12 @@ struct CourseExperienceRootView: View {
             store.installDocumentToolRouterIfNeeded(appModel: appModel)
             await store.recoverReadyCourses()
             if store.setupComplete, store.connectionState != .connected {
-                await store.connectLocalAgent(appModel: appModel, agentID: store.selectedAgentID ?? "codex")
+                // Relaunch must never open a paywall; the first send does.
+                await store.connectLocalAgent(
+                    appModel: appModel,
+                    agentID: store.selectedAgentID ?? "codex",
+                    gatesEntitlement: false
+                )
             }
         }
         .task(id: store.setupComplete) {
@@ -2139,7 +2144,7 @@ private struct CourseAgentSettingsView: View {
                                 AgentIconView(kind: option.id, size: 32)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(option.title).foregroundStyle(.primary)
-                                    Text(option.subtitle)
+                                    Text(store.subtitle(for: option))
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }

@@ -193,8 +193,14 @@ targets:
           APP_CODE_SIGN_STYLE: Automatic
           PROVISIONING_PROFILE_SPECIFIER: "$(APP_PROVISIONING_PROFILE_SPECIFIER)"
           APP_PROVISIONING_PROFILE_SPECIFIER: ""
+          # Paid-tier gating is off for local Debug builds so development and
+          # existing tests are unaffected. Set LEARNFOLD_SUBSCRIPTIONS_ENFORCED=1
+          # in the scheme environment to exercise the paywall with the local
+          # StoreKit configuration.
+          LEARNFOLD_SUBSCRIPTIONS_ENFORCED: "NO"
           OTHER_LDFLAGS: "$(inherited) -lc++ -lz -lresolv -lcodex_mobile_client -lghostty"
         Release:
+          LEARNFOLD_SUBSCRIPTIONS_ENFORCED: "YES"
           CODE_SIGN_STYLE: "$(APP_CODE_SIGN_STYLE)"
           APP_CODE_SIGN_STYLE: Automatic
           CODE_SIGN_IDENTITY: "$(APP_CODE_SIGN_IDENTITY)"
@@ -568,6 +574,9 @@ schemes:
     run:
       config: Debug
       customLLDBInit: $(SRCROOT)/.lldbinit
+      # Local products for the Plus/Hosted subscription group. Debug only: the
+      # archive and profile actions never reference it.
+      storeKitConfiguration: Support/Learnfold.storekit
     test:
       config: Debug
       targets:

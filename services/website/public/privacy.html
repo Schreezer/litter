@@ -59,7 +59,7 @@
       <h2>Learning Agents and Model Providers</h2>
       <p>The destination of course requests depends on the learning agent you choose:</p>
       <ul>
-        <li><strong>Learnfold Hosted (default):</strong> prompts, your messages, course context, tool results, and any sources or images you ask the agent to use are sent to Learnfold's cloud service and on to an AI model provider. See "Learnfold Hosted" below.</li>
+        <li><strong>Learnfold Hosted (default):</strong> prompts, your messages, course context, tool results, and any sources or images you ask the agent to use are sent to Learnfold's cloud service and on to an AI model provider. See "Learnfold Hosted" and "Learnfold Hosted and Subscriptions" below.</li>
         <li><strong>Apple on-device models:</strong> supported generation runs on your device.</li>
         <li><strong>Apple Private Cloud Compute:</strong> when available and selected, prompts and relevant course context are processed by Apple's Private Cloud Compute service.</li>
         <li><strong>Hermes or another connected server:</strong> learner messages, link addresses, course context, tool results, and supported attachments are sent to the server you connect. That server may in turn use a model provider configured by its owner.</li>
@@ -77,6 +77,12 @@
         <li><strong>Limits and use:</strong> daily usage limits apply. We do not use your content for advertising or sell it, and we do not use it to train models.</li>
       </ul>
       <p>Do not submit material you are not authorized to share or that contains sensitive personal information you do not want processed in the cloud. To use no cloud service, choose Apple on-device models, where supported. To request deletion of Hosted conversation data for your installation, email <a href="mailto:chirag@fitsnap.fun?subject=Learnfold%20Hosted%20data%20deletion">chirag@fitsnap.fun</a>. Because Hosted does not use accounts, include the approximate dates you used it; we will delete what we can identify.</p>
+
+      <h2>Learnfold Hosted and Subscriptions</h2>
+      <p>Learnfold Plus and Learnfold Hosted are auto-renewing subscriptions sold through the App Store. Apple processes payment, billing and renewals. We do not receive your Apple Account name, email address, or payment details.</p>
+      <p>Learnfold Plus covers using your own runtime. It is checked on your device through StoreKit and no purchase information is sent to us for it.</p>
+      <p>Learnfold Hosted is processed by a service we operate. To confirm your subscription, the app sends that service the Apple-signed transaction for your subscription together with a random installation identifier that the app keeps in your Keychain. The service verifies Apple's signature and then stores a one-way hash of the installation identifier, the transaction's original transaction number, its expiry date, and daily usage counters used to enforce fair-use limits and prevent one subscription from being shared widely. This links your subscription to that installation, not to your name or Apple Account. Because the identifier syncs through iCloud Keychain, it can follow you to your other devices; a subscription can be used on a limited number of installations.</p>
+      <p>Hosted conversation history is stored by the Hosted service so you can resume a course, and course content you send in Hosted requests is sent to a third-party model provider to generate replies. Our infrastructure providers process network metadata such as IP address and request time to operate and protect the service. When a subscription ends or is refunded, Hosted access stops; we may keep the hashed identifier and usage counters for a limited period for abuse prevention. To ask us to delete Hosted data associated with your installation, contact <a href="mailto:chirag@fitsnap.fun">chirag@fitsnap.fun</a>.</p>
 
       <h2>Voice and Audio</h2>
       <p>Learnfold accesses the microphone only after you start a voice feature and grant permission.</p>

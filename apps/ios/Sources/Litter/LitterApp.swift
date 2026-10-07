@@ -211,6 +211,7 @@ enum DebugLaunchSignalAuthorityInventory {
         "--ui-test-course-reading",
         "--ui-test-course-submission-recovery",
         "--ui-test-starter-course",
+        "--ui-test-subscription-paywall",
         "--ui-test-course-generation-control",
         "--ui-test-course-learning-path",
         "--ui-test-visualization-gallery",
@@ -1949,7 +1950,10 @@ struct ContentView: View {
     @State private var appState = AppState()
     @State private var stableSafeAreaInsets = StableSafeAreaInsets()
     @State private var conversationWarmup = ConversationWarmupCoordinator()
-    @State private var courseStore = CourseExperienceStore()
+    @State private var courseStore = CourseExperienceStore(
+        entitlements: SubscriptionStore.shared,
+        enforcesEntitlements: SubscriptionConfiguration.isEnforced()
+    )
     @State private var petOverlay = PetOverlayController.shared
     @State private var composerBottomInset: CGFloat = 0
     @State private var splashDismissed = false
@@ -1979,6 +1983,7 @@ struct ContentView: View {
 
     var body: some View {
         @Bindable var bindableAppState = appState
+        @Bindable var bindableCourseStore = courseStore
 
         GeometryReader { geometry in
             ZStack {
@@ -1987,6 +1992,9 @@ struct ContentView: View {
                 #if DEBUG
                 if StarterCourseUITestHarness.isEnabled {
                     StarterCourseUITestHarness()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if SubscriptionPaywallUITestHarness.isEnabled {
+                    SubscriptionPaywallUITestHarness()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if CourseReadingUITestHarness.isEnabled {
                     CourseReadingUITestHarness()
@@ -2051,6 +2059,9 @@ struct ContentView: View {
         .environment(appState)
         .environment(conversationWarmup)
         .environment(courseStore)
+        .sheet(item: $bindableCourseStore.paywallRequest) { request in
+            SubscriptionPaywallView(requiredPlan: request.requiredPlan)
+        }
         .environment(\.textScale, textScale)
         .preferredColorScheme(themeManager.appearanceMode.preferredColorScheme)
         .background {
@@ -2064,6 +2075,7 @@ struct ContentView: View {
         #endif
         .onAppear {
             themeManager.syncSystemColorScheme(colorScheme)
+            SubscriptionStore.shared.start()
             CourseCloudSyncApplyBridge.shared.register(store: courseStore)
             let environment = ProcessInfo.processInfo.environment
             let forceDiscoveryForUITest = LearnfoldUITestLaunchPolicy

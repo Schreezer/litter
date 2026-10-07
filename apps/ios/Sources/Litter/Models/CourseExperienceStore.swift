@@ -3100,6 +3100,9 @@ final class CourseExperienceStore {
     private var didInstallDocumentToolRouter = false
     private let appleRuntime: any AppleCourseAgentRuntime
     private let hostedRuntime: any HostedCourseAgentRuntime
+    /// Source of paid-plan entitlements. `nil` in tests and unenforced builds.
+    private let entitlements: (any EntitlementProviding)?
+    private let enforcesEntitlements: Bool
     private let agentReadinessProbe: any CourseAgentReadinessProbing
     private let sourceIngestion: CourseSourceIngestionCoordinator
     private let remoteHermesToolExecutor: (@MainActor @Sendable (
@@ -3396,8 +3399,41 @@ final class CourseExperienceStore {
         return true
     }
 
+    /// Set when the learner tries to use an agent their plan doesn't cover.
+    /// The root view presents the paywall for it.
+    var paywallRequest: PaywallRequest?
+
+    /// The plan still needed to use this agent, or `nil` if it is free, the
+    /// learner is entitled, or this build doesn't enforce plans.
+    func entitlementDenial(forRuntimeID runtimeID: String) -> LearnfoldPlan? {
+        guard enforcesEntitlements, let entitlements,
+              let required = AgentAccessPolicy.requiredPlan(forRuntimeID: runtimeID),
+              !entitlements.hasAccess(to: required) else { return nil }
+        return required
+    }
+
+    /// Subtitle for agent pickers: appends the plan an unentitled agent needs.
+    func subtitle(for option: CourseAgentOption) -> String {
+        guard let required = entitlementDenial(forRuntimeID: option.id) else { return option.subtitle }
+        return "\(option.subtitle) · Requires \(required.title)"
+    }
+
+    /// Presents the paywall and returns `true` when the agent is gated.
+    @discardableResult
+    private func presentPaywallIfGated(runtimeID: String) -> Bool {
+        guard let required = entitlementDenial(forRuntimeID: runtimeID) else { return false }
+        if paywallRequest?.requiredPlan != required {
+            paywallRequest = PaywallRequest(requiredPlan: required)
+        }
+        return true
+    }
+
     var preferredSetupAgentID: String {
-        CourseAgentProvider.preferredDefault(in: agentOptions) ?? CourseAgentProvider.codex
+        // Don't default a new learner into an agent that opens a paywall.
+        let ungated = agentOptions.filter { entitlementDenial(forRuntimeID: $0.id) == nil }
+        return CourseAgentProvider.preferredDefault(in: ungated)
+            ?? CourseAgentProvider.preferredDefault(in: agentOptions)
+            ?? CourseAgentProvider.codex
     }
 
     init(
@@ -3405,6 +3441,8 @@ final class CourseExperienceStore {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         appleRuntime: (any AppleCourseAgentRuntime)? = nil,
         hostedRuntime: (any HostedCourseAgentRuntime)? = nil,
+        entitlements: (any EntitlementProviding)? = nil,
+        enforcesEntitlements: Bool = false,
         coursesRootURL: URL? = nil,
         courseControlRootURL: URL? = nil,
         hermesRecoveryArchiveRootURL: URL? = nil,
@@ -3464,8 +3502,10 @@ final class CourseExperienceStore {
         let resolvedAvailability = resolvedAppleRuntime.availability()
         appleAvailability = resolvedAvailability
         let resolvedHostedRuntime = hostedRuntime
-            ?? SystemHostedCourseAgentRuntime(environment: environment)
+            ?? SystemHostedCourseAgentRuntime(environment: environment, entitlements: entitlements)
         self.hostedRuntime = resolvedHostedRuntime
+        self.entitlements = entitlements
+        self.enforcesEntitlements = enforcesEntitlements && entitlements != nil
         let resolvedHostedAvailability = resolvedHostedRuntime.availability()
         hostedAvailability = resolvedHostedAvailability
         agentOptions = Self.initialAgentOptions(
@@ -3850,10 +3890,14 @@ final class CourseExperienceStore {
         appModel: AppModel,
         agentID: String = "codex",
         modelID: String? = nil,
-        reasoningEffortID: String? = nil
+        reasoningEffortID: String? = nil,
+        gatesEntitlement: Bool = true
     ) async -> Bool {
         guard connectionState != .connecting else { return false }
         let hadCompletedSetup = setupComplete
+        if gatesEntitlement, presentPaywallIfGated(runtimeID: agentID) {
+            return false
+        }
         connectionState = .connecting
         agentError = nil
         agentNeedsAuthentication = false
@@ -5446,6 +5490,7 @@ final class CourseExperienceStore {
         }
         let dispatchTarget = discussionTarget ?? mainDispatchTarget()
         let runtimeID = dispatchTarget.runtimeID
+        if presentPaywallIfGated(runtimeID: runtimeID) { return false }
         let sourceError = Self.unsupportedAppleSourceMessage(
             runtimeID: runtimeID,
             sources: submittedSources
@@ -5579,6 +5624,7 @@ final class CourseExperienceStore {
                   workspaceID: previousAttempt.workspaceID,
                   selectionDiscussionID: selectionDiscussionID
               ) else { return false }
+        if presentPaywallIfGated(runtimeID: previousAttempt.target.runtimeID) { return false }
 
         let scope = CourseChatScope(selectionDiscussionID: selectionDiscussionID)
         guard let runToken = chatRuns.begin(scope) else { return false }
@@ -7390,6 +7436,13 @@ final class CourseExperienceStore {
         return "Apple’s model couldn’t complete this request. Please try again."
     }
 
+    /// Surfaces the paywall when the Worker says Hosted needs a subscription.
+    private func presentPaywallIfSubscriptionRequired(_ error: any Error) {
+        guard let hosted = error as? HostedCourseAgentRuntimeError,
+              case .subscriptionRequired = hosted else { return }
+        paywallRequest = PaywallRequest(requiredPlan: .hosted)
+    }
+
     static func hostedAgentFailureMessage(_ error: any Error) -> String {
         if let hostedError = error as? HostedCourseAgentRuntimeError,
            let description = hostedError.errorDescription,
@@ -7449,6 +7502,11 @@ final class CourseExperienceStore {
         guard case .configured = configureCourseAgentContext(for: course) else {
             backgroundGenerationErrorCourseID = course.id
             backgroundGenerationError = "This course is no longer connected to its agent thread."
+            return
+        }
+        if presentPaywallIfGated(runtimeID: activeAgentID) {
+            backgroundGenerationErrorCourseID = course.id
+            backgroundGenerationError = "Choose a plan to keep generating with this agent."
             return
         }
 
@@ -11825,6 +11883,7 @@ final class CourseExperienceStore {
                       selectionDiscussionID: selectionDiscussionID
                   ) else { return }
             let nsError = error as NSError
+            presentPaywallIfSubscriptionRequired(error)
             if runtimeID == "hermes", let key = acceptedHermesTurn?.key ?? hermesThreadKey {
                 AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                     key: key,
