@@ -484,9 +484,11 @@ struct CourseExperienceRootView: View {
         .sheet(isPresented: $showsDesktopAgentSettings) {
             CourseAgentSettingsView(store: store, onConnectRemoteAgent: onConnectRemoteAgent)
                 .environment(appModel)
+                .frame(minWidth: 540, idealWidth: 600, minHeight: 600, idealHeight: 680)
         }
         .sheet(isPresented: $showsDesktopAppSettings) {
             SettingsView().environment(appModel).environment(appState)
+                .frame(minWidth: 540, idealWidth: 600, minHeight: 600, idealHeight: 680)
         }
         .onChange(of: store.navigationPath, initial: true) { _, path in
             navigationHistory.record(path: path)
@@ -3014,25 +3016,24 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
 
     private var desktopBody: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 26) {
+            VStack(alignment: .leading, spacing: 22) {
                 HStack(alignment: .top, spacing: 18) {
                     CourseArtwork(course: course)
-                        .frame(width: 68, height: 68)
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
-                    VStack(alignment: .leading, spacing: 8) {
+                        .frame(width: 64, height: 64)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    VStack(alignment: .leading, spacing: 6) {
                         Text(course.title)
-                            .font(.system(size: 27, weight: .bold, design: .rounded))
+                            .font(.largeTitle.weight(.bold))
                             .fixedSize(horizontal: false, vertical: true)
                         Text(progressSummary ?? course.subtitle)
-                            .font(.system(size: 13))
+                            .font(.body)
                             .foregroundStyle(.secondary)
                             .accessibilityIdentifier("course-progress-summary")
-                        HStack(spacing: 8) {
+                        HStack(spacing: 12) {
                             Label(course.lessonCount == 1 ? "1 lesson" : "\(course.lessonCount) lessons", systemImage: "doc.text")
-                            Text("·")
                             Label(course.duration, systemImage: "clock")
                         }
-                        .font(.system(size: 11))
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 0)
@@ -3069,11 +3070,13 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
                 }
             }
             .frame(maxWidth: 1040, alignment: .leading)
-            .padding(28)
+            .padding(.horizontal, 24)
+            .padding(.top, 20)
+            .padding(.bottom, 32)
             .frame(maxWidth: .infinity, alignment: .top)
         }
-        .background(Color(uiColor: .systemGroupedBackground))
-        .navigationTitle("Course overview")
+        .background(Color(uiColor: .systemBackground))
+        .navigationTitle(course.title)
         .navigationBarTitleDisplayMode(.inline)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("course-detail-root")
@@ -3081,11 +3084,9 @@ private struct CourseDetailPresentation<LearnSection: View, StructureSection: Vi
 
     private var desktopAgentButton: some View {
         Button(action: onTalkToCourseAgent) {
-            Label("Course discussion", systemImage: "bubble.left.and.bubble.right")
-                .font(.system(size: 12, weight: .medium))
+            Label("Course Discussion", systemImage: "bubble.left.and.bubble.right")
         }
         .buttonStyle(.bordered)
-        .controlSize(.large)
         .accessibilityIdentifier("talk-to-course-agent-button")
     }
 

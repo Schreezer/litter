@@ -79,6 +79,28 @@ struct CourseExplorationRequest: Equatable, Sendable {
         }
     }
 
+    /// The learner's ask as a short status line. What it grew from is kept
+    /// apart in `statusSource`, so neither needs quotes inside quotes.
+    var statusTitle: String {
+        if let question = trimmed(question) { return Self.clipped(question) }
+        if trimmed(quotedPassage) != nil { return "Tell me more" }
+        switch direction {
+        case .deeper: return "Going deeper"
+        case .sideways: return "Going sideways"
+        case .wider: return "Zooming out"
+        case .synthesis: return "Tying the threads together"
+        case .question: return "Exploring"
+        }
+    }
+
+    /// The passage or page the exploration grew from, short enough for one line.
+    var statusSource: String {
+        if let passage = trimmed(quotedPassage) {
+            return "“\(Self.clipped(passage, limit: Self.sourceLimit))”"
+        }
+        return "From \(Self.clipped(parentTitle, limit: Self.sourceLimit))"
+    }
+
     /// Shown under the exploration on the Learn map, in the learner's terms.
     var originQuestion: String {
         if let question = trimmed(question) {
@@ -135,10 +157,21 @@ struct CourseExplorationRequest: Equatable, Sendable {
         return text
     }
 
-    private static func clipped(_ text: String) -> String {
+    private static let sourceLimit = 34
+
+    private static func clipped(_ text: String, limit: Int = titleLimit) -> String {
         let singleLine = text.split(whereSeparator: \.isNewline).joined(separator: " ")
-        guard singleLine.count > titleLimit else { return singleLine }
-        return String(singleLine.prefix(titleLimit - 1)).trimmingCharacters(in: .whitespaces) + "…"
+        guard singleLine.count > limit else { return singleLine }
+        var kept = singleLine.prefix(limit - 1)
+        // End on a whole word unless that would throw away most of the text.
+        if singleLine[kept.endIndex] != " ", let space = kept.lastIndex(of: " "),
+           kept.distance(from: kept.startIndex, to: space) > limit / 2 {
+            kept = kept[..<space]
+        }
+        while let last = kept.last, last == " " || last == "," || last == ";" || last == ":" {
+            kept = kept.dropLast()
+        }
+        return kept + "…"
     }
 }
 
@@ -150,6 +183,8 @@ struct CourseExplorationAnchor: Codable, Equatable, Sendable {
     var rangeLocation: Int
     var rangeLength: Int
     var selectedText: String
+    /// Each block's part when the passage spans several blocks.
+    var segments: [CourseTextSegment]?
 
     private enum CodingKeys: String, CodingKey {
         case blockID = "block_id"
@@ -157,6 +192,7 @@ struct CourseExplorationAnchor: Codable, Equatable, Sendable {
         case rangeLocation = "location"
         case rangeLength = "length"
         case selectedText = "text"
+        case segments
     }
 
     /// Page properties hold strings, so the anchor travels as compact JSON.
@@ -166,12 +202,20 @@ struct CourseExplorationAnchor: Codable, Equatable, Sendable {
         return (try? encoder.encode(self)).map { String(decoding: $0, as: UTF8.self) }
     }
 
-    init(blockID: String?, pathIndices: [Int], rangeLocation: Int, rangeLength: Int, selectedText: String) {
+    init(
+        blockID: String?,
+        pathIndices: [Int],
+        rangeLocation: Int,
+        rangeLength: Int,
+        selectedText: String,
+        segments: [CourseTextSegment]? = nil
+    ) {
         self.blockID = blockID
         self.pathIndices = pathIndices
         self.rangeLocation = rangeLocation
         self.rangeLength = rangeLength
         self.selectedText = selectedText
+        self.segments = segments
     }
 
     init?(propertyValue: String?) {
@@ -235,10 +279,87 @@ struct CourseExplorationJob: Identifiable, Equatable, Sendable {
     let courseID: String
     let parentPageID: String
     let pageID: String?
+    /// The placeholder title, then the written page's title.
     var title: String
     var phase: Phase
+    /// `CourseExplorationRequest.statusTitle`, shown until the page has a title.
+    var ask: String?
+    /// `CourseExplorationRequest.statusSource`.
+    var source: String?
 
     var isActive: Bool { phase == .queued || phase == .writing }
+
+    /// What the learner reads for this job: their ask while it is written,
+    /// the page's own title once it is.
+    var displayTitle: String {
+        phase == .ready ? title : (ask ?? title)
+    }
+
+    var statusDetail: String {
+        let status: String
+        switch phase {
+        case .queued: status = "Waiting for a free agent"
+        case .writing: status = "Writing"
+        case .ready: status = "Ready to read"
+        case .failed(let reason): return reason
+        }
+        guard let source else { return status }
+        return "\(status) · \(source)"
+    }
+}
+
+/// What the exploration pill on a page says about the jobs forked from it.
+struct CourseExplorationPillSummary: Equatable {
+    enum Lead: Equatable {
+        case ready(CourseExplorationJob)
+        case failed(CourseExplorationJob)
+        case writing
+    }
+
+    let lead: Lead
+    let title: String
+    let detail: String
+    /// More than one job, so the pill can expand to list each of them.
+    let listsJobs: Bool
+
+    /// Ready jobs lead because they need the learner; failures next.
+    init?(jobs: [CourseExplorationJob]) {
+        guard !jobs.isEmpty else { return nil }
+        let active = jobs.filter(\.isActive)
+        let others = jobs.count - 1
+        listsJobs = jobs.count > 1
+        if let ready = jobs.last(where: { $0.phase == .ready }) {
+            lead = .ready(ready)
+            title = ready.displayTitle
+            detail = others == 0 ? ready.statusDetail : Self.moreDetail(jobs: jobs, excluding: ready, active: active)
+        } else if let failed = jobs.last(where: { if case .failed = $0.phase { true } else { false } }) {
+            lead = .failed(failed)
+            title = failed.displayTitle
+            detail = others == 0
+                ? "Couldn’t write it · \(failed.statusDetail)"
+                : Self.moreDetail(jobs: jobs, excluding: failed, active: active)
+        } else if active.count == 1 {
+            lead = .writing
+            title = active[0].displayTitle
+            detail = active[0].statusDetail
+        } else {
+            lead = .writing
+            title = "Writing \(active.count) explorations"
+            // Name every one so the learner can tell them apart.
+            detail = active.map(\.displayTitle).joined(separator: " · ")
+        }
+    }
+
+    private static func moreDetail(
+        jobs: [CourseExplorationJob],
+        excluding lead: CourseExplorationJob,
+        active: [CourseExplorationJob]
+    ) -> String {
+        let others = jobs.count - 1
+        let writing = active.filter { $0.id != lead.id }.count
+        if writing == others { return "\(writing) more writing" }
+        return "\(others) more \(others == 1 ? "exploration" : "explorations")"
+    }
 }
 
 enum CourseExplorationConcurrency {

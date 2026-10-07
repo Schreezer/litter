@@ -69,18 +69,68 @@ public struct NativeBlockEditorPageDestination: Hashable, Sendable {
     }
 }
 
+/// Selected text in reading or editing mode.
+///
+/// A reader can drag a selection across several text blocks. `segments` then
+/// holds each block's share in document order, while `blockID`, `path`, and
+/// `range` describe the first segment so single-block hosts keep working.
 public struct NativeBlockEditorSelection: Hashable, Sendable {
+    /// One block's part of a selection.
+    public struct Segment: Hashable, Sendable {
+        public var blockID: String?
+        public var path: BlockPath
+        public var range: NSRange
+        /// The selected text, or a description when `isWholeBlock`.
+        public var text: String
+        /// Set for a block without text, such as an image or a table, that
+        /// the selection covers whole. `range` is then empty.
+        public var isWholeBlock: Bool
+        /// An image block's source: a data, file, or web URL.
+        public var imageSource: String?
+
+        public init(
+            blockID: String?,
+            path: BlockPath,
+            range: NSRange,
+            text: String,
+            isWholeBlock: Bool = false,
+            imageSource: String? = nil
+        ) {
+            self.blockID = blockID
+            self.path = path
+            self.range = range
+            self.text = text
+            self.isWholeBlock = isWholeBlock
+            self.imageSource = imageSource
+        }
+    }
+
     public var blockID: String?
     public var path: BlockPath
     public var range: NSRange
     public var text: String
+    public var segments: [Segment]
 
     public init(blockID: String?, path: BlockPath, range: NSRange, text: String) {
         self.blockID = blockID
         self.path = path
         self.range = range
         self.text = text
+        segments = [Segment(blockID: blockID, path: path, range: range, text: text)]
     }
+
+    /// A selection spanning `segments`, whose text joins each block's part
+    /// with a line break. Returns nil when there are no segments.
+    public init?(segments: [Segment]) {
+        guard let first = segments.first else { return nil }
+        blockID = first.blockID
+        path = first.path
+        range = first.range
+        text = segments.map(\.text).joined(separator: "\n")
+        self.segments = segments
+    }
+
+    public var spansMultipleBlocks: Bool { segments.count > 1 }
 }
 
 /// A host-owned, non-document annotation rendered over a text range.
@@ -225,8 +275,12 @@ public struct NativeBlockEditorView: View {
     @ViewBuilder
     private var canvasContent: some View {
         if let header { header.padding(.bottom, 12) }
-        ForEach(visibleBlocks) { block in
-            blockRow(block)
+        if configuration.isEditable {
+            ForEach(visibleBlocks) { block in
+                blockRow(block)
+            }
+        } else if !visibleBlocks.isEmpty {
+            readingFlow(visibleBlocks)
         }
         if configuration.isEditable {
             if visibleBlocks.isEmpty {
@@ -308,6 +362,78 @@ public struct NativeBlockEditorView: View {
             engine.document.root.children,
             hiddenBlockIDs: configuration.hiddenBlockIDs
         )
+    }
+
+    /// Reading lays the whole page out in one text view, so a selection can
+    /// run from one block into the next, across images and code.
+    private func readingFlow(_ blocks: [EditorVisibleBlock]) -> some View {
+        RichTextReadingFlow(
+            blocks: blocks.map {
+                ReadingFlowBlock(node: $0.node, path: $0.path, depth: $0.depth, number: $0.number)
+            },
+            embedContent: { block in
+                AnyView(blockContent(EditorVisibleBlock(
+                    node: block.node,
+                    path: block.path,
+                    depth: block.depth,
+                    number: block.number
+                )))
+            },
+            annotations: textAnnotations,
+            accentColor: UIColor(configuration.accentColor),
+            onOpenURL: { onOpenURL?($0) ?? false },
+            onOpenAnnotation: { onOpenTextAnnotation?($0) },
+            onSelectionChange: { selection in
+                guard let selection else {
+                    // Hosts treat an empty selection as nothing highlighted.
+                    let first = blocks[0]
+                    try? engine.setSelection(nil)
+                    onSelectionChange?(NativeBlockEditorSelection(
+                        blockID: first.node.stableBlockID,
+                        path: first.path,
+                        range: NSRange(location: 0, length: 0),
+                        text: ""
+                    ))
+                    return
+                }
+                if let first = selection.segments.first, let last = selection.segments.last {
+                    try? engine.setSelection(Selection(
+                        start: Position(path: first.path, offset: first.range.location),
+                        end: Position(path: last.path, offset: NSMaxRange(last.range))
+                    ))
+                }
+                onSelectionChange?(selection)
+            },
+            onAskAboutSelection: onAskAboutSelection,
+            onCopy: copyReadingSelection
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 3)
+    }
+
+    /// Copies each selected block's slice, keeping block types and inline
+    /// formatting the way a single-block copy does. Images and other blocks
+    /// without text are copied whole.
+    private func copyReadingSelection(_ selection: NativeBlockEditorSelection) -> Bool {
+        let fragments: [BlockNode] = selection.segments.compactMap { segment in
+            if segment.isWholeBlock { return engine.node(at: segment.path) }
+            guard var node = engine.node(at: segment.path),
+                  let slice = try? node.delta?.slice(
+                    from: segment.range.location,
+                    to: NSMaxRange(segment.range)
+                  ) else { return nil }
+            node.delta = slice
+            node.children = []
+            return node
+        }
+        guard !fragments.isEmpty else { return false }
+        do {
+            try EditorClipboard.write(BlockDocument(root: BlockNode(type: "page", children: fragments)))
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
     }
 
     @ToolbarContentBuilder
@@ -643,6 +769,7 @@ public struct NativeBlockEditorView: View {
             DocumentImageBlockView(
                 node: block.node,
                 identifier: block.path.identifier,
+                showsResizeControls: configuration.isEditable,
                 onResize: { width in
                     perform { try engine.updateNode(at: block.path, attributes: ["width": .number(width)]) }
                 }
@@ -747,13 +874,7 @@ public struct NativeBlockEditorView: View {
                     text: text
                 ))
             },
-            annotations: textAnnotations.filter { annotation in
-                if let blockID = annotation.blockID,
-                   let stableBlockID = block.node.stableBlockID {
-                    return blockID == stableBlockID
-                }
-                return annotation.path == block.path
-            },
+            annotations: textAnnotations.filter { $0.applies(to: block.node, at: block.path) },
             onOpenAnnotation: { annotation in
                 onOpenTextAnnotation?(annotation)
             },
@@ -1456,7 +1577,7 @@ private struct EditorReorderDropDelegate: DropDelegate {
     }
 }
 
-private extension BlockPath {
+extension BlockPath {
     var identifier: String { indices.map(String.init).joined(separator: "-") }
 }
 #endif

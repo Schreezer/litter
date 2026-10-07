@@ -73,7 +73,7 @@ final class CourseExplorationUITests: XCTestCase {
     func testExploringASelectedPassageAsksWhatToExploreFirst() {
         let app = launchReadingFixture()
 
-        let paragraph = app.textViews.matching(NSPredicate(
+        let paragraph = app.staticTexts.matching(NSPredicate(
             format: "value BEGINSWITH %@", "Try describing a verification step"
         )).firstMatch
         XCTAssertTrue(waitForHittable(paragraph), app.debugDescription)
@@ -115,8 +115,60 @@ final class CourseExplorationUITests: XCTestCase {
     }
 
     @MainActor
-    private func launchReadingFixture() -> XCUIApplication {
+    func testPillNamesEachExplorationAndListsThem() {
+        // The first fork is written quickly; the second keeps writing.
+        let app = launchReadingFixture(explorationDelays: "6,90")
+
+        let deeper = app.buttons["course-explore-deeper"]
+        XCTAssertTrue(scrollUntilHittable(deeper, in: app), app.debugDescription)
+        deeper.tap()
+        let sideways = app.buttons["course-explore-sideways"]
+        XCTAssertTrue(waitForHittable(sideways), app.debugDescription)
+        sideways.tap()
+
+        let pill = app.descendants(matching: .any).matching(identifier: "course-exploration-pill").firstMatch
+        XCTAssertTrue(pill.waitForExistence(timeout: 10), app.debugDescription)
+        XCTAssertTrue(app.staticTexts["Writing 2 explorations"].waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertTrue(app.staticTexts["Going deeper · Going sideways"].exists,
+                      "The pill names every exploration being written.")
+        capture("Pill names both explorations being written", app)
+
+        let open = app.buttons["course-exploration-pill-action"]
+        XCTAssertTrue(open.waitForExistence(timeout: 30), app.debugDescription)
+        XCTAssertEqual(open.label, "Open")
+        XCTAssertTrue(app.staticTexts["1 more writing"].exists, app.debugDescription)
+        capture("Ready exploration leads, the other is still writing", app)
+
+        app.buttons["course-exploration-pill-expand"].tap()
+        let rows = app.descendants(matching: .any).matching(identifier: "course-exploration-job")
+        XCTAssertTrue(rows.firstMatch.waitForExistence(timeout: 5), app.debugDescription)
+        XCTAssertEqual(rows.count, 2, app.debugDescription)
+        XCTAssertTrue(app.staticTexts["Going sideways"].exists, "The one still writing is listed by its ask.")
+        capture("Expanded pill lists each exploration", app)
+
+        let rowOpen = app.buttons["course-exploration-job-action"]
+        XCTAssertEqual(rowOpen.label, "Open")
+        // Hold the press so the pressed state can be captured from outside.
+        rowOpen.press(forDuration: 1.5)
+        let explorationTitle = app.staticTexts.matching(NSPredicate(
+            format: "identifier BEGINSWITH 'course-page-title-' AND label == %@",
+            "Why the challenge must be random"
+        )).firstMatch
+        XCTAssertTrue(explorationTitle.waitForExistence(timeout: 15), app.debugDescription)
+
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.staticTexts["course-page-title-article-two"].waitForExistence(timeout: 10))
+        XCTAssertTrue(pill.waitForExistence(timeout: 5), "The exploration still writing keeps its notice.")
+        XCTAssertTrue(app.staticTexts["Going sideways"].exists, app.debugDescription)
+        capture("Opened exploration leaves the one still writing", app)
+    }
+
+    @MainActor
+    private func launchReadingFixture(explorationDelays: String? = nil) -> XCUIApplication {
         let app = XCUIApplication()
+        if let explorationDelays {
+            app.launchEnvironment["LEARNFOLD_READING_TEST_EXPLORATION_DELAY_SECONDS"] = explorationDelays
+        }
         app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
         app.launchEnvironment["SNAPPY_SKIP_AGENT_SETUP"] = "1"
         app.launchEnvironment["LEARNFOLD_READING_TEST_TOKEN"] = UUID().uuidString

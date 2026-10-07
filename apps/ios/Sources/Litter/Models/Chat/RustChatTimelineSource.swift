@@ -55,22 +55,36 @@ final class RustChatTimelineSource: ChatTimelineSource {
         streamGeneration += 1
         let generation = streamGeneration
         prepare?()
-        let subscription = store.subscribeChatWithOptions(key: key, options: options)
+        var subscription = store.subscribeChatWithOptions(key: key, options: options)
         self.subscription = subscription
         let (stream, continuation) = AsyncStream.makeStream(of: ChatUpdate.self)
-        pump = Task { @MainActor in
+        pump = Task { @MainActor [weak self] in
+            var failures = 0
             while !Task.isCancelled {
                 do {
                     let update = try await subscription.nextUpdate()
                     guard !Task.isCancelled else { break }
+                    failures = 0
                     continuation.yield(update)
                 } catch {
+                    // Ending the stream here would freeze the screen on its
+                    // last update while the store moves on (only reopening
+                    // the chat recovered). Open a fresh subscription instead;
+                    // its first update is a snapshot, so nothing is lost.
+                    failures += 1
                     LLog.warn(
                         "chat",
-                        "chat subscription ended",
-                        fields: ["error": error.localizedDescription]
+                        "chat subscription failed; reopening",
+                        fields: [
+                            "error": error.localizedDescription,
+                            "threadId": self?.key.threadId ?? "",
+                            "attempt": failures
+                        ]
                     )
-                    break
+                    try? await Task.sleep(for: .milliseconds(min(250 << min(failures - 1, 4), 4000)))
+                    guard !Task.isCancelled, let self, self.streamGeneration == generation else { break }
+                    subscription = self.store.subscribeChatWithOptions(key: self.key, options: self.options)
+                    self.subscription = subscription
                 }
             }
             continuation.finish()
@@ -93,6 +107,10 @@ final class RustChatTimelineSource: ChatTimelineSource {
 
     func stop() {
         routing.stop()
+    }
+
+    func resync() {
+        subscription?.resync()
     }
 
     func answer(_ answer: ChatQuestionAnswer) {

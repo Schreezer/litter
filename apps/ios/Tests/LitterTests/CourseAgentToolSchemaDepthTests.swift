@@ -31,6 +31,33 @@ final class CourseAgentToolSchemaDepthTests: XCTestCase {
         }
     }
 
+    func testAppleLessonToolTitleIsOptionalShallowAndBounded() throws {
+        #if canImport(FoundationModels)
+        guard #available(iOS 26.0, *) else {
+            throw XCTSkip("Foundation Models tools require iOS 26 or later.")
+        }
+        for kind in [
+            CourseLessonExampleKind.topicDemonstration,
+            .runnableCode(languageOrFramework: "Swift"),
+        ] {
+            let spec = try AppleCourseToolFactory.generateLessonSpec(exampleKind: kind)
+            let schema = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: Data(spec.inputSchemaJson.utf8)) as? [String: Any]
+            )
+            XCTAssertLessThanOrEqual(Self.schemaDepth(schema), Self.maximumSchemaDepth)
+            let title = try XCTUnwrap((schema["properties"] as? [String: Any])?["title"] as? [String: Any])
+            XCTAssertEqual(title["type"] as? String, "string")
+            XCTAssertEqual(title["maxLength"] as? Int, CoursePlanHierarchyPolicy.maximumNodeTitleLength)
+            XCTAssertFalse(
+                (schema["required"] as? [String] ?? []).contains("title"),
+                "Planned lessons omit the title, so the schema must not require it."
+            )
+        }
+        #else
+        throw XCTSkip("Foundation Models is unavailable.")
+        #endif
+    }
+
     func testPlanSchemaStillDescribesTheFourLevelHierarchy() throws {
         let schema = CourseAgentTools.planInputSchemaObject()
         let properties = try XCTUnwrap(schema["properties"] as? [String: Any])

@@ -1254,6 +1254,12 @@ struct CourseChatView: View {
             if !working {
                 // A preview the source never staged was not sent.
                 chatModel.setLocalPreview(nil)
+                // The run is over, so the store holds its whole outcome. Make
+                // sure the screen shows it: the thread may have changed, or
+                // the subscription may have missed updates. A message that
+                // did land replaces the cleared preview from the snapshot.
+                syncChatModel()
+                chatModel.resync()
             }
             sendPendingInitialQuestionIfReady()
             sendQueuedQuestionOptionIfReady()

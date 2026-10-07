@@ -45,7 +45,8 @@ struct CourseReadingUITestHarness: View {
             let courseRoot = root.appendingPathComponent(workspaceID)
             let database = courseRoot.appendingPathComponent(".course/course-library.sqlite")
             let includesAssessments = ProcessInfo.processInfo.environment["LEARNFOLD_READING_TEST_ASSESSMENTS"] == "1"
-            let course = LearningCourse(
+            let isFilmCourse = CourseReadingFilmFixture.isEnabled
+            var course = LearningCourse(
                 id: workspaceID,
                 title: includesAssessments ? "Cellular energetics" : "Zero-Knowledge SNARKs",
                 subtitle: includesAssessments ? "Energy for living cells" : "From Intuition to Circuits",
@@ -53,6 +54,12 @@ struct CourseReadingUITestHarness: View {
                 workspaceID: workspaceID, agentRuntimeKind: CourseAgentProvider.hosted,
                 hostedSessionID: UUID()
             )
+            if isFilmCourse {
+                course.title = CourseReadingFilmFixture.courseTitle
+                course.subtitle = CourseReadingFilmFixture.courseSubtitle
+                course.accentHex = CourseReadingFilmFixture.accentHex
+                course.lessonCount = CourseReadingFilmFixture.lessonCount
+            }
             let defaults = UserDefaults(suiteName: "ReadingFixture.\(token)")!
             if !FileManager.default.fileExists(atPath: database.path) {
                 var workspace = PageWorkspace(rootTitle: course.title)
@@ -62,83 +69,95 @@ struct CourseReadingUITestHarness: View {
                     document.root.data["course_generation_status"] = .string(status)
                     return document
                 }
-                let chapter = try workspace.createPage(
-                    title: includesAssessments ? "Energy inside cells" : "The Zero-Knowledge Mindset",
-                    parentID: workspace.rootPageID,
-                    document: document("", role: "chapter"), id: "chapter")
-                let section = try workspace.createPage(
-                    title: includesAssessments ? "Oxygen and ion pumps" : "Proofs without secrets",
-                    parentID: chapter.id,
-                    document: document("", role: "subchapter"), id: "section")
-                let article = includesAssessments ? Self.assessmentArticle : (1...18).map { index in
-                    "## Idea \(index)\n\nA proof can show that a statement is true while keeping its underlying secret private. Follow the verifier's questions and the prover's responses to see what information each step reveals."
-                }.joined(separator: "\n\n")
-                let visualizationHTML = """
-                <style>
-                .proof-simulation { padding: 12px; border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 12px; }
-                .proof-round { display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center; min-height: 82px; }
-                .proof-party { text-align: center; padding: 10px 4px; background: color-mix(in srgb, #007aff 14%, transparent); border-radius: 8px; }
-                .proof-arrow { font-size: 22px; color: #007aff; }
-                .proof-controls { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
-                .proof-controls button { min-height: 44px; border: 0; border-radius: 9px; padding: 0 14px; background: #007aff; color: white; font: inherit; font-weight: 600; }
-                .proof-controls output { flex: 1; }
-                </style>
-                <section class="proof-simulation" aria-label="Zero-knowledge proof challenge simulation">
-                  <div class="proof-round" aria-hidden="true">
-                    <div class="proof-party">Prover<br><strong id="proof-secret">commits</strong></div>
-                    <div class="proof-arrow" id="proof-arrow">→</div>
-                    <div class="proof-party">Verifier<br><strong id="proof-action">waits</strong></div>
-                  </div>
-                  <div class="proof-controls">
-                    <button id="advance-proof" type="button">Advance simulation</button>
-                    <output id="proof-state" aria-live="polite">Round 1: prover sends a commitment.</output>
-                  </div>
-                </section>
-                <script>
-                (function () {
-                  var step = 0;
-                  var states = [
-                    ['commits', 'waits', '→', 'Round 1: prover sends a commitment.'],
-                    ['holds secret', 'challenges', '←', 'Round 2: verifier sends a random challenge.'],
-                    ['responds', 'checks proof', '→', 'Round 3: verifier checks the response without learning the secret.']
-                  ];
-                  document.getElementById('advance-proof').addEventListener('click', function () {
-                    step = (step + 1) % states.length;
-                    document.getElementById('proof-secret').textContent = states[step][0];
-                    document.getElementById('proof-action').textContent = states[step][1];
-                    document.getElementById('proof-arrow').textContent = states[step][2];
-                    document.getElementById('proof-state').textContent = states[step][3];
-                  });
-                })();
-                </script>
-                """
-                var articleDocument = try document(article, role: "lesson")
-                if !includesAssessments {
-                    articleDocument.root.children.insert(
-                        .html(
-                            visualizationHTML,
-                            allowNetwork: false,
-                            allowJavaScript: true
-                        ),
-                        at: 0
-                    )
+                if isFilmCourse {
+                    // The launch film's course: verbatim pages, no visualization.
+                    for page in CourseReadingFilmFixture.pages {
+                        _ = try workspace.createPage(
+                            title: page.title,
+                            parentID: page.parentID ?? workspace.rootPageID,
+                            document: document(page.markdown, role: page.role, status: page.status),
+                            id: page.id
+                        )
+                    }
+                } else {
+                    let chapter = try workspace.createPage(
+                        title: includesAssessments ? "Energy inside cells" : "The Zero-Knowledge Mindset",
+                        parentID: workspace.rootPageID,
+                        document: document("", role: "chapter"), id: "chapter")
+                    let section = try workspace.createPage(
+                        title: includesAssessments ? "Oxygen and ion pumps" : "Proofs without secrets",
+                        parentID: chapter.id,
+                        document: document("", role: "subchapter"), id: "section")
+                    let article = includesAssessments ? Self.assessmentArticle : (1...18).map { index in
+                        "## Idea \(index)\n\nA proof can show that a statement is true while keeping its underlying secret private. Follow the verifier's questions and the prover's responses to see what information each step reveals."
+                    }.joined(separator: "\n\n")
+                    let visualizationHTML = """
+                    <style>
+                    .proof-simulation { padding: 12px; border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 12px; }
+                    .proof-round { display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center; min-height: 82px; }
+                    .proof-party { text-align: center; padding: 10px 4px; background: color-mix(in srgb, #007aff 14%, transparent); border-radius: 8px; }
+                    .proof-arrow { font-size: 22px; color: #007aff; }
+                    .proof-controls { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+                    .proof-controls button { min-height: 44px; border: 0; border-radius: 9px; padding: 0 14px; background: #007aff; color: white; font: inherit; font-weight: 600; }
+                    .proof-controls output { flex: 1; }
+                    </style>
+                    <section class="proof-simulation" aria-label="Zero-knowledge proof challenge simulation">
+                      <div class="proof-round" aria-hidden="true">
+                        <div class="proof-party">Prover<br><strong id="proof-secret">commits</strong></div>
+                        <div class="proof-arrow" id="proof-arrow">→</div>
+                        <div class="proof-party">Verifier<br><strong id="proof-action">waits</strong></div>
+                      </div>
+                      <div class="proof-controls">
+                        <button id="advance-proof" type="button">Advance simulation</button>
+                        <output id="proof-state" aria-live="polite">Round 1: prover sends a commitment.</output>
+                      </div>
+                    </section>
+                    <script>
+                    (function () {
+                      var step = 0;
+                      var states = [
+                        ['commits', 'waits', '→', 'Round 1: prover sends a commitment.'],
+                        ['holds secret', 'challenges', '←', 'Round 2: verifier sends a random challenge.'],
+                        ['responds', 'checks proof', '→', 'Round 3: verifier checks the response without learning the secret.']
+                      ];
+                      document.getElementById('advance-proof').addEventListener('click', function () {
+                        step = (step + 1) % states.length;
+                        document.getElementById('proof-secret').textContent = states[step][0];
+                        document.getElementById('proof-action').textContent = states[step][1];
+                        document.getElementById('proof-arrow').textContent = states[step][2];
+                        document.getElementById('proof-state').textContent = states[step][3];
+                      });
+                    })();
+                    </script>
+                    """
+                    var articleDocument = try document(article, role: "lesson")
+                    if !includesAssessments {
+                        articleDocument.root.children.insert(
+                            .html(
+                                visualizationHTML,
+                                allowNetwork: false,
+                                allowJavaScript: true
+                            ),
+                            at: 0
+                        )
+                    }
+                    _ = try workspace.createPage(
+                        title: includesAssessments ? "Molecular machinery and cellular energetics" : "What a proof reveals",
+                        parentID: section.id,
+                        document: articleDocument, id: "article-one")
+                    _ = try workspace.createPage(
+                        title: includesAssessments ? "Oxygen, gradients, and ATP" : "A verifier's challenge",
+                        parentID: section.id,
+                        document: document(
+                            includesAssessments ? Self.secondAssessmentArticle
+                                : "## A challenge\n\nTry describing a verification step without sharing the secret.\n\n## Keep asking\n\n- Why is the challenge random?\n- What could a cheating prover do?",
+                            role: "lesson"
+                        ), id: "article-two")
+                    let second = try workspace.createPage(title: "Finite Fields", parentID: workspace.rootPageID,
+                        document: document("", role: "chapter"), id: "chapter-two")
+                    _ = try workspace.createPage(title: "The math playground", parentID: second.id,
+                        document: document("", role: "lesson", status: "pending_generation"), id: "article-three")
                 }
-                _ = try workspace.createPage(
-                    title: includesAssessments ? "Molecular machinery and cellular energetics" : "What a proof reveals",
-                    parentID: section.id,
-                    document: articleDocument, id: "article-one")
-                _ = try workspace.createPage(
-                    title: includesAssessments ? "Oxygen, gradients, and ATP" : "A verifier's challenge",
-                    parentID: section.id,
-                    document: document(
-                        includesAssessments ? Self.secondAssessmentArticle
-                            : "## A challenge\n\nTry describing a verification step without sharing the secret.\n\n## Keep asking\n\n- Why is the challenge random?\n- What could a cheating prover do?",
-                        role: "lesson"
-                    ), id: "article-two")
-                let second = try workspace.createPage(title: "Finite Fields", parentID: workspace.rootPageID,
-                    document: document("", role: "chapter"), id: "chapter-two")
-                _ = try workspace.createPage(title: "The math playground", parentID: second.id,
-                    document: document("", role: "lesson", status: "pending_generation"), id: "article-three")
                 try FileManager.default.createDirectory(at: database.deletingLastPathComponent(), withIntermediateDirectories: true)
                 _ = try await NativeEditorMCPService.open(databaseURL: database, seedWorkspace: workspace)
                 var brief = CourseBrief()
@@ -261,7 +280,27 @@ struct CourseReadingUITestHarness: View {
 
 private struct ReadingFixtureNavigation: View {
     @Bindable var store: CourseExperienceStore
+
+    /// Film footage hides the fixture banner; every other run keeps it.
+    private static var hidesBanner: Bool {
+        ProcessInfo.processInfo.environment["LEARNFOLD_READING_TEST_HIDE_BANNER"] == "1"
+    }
+
     var body: some View {
+        if Self.hidesBanner {
+            navigation
+        } else {
+            navigation
+                .safeAreaInset(edge: .top) {
+                    Text("LOCAL READING FIXTURE · SIMULATED GENERATION")
+                        .font(.caption2)
+                        .accessibilityIdentifier("reading-fixture")
+                        .accessibilityValue(ThemeManager.shared.appearanceMode.rawValue)
+                }
+        }
+    }
+
+    private var navigation: some View {
         NavigationStack(path: $store.navigationPath) {
             if let course = store.courses.first {
                 CourseRouteDestinationView(route: .course(course.id), store: store)
@@ -269,12 +308,6 @@ private struct ReadingFixtureNavigation: View {
                         CourseRouteDestinationView(route: route, store: store)
                     }
             }
-        }
-        .safeAreaInset(edge: .top) {
-            Text("LOCAL READING FIXTURE · SIMULATED GENERATION")
-                .font(.caption2)
-                .accessibilityIdentifier("reading-fixture")
-                .accessibilityValue(ThemeManager.shared.appearanceMode.rawValue)
         }
     }
 }
@@ -297,6 +330,8 @@ final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
     }
 
     private var attempts = 0
+    /// Exploration forks seen this launch; indexes the per-fork delay list.
+    private var explorationForks = 0
     private let transcriptsRoot: URL
     private let generationScenario: String
     private let appStore: AppStore?
@@ -319,7 +354,9 @@ final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
         try persist([
             .init(id: UUID().uuidString, role: .learner, text: "Plan this whole course."),
             .init(id: UUID().uuidString, role: .agent,
-                  text: "Course-only discussion: the complete SNARKs learning plan.")
+                  text: CourseReadingFilmFixture.isEnabled
+                    ? CourseReadingFilmFixture.seededConversationReply
+                    : "Course-only discussion: the complete SNARKs learning plan.")
         ], sessionID: sessionID)
     }
 
@@ -432,7 +469,9 @@ final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
             return
         }
         if let pageID = Self.explorationPageID(in: prompt) {
-            try await writeExploration(pageID: pageID, workspaceID: workspaceID, courseDirectory: courseDirectory)
+            try await writeExploration(
+                pageID: pageID, prompt: prompt, workspaceID: workspaceID, courseDirectory: courseDirectory
+            )
             onPartialResponse("The exploration is ready.")
             return
         }
@@ -450,7 +489,10 @@ final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
         )
         let page = try await repository.pageSnapshot(id: "article-three")
         let writesEmptyLesson = attempts == 1 && generationScenario == "empty-generated"
-        var document = try AppFlowyMarkdownCodec().decode(writesEmptyLesson ? "" : "## Working in a finite field\n\nArithmetic wraps around a fixed set of values. This is the final lesson in this local fixture.")
+        let lessonMarkdown = CourseReadingFilmFixture.isEnabled
+            ? CourseReadingFilmFixture.articleThreeGeneratedMarkdown
+            : "## Working in a finite field\n\nArithmetic wraps around a fixed set of values. This is the final lesson in this local fixture."
+        var document = try AppFlowyMarkdownCodec().decode(writesEmptyLesson ? "" : lessonMarkdown)
         document.root.data = page.document.root.data
         document.root.data["course_generation_status"] = .string(
             attempts == 1 && generationScenario == "content-without-completion" ? "pending_generation" : "generated"
@@ -470,8 +512,17 @@ final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
 
     /// Writes the exploration the way a real agent does: one revision-checked
     /// update that saves the content, the generated status, and a real title.
-    private func writeExploration(pageID: String, workspaceID: String, courseDirectory: URL) async throws {
-        try await Task.sleep(for: .seconds(1))
+    /// The film course picks the exploration the fork asked for; the delay and
+    /// the optional release gate come from `ReadingFixtureExplorationPacing`.
+    private func writeExploration(
+        pageID: String, prompt: String, workspaceID: String, courseDirectory: URL
+    ) async throws {
+        let forkIndex = explorationForks
+        explorationForks += 1
+        let film = CourseReadingFilmFixture.isEnabled
+            ? CourseReadingFilmFixture.exploration(forPrompt: prompt) : nil
+        try await Task.sleep(for: .seconds(ReadingFixtureExplorationPacing.delaySeconds(forFork: forkIndex)))
+        try await ReadingFixtureExplorationPacing.waitForRelease(trigger: film?.trigger ?? "fork-\(forkIndex + 1)")
         let repository = try await CourseDocumentRegistry.shared.repository(
             workspaceID: workspaceID,
             databaseURL: courseDirectory.appendingPathComponent(".course/course-library.sqlite"),
@@ -482,9 +533,9 @@ final class ReadingFixtureRuntime: HostedCourseAgentRuntime {
             "page_id": pageID,
             "expected_revision": page.revision,
             "command": "replace_content",
-            "new_str": "## Why randomness matters\n\nIf the prover could predict the challenge, it could prepare an answer without knowing the secret. A random challenge removes that shortcut.\n\n## Keep going\n\nEach round halves a cheating prover's odds.",
+            "new_str": film?.markdown ?? "## Why randomness matters\n\nIf the prover could predict the challenge, it could prepare an answer without knowing the secret. A random challenge removes that shortcut.\n\n## Keep going\n\nEach round halves a cheating prover's odds.",
             "properties": [
-                "title": "Why the challenge must be random",
+                "title": film?.title ?? "Why the challenge must be random",
                 "generation_status": "generated",
             ],
         ]

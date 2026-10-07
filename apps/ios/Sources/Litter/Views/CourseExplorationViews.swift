@@ -944,13 +944,22 @@ struct CourseExplorationJobsPill: View {
     let onDismiss: (CourseExplorationJob) -> Void
     let onDismissForkError: () -> Void
 
+    @State private var isExpanded = false
+
     var body: some View {
-        if let content {
-            if isCompact {
-                compactBody(content)
-            } else {
-                pillBody(content)
+        Group {
+            if let content {
+                if isCompact {
+                    compactBody(content)
+                } else if isExpanded, jobs.count > 1 {
+                    expandedBody
+                } else {
+                    pillBody(content)
+                }
             }
+        }
+        .onChange(of: jobs.count) { _, count in
+            if count < 2 { isExpanded = false }
         }
     }
 
@@ -959,10 +968,30 @@ struct CourseExplorationJobsPill: View {
             content.icon
                 .controlSize(.mini)
                 .frame(width: 14)
-            Text(content.title)
-                .font(.system(size: 11, weight: .medium))
-                .lineLimit(1)
+            if content.listsJobs {
+                Menu {
+                    ForEach(jobs) { job in
+                        if let action = action(for: job) {
+                            Button(job.displayTitle, systemImage: action.systemImage, action: action.perform)
+                        } else {
+                            Text("\(job.displayTitle) · \(job.statusDetail)")
+                        }
+                    }
+                } label: {
+                    Text(content.title)
+                        .font(.system(size: 11, weight: .medium))
+                        .lineLimit(1)
+                }
+                .buttonStyle(.borderless)
+                .fixedSize()
                 .help(content.detail ?? content.title)
+                .accessibilityIdentifier("course-exploration-pill-expand")
+            } else {
+                Text(content.title)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                    .help(content.detail ?? content.title)
+            }
             if let action = content.action {
                 Button(action.label, action: action.perform)
                     .font(.system(size: 11, weight: .semibold))
@@ -986,53 +1015,169 @@ struct CourseExplorationJobsPill: View {
     }
 
     private func pillBody(_ content: Content) -> some View {
-        Group {
-            HStack(spacing: 10) {
-                content.icon
-                    .frame(width: 18)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(content.title)
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(1)
-                    if let detail = content.detail {
+        HStack(spacing: 10) {
+            if content.listsJobs {
+                // The summary names the others; tapping it lists each one.
+                Button { setExpanded(true) } label: {
+                    summary(content, showsDisclosure: true)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Shows each exploration from this page")
+                .accessibilityIdentifier("course-exploration-pill-expand")
+            } else {
+                summary(content, showsDisclosure: false)
+            }
+            Spacer(minLength: 4)
+            if let action = content.action {
+                Button(action.label, action: action.perform)
+                    .buttonStyle(ExplorationPillActionStyle())
+                    .accessibilityIdentifier("course-exploration-pill-action")
+            }
+            if let dismiss = content.dismiss {
+                dismissButton(dismiss)
+                    .accessibilityIdentifier("course-exploration-pill-dismiss")
+            }
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 10)
+        .padding(.vertical, 10)
+        // Not interactive glass: its press highlight washed out the Open label.
+        // A capsule at one line, a rounded card when the title wraps.
+        .modifier(GlassRoundedRectModifier(cornerRadius: 26))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-exploration-pill")
+    }
+
+    private func summary(_ content: Content, showsDisclosure: Bool) -> some View {
+        HStack(spacing: 10) {
+            content.icon
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                // Page titles get a second line rather than an ellipsis.
+                Text(content.title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                if let detail = content.detail {
+                    HStack(spacing: 4) {
                         Text(detail)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
+                        if showsDisclosure {
+                            Image(systemName: "chevron.up")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.secondary)
+                        }
                     }
-                }
-                Spacer(minLength: 4)
-                if let action = content.action {
-                    Button(action.label, action: action.perform)
-                        .font(.subheadline.weight(.semibold))
-                        .buttonStyle(.borderless)
-                        .tint(Color.courseExploration)
-                        .accessibilityIdentifier("course-exploration-pill-action")
-                }
-                if let dismiss = content.dismiss {
-                    Button(action: dismiss) {
-                        Image(systemName: "xmark")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(4)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Dismiss")
-                    .accessibilityIdentifier("course-exploration-pill-dismiss")
                 }
             }
-            .padding(.leading, 14)
-            .padding(.trailing, 10)
-            .padding(.vertical, 10)
-            .modifier(GlassCapsuleModifier(interactive: true))
-            .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("course-exploration-pill")
+        }
+        .foregroundStyle(.primary)
+    }
+
+    /// Every exploration from this page, each with its own way in.
+    private var expandedBody: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button { setExpanded(false) } label: {
+                HStack {
+                    Text("Explorations from this page")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
+                .padding(.bottom, 4)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Hide explorations")
+            .accessibilityIdentifier("course-exploration-pill-collapse")
+
+            ForEach(jobs) { job in
+                jobRow(job)
+            }
+        }
+        .padding(.bottom, 6)
+        .modifier(GlassRoundedRectModifier(cornerRadius: 24))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-exploration-pill")
+    }
+
+    private func jobRow(_ job: CourseExplorationJob) -> some View {
+        HStack(spacing: 10) {
+            icon(for: job)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(job.displayTitle)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                Text(job.statusDetail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            if let action = action(for: job) {
+                Button(action.label, action: action.perform)
+                    .buttonStyle(ExplorationPillActionStyle())
+                    .accessibilityIdentifier("course-exploration-job-action")
+            }
+            if !job.isActive {
+                dismissButton { onDismiss(job) }
+                    .accessibilityIdentifier("course-exploration-job-dismiss")
+            }
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 10)
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("course-exploration-job")
+    }
+
+    private func dismissButton(_ dismiss: @escaping () -> Void) -> some View {
+        Button(action: dismiss) {
+            Image(systemName: "xmark")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(4)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Dismiss")
+    }
+
+    private func setExpanded(_ expanded: Bool) {
+        withAnimation(.snappy(duration: 0.25)) { isExpanded = expanded }
+    }
+
+    private func icon(for job: CourseExplorationJob) -> AnyView {
+        switch job.phase {
+        case .queued, .writing:
+            AnyView(ProgressView().controlSize(.small))
+        case .ready:
+            AnyView(Image(systemName: "arrow.triangle.branch").foregroundStyle(Color.courseExploration))
+        case .failed:
+            AnyView(Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange))
+        }
+    }
+
+    private func action(for job: CourseExplorationJob) -> Content.Action? {
+        switch job.phase {
+        case .ready: .init(label: "Open", systemImage: "arrow.up.right") { onOpen(job) }
+        case .failed: .init(label: "Retry", systemImage: "arrow.clockwise") { onRetry(job) }
+        case .queued, .writing: nil
         }
     }
 
     private struct Content {
         struct Action {
             let label: String
+            let systemImage: String
             let perform: () -> Void
         }
 
@@ -1041,41 +1186,31 @@ struct CourseExplorationJobsPill: View {
         let detail: String?
         let action: Action?
         let dismiss: (() -> Void)?
+        var listsJobs = false
     }
 
     private var content: Content? {
-        let active = jobs.filter(\.isActive)
-        let writingDetail: String? = active.isEmpty ? nil
-            : active.count == 1 ? "Still writing “\(active[0].title)”"
-            : "Still writing \(active.count) more"
-        if let ready = jobs.last(where: { $0.phase == .ready }) {
-            return Content(
-                icon: AnyView(Image(systemName: "arrow.triangle.branch").foregroundStyle(Color.courseExploration)),
-                title: ready.title,
-                detail: writingDetail ?? "Ready to read",
-                action: .init(label: "Open") { onOpen(ready) },
-                dismiss: { onDismiss(ready) }
-            )
-        }
-        if let failed = jobs.last(where: { if case .failed = $0.phase { true } else { false } }),
-           case .failed(let reason) = failed.phase {
-            return Content(
-                icon: AnyView(Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)),
-                title: "Couldn’t write “\(failed.title)”",
-                detail: writingDetail ?? reason,
-                action: .init(label: "Retry") { onRetry(failed) },
-                dismiss: { onDismiss(failed) }
-            )
-        }
-        if !active.isEmpty {
-            let queued = active.filter { $0.phase == .queued }.count
-            return Content(
-                icon: AnyView(ProgressView().controlSize(.small)),
-                title: active.count == 1 ? "Writing “\(active[0].title)”" : "Writing \(active.count) explorations",
-                detail: queued > 0 ? "\(queued) waiting for a free agent" : "Keep reading. It will show up here when it’s ready.",
-                action: nil,
-                dismiss: nil
-            )
+        if let summary = CourseExplorationPillSummary(jobs: jobs) {
+            switch summary.lead {
+            case .ready(let job), .failed(let job):
+                return Content(
+                    icon: icon(for: job),
+                    title: summary.title,
+                    detail: summary.detail,
+                    action: action(for: job),
+                    dismiss: { onDismiss(job) },
+                    listsJobs: summary.listsJobs
+                )
+            case .writing:
+                return Content(
+                    icon: AnyView(ProgressView().controlSize(.small)),
+                    title: summary.title,
+                    detail: summary.detail,
+                    action: nil,
+                    dismiss: nil,
+                    listsJobs: summary.listsJobs
+                )
+            }
         }
         if let forkError {
             return Content(
@@ -1087,5 +1222,22 @@ struct CourseExplorationJobsPill: View {
             )
         }
         return nil
+    }
+}
+
+/// A filled capsule whose label stays put while pressed; only the capsule
+/// dims and shrinks a little.
+private struct ExplorationPillActionStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(Capsule().fill(Color.courseExploration))
+            .opacity(configuration.isPressed ? 0.82 : 1)
+            .scaleEffect(configuration.isPressed ? 0.95 : 1)
+            .animation(.snappy(duration: 0.15), value: configuration.isPressed)
+            .contentShape(Capsule())
     }
 }

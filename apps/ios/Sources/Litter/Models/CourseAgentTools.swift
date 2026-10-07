@@ -225,7 +225,6 @@ enum CourseAgentTools {
                     "type": "array",
                     "description": "Chapter summaries. IDs, titles, and order must exactly match the chapter roots in learning_path.",
                     "minItems": 1,
-                    "maxItems": 8,
                     "items": [
                         "type": "object",
                         "additionalProperties": false,
@@ -252,7 +251,6 @@ enum CourseAgentTools {
                             "deliverables": [
                                 "type": "array",
                                 "minItems": 1,
-                                "maxItems": 6,
                                 "description": "Learner outcomes or artifacts for this chapter. Do not encode folders, subchapters, or lesson hierarchy here; use learning_path.",
                                 "items": [
                                     "type": "string",
@@ -267,9 +265,8 @@ enum CourseAgentTools {
                 ],
                 "learning_path": [
                     "type": "array",
-                    "description": "The complete ordered native page hierarchy. Every planned chapter, subchapter, lesson, module, and explainer is a separate typed node. Limits: at most \(CoursePlanHierarchyPolicy.maximumNodeCount) nodes in total across all levels, at most \(CoursePlanHierarchyPolicy.maximumDepth) levels deep, and every chapter or subchapter has 1 to \(CoursePlanHierarchyPolicy.maximumDirectChildren) children. Node IDs must be unique across the whole plan and must not reuse plan_id. Root IDs and titles must exactly match chapters in order. For a large course, group lessons into fewer, richer pages rather than exceeding the node limit.",
+                    "description": "The complete ordered native page hierarchy. Every planned chapter, subchapter, lesson, module, and explainer is a separate typed node. At most \(CoursePlanHierarchyPolicy.maximumDepth) levels deep, and every chapter or subchapter has at least one child; there is no limit on the number of chapters or pages. Node IDs must be unique across the whole plan and must not reuse plan_id. Root IDs and titles must exactly match chapters in order.",
                     "minItems": 1,
-                    "maxItems": 8,
                     "items": planNodeSchema(depth: 1),
                 ],
             ],
@@ -301,7 +298,7 @@ enum CourseAgentTools {
     private static func nestedPlanNodeSchema(depth: Int) -> [String: Any] {
         [
             "type": "object",
-            "description": "A level-\(depth) page with the same fields as its parent: id (globally unique stable ID), title (no ordinal prefix), role, and children (always present, an empty array for pages). Role is one of subchapter, lesson, module, or explainer; only a subchapter has children, 1 to \(CoursePlanHierarchyPolicy.maximumDirectChildren) of them. At most \(CoursePlanHierarchyPolicy.maximumDepth) levels in total, so level-\(CoursePlanHierarchyPolicy.maximumDepth) pages are lesson, module, or explainer with children [].",
+            "description": "A level-\(depth) page with the same fields as its parent: id (globally unique stable ID), title (no ordinal prefix), role, and children (always present, an empty array for pages). Role is one of subchapter, lesson, module, or explainer; only a subchapter has children, at least one. At most \(CoursePlanHierarchyPolicy.maximumDepth) levels in total, so level-\(CoursePlanHierarchyPolicy.maximumDepth) pages are lesson, module, or explainer with children [].",
         ]
     }
 
@@ -311,7 +308,6 @@ enum CourseAgentTools {
             children = [
                 "type": "array",
                 "minItems": depth == 1 ? 1 : 0,
-                "maxItems": CoursePlanHierarchyPolicy.maximumDirectChildren,
                 "items": depth < typedPlanSchemaLevels
                     ? planNodeSchema(depth: depth + 1)
                     : nestedPlanNodeSchema(depth: depth + 1),

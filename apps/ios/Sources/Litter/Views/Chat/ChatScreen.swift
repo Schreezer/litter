@@ -94,6 +94,7 @@ struct ChatScreen: View {
     @FocusState private var composerFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ScrollView {
@@ -232,6 +233,11 @@ struct ChatScreen: View {
             reserveFloor = viewportHeight
         }
         .onReceive(editingBegan) { _ in keyboardWillOpen() }
+        // The runtime may have reconnected while the app was away; catch up
+        // on anything the subscription missed.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { model.resync() }
+        }
         .litterFontFamily(.system)
         .environment(\.textScale, 1.0)
         .accessibilityElement(children: .contain)

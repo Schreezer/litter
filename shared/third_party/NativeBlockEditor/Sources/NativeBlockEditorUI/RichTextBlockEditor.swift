@@ -543,23 +543,7 @@ struct RichTextBlockEditor: UIViewRepresentable {
             guard annotation.range.location >= 0,
                   annotation.range.length > 0,
                   NSMaxRange(annotation.range) <= output.length else { continue }
-            let attributes: [NSAttributedString.Key: Any] = switch annotation.style {
-            case .discussion:
-                [
-                    RichTextCodec.annotationIDKey: annotation.id,
-                    .backgroundColor: UIColor.systemBlue.withAlphaComponent(0.20),
-                    .underlineColor: UIColor.systemBlue.withAlphaComponent(0.65),
-                    .underlineStyle: NSUnderlineStyle.single.rawValue,
-                ]
-            case .branch:
-                [
-                    RichTextCodec.annotationIDKey: annotation.id,
-                    .backgroundColor: UIColor.systemPurple.withAlphaComponent(0.08),
-                    .underlineColor: UIColor.systemPurple.withAlphaComponent(0.75),
-                    .underlineStyle: NSUnderlineStyle.single.rawValue | NSUnderlineStyle.patternDot.rawValue,
-                ]
-            }
-            output.addAttributes(attributes, range: annotation.range)
+            output.addAttributes(RichTextCodec.annotationAttributes(for: annotation), range: annotation.range)
         }
         return output
     }
@@ -692,24 +676,7 @@ struct RichTextBlockEditor: UIViewRepresentable {
         }
 
         private func characterIndex(at point: CGPoint, in textView: UITextView) -> Int? {
-            guard textView.textStorage.length > 0 else { return nil }
-            let containerPoint = CGPoint(
-                x: point.x - textView.textContainerInset.left,
-                y: point.y - textView.textContainerInset.top
-            )
-            let glyphIndex = textView.layoutManager.glyphIndex(
-                for: containerPoint,
-                in: textView.textContainer
-            )
-            guard glyphIndex < textView.layoutManager.numberOfGlyphs else { return nil }
-            let glyphRect = textView.layoutManager.boundingRect(
-                forGlyphRange: NSRange(location: glyphIndex, length: 1),
-                in: textView.textContainer
-            )
-            guard glyphRect.insetBy(dx: -6, dy: -6).contains(containerPoint) else { return nil }
-            let characterIndex = textView.layoutManager.characterIndexForGlyph(at: glyphIndex)
-            guard characterIndex < textView.textStorage.length else { return nil }
-            return characterIndex
+            textView.nbeCharacterIndex(at: point)
         }
 
         func gestureRecognizer(
@@ -1078,6 +1045,28 @@ enum RichTextCodec {
             )
         }
         return output
+    }
+
+    /// How a host annotation is drawn over its range.
+    static func annotationAttributes(
+        for annotation: NativeBlockEditorTextAnnotation
+    ) -> [NSAttributedString.Key: Any] {
+        switch annotation.style {
+        case .discussion:
+            [
+                annotationIDKey: annotation.id,
+                .backgroundColor: UIColor.systemBlue.withAlphaComponent(0.20),
+                .underlineColor: UIColor.systemBlue.withAlphaComponent(0.65),
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+            ]
+        case .branch:
+            [
+                annotationIDKey: annotation.id,
+                .backgroundColor: UIColor.systemPurple.withAlphaComponent(0.08),
+                .underlineColor: UIColor.systemPurple.withAlphaComponent(0.75),
+                .underlineStyle: NSUnderlineStyle.single.rawValue | NSUnderlineStyle.patternDot.rawValue,
+            ]
+        }
     }
 
     static func delta(from attributed: NSAttributedString) -> TextDelta {

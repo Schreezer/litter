@@ -455,6 +455,85 @@ final class ChatScreenModelTests: XCTestCase {
         XCTAssertEqual(model.turns.map(\.id), ["user:1"])
     }
 
+    func testResyncAfterTheStreamEndsSubscribesAgain() async {
+        let source = RecordingSource()
+        let model = ChatScreenModel(source: source, renderer: RecordingRenderer())
+        model.start()
+        XCTAssertEqual(source.updatesCalls, 1)
+        // `RecordingSource` streams end at once, like a subscription that
+        // failed. The screen must not stay on its last update for good.
+        for _ in 0..<50 { await Task.yield() }
+
+        model.resync()
+        XCTAssertEqual(source.updatesCalls, 2, "An ended stream is reopened")
+        XCTAssertEqual(source.resyncCount, 0)
+    }
+
+    func testResyncOfALiveStreamAsksTheSourceForASnapshot() async {
+        let source = RecordingSource()
+        source.holdsStreamOpen = true
+        let model = ChatScreenModel(source: source, renderer: RecordingRenderer())
+        model.start()
+        for _ in 0..<50 { await Task.yield() }
+
+        model.resync()
+        XCTAssertEqual(source.resyncCount, 1)
+        XCTAssertEqual(source.updatesCalls, 1, "A live stream is kept")
+        model.tearDown()
+    }
+
+    func testResyncAfterTearDownDoesNothing() {
+        let source = RecordingSource()
+        let model = ChatScreenModel(source: source, renderer: RecordingRenderer())
+        model.start()
+        model.tearDown()
+
+        model.resync()
+        XCTAssertEqual(source.updatesCalls, 1, "A torn-down model stays down")
+        XCTAssertEqual(source.resyncCount, 0)
+    }
+
+    func testResyncedSnapshotMakesAMissedTurnLive() {
+        let model = ChatScreenModel(source: RecordingSource(), renderer: RecordingRenderer())
+        model.apply(snapshot(
+            rows: [row("user:u1", user("a")), row("a1", answer("Reply"))],
+            phase: .settled(outcome: .completed),
+            seq: 3
+        ))
+        XCTAssertNil(model.liveTurnID, "Opening a settled chat reserves nothing")
+
+        model.apply(snapshot(
+            rows: [
+                row("user:u1", user("a")),
+                row("a1", answer("Reply")),
+                row("user:u2", user("b")),
+                row("a2", answer("Second reply")),
+            ],
+            phase: .settled(outcome: .completed),
+            seq: 9
+        ))
+        XCTAssertEqual(model.turns.map(\.id), ["user:u1", "user:u2"])
+        XCTAssertEqual(model.liveTurnID, "user:u2")
+    }
+
+    func testRustSourceResyncDeliversASnapshot() async {
+        let store = AppStore()
+        let key = appleChatThreadKey(sessionId: "resync-\(UUID().uuidString)")
+        let source = RustChatTimelineSource(
+            store: store,
+            key: key,
+            routing: ChatIntentRouting(send: { _ in false }, stop: {}, respondToRequest: { _, _, _ in })
+        )
+        var iterator = source.updates().makeAsyncIterator()
+        guard case .snapshot? = await iterator.next() else {
+            return XCTFail("Expected the opening snapshot")
+        }
+        source.resync()
+        guard case .snapshot? = await iterator.next() else {
+            return XCTFail("A resync delivers a fresh snapshot")
+        }
+    }
+
     func testDeltaForUnannouncedRowCreatesAnAnswerRow() {
         let model = ChatScreenModel(source: RecordingSource(), renderer: RecordingRenderer())
         model.apply(snapshot(rows: [row("user:c1", user("q"))], phase: .streaming))
@@ -811,12 +890,28 @@ private final class RecordingRenderer: ChatStreamingRendering {
 @MainActor
 private final class RecordingSource: ChatTimelineSource {
     var sent: [String] = []
+    var updatesCalls = 0
+    var resyncCount = 0
+    /// Keeps `updates()` streams open instead of ending them at once.
+    var holdsStreamOpen = false
+    private var continuations: [AsyncStream<ChatUpdate>.Continuation] = []
     var answers: [ChatQuestionAnswer] = []
     var stopCount = 0
     var accepts = true
 
     func updates() -> AsyncStream<ChatUpdate> {
-        AsyncStream { $0.finish() }
+        updatesCalls += 1
+        let (stream, continuation) = AsyncStream.makeStream(of: ChatUpdate.self)
+        if holdsStreamOpen {
+            continuations.append(continuation)
+        } else {
+            continuation.finish()
+        }
+        return stream
+    }
+
+    func resync() {
+        resyncCount += 1
     }
 
     func send(text: String) -> Bool {

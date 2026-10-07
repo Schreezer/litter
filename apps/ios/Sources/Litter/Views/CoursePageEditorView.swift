@@ -512,7 +512,13 @@ struct CoursePageEditorView: View {
             runtimeProbeOverlay
         }
 #endif
+        #if targetEnvironment(macCatalyst)
+        // The window title names the course; an empty title would fall back
+        // to the app name.
+        .navigationTitle(course.title)
+        #else
         .navigationTitle("")
+        #endif
         .task(id: loadID) {
             await loadPage(requestID: loadID)
         }
@@ -591,15 +597,7 @@ struct CoursePageEditorView: View {
                         pageTitle: model.title,
                         selection: selection,
                         document: model.document
-                    ).map {
-                        CourseExplorationAnchor(
-                            blockID: $0.blockID,
-                            pathIndices: $0.pathIndices,
-                            rangeLocation: $0.rangeLocation,
-                            rangeLength: $0.rangeLength,
-                            selectedText: $0.selectedText
-                        )
-                    },
+                    ).map(CourseSelectionAnchorResolver.explorationAnchor(for:)),
                     model: model
                 )
             } : nil,
@@ -1170,8 +1168,8 @@ struct CoursePageEditorView: View {
         in model: CoursePageEditorModel
     ) -> [NativeBlockEditorTextAnnotation] {
         let discussions = store.unresolvedSelectionDiscussions(courseID: course.id, pageID: pageID)
-            .compactMap {
-                CourseSelectionAnchorResolver.annotation(
+            .flatMap {
+                CourseSelectionAnchorResolver.annotations(
                     for: $0,
                     document: model.document
                 )
@@ -1179,14 +1177,14 @@ struct CoursePageEditorView: View {
         // Where each exploration forked from a passage on this page.
         let branches = (CourseExplorationMap.node(withPageID: pageID, in: readingNodes)?.children ?? [])
             .filter(CourseExplorationMap.isExploration)
-            .compactMap { node in
-                node.originAnchor.flatMap {
-                    CourseSelectionAnchorResolver.branchAnnotation(
+            .flatMap { node in
+                node.originAnchor.map {
+                    CourseSelectionAnchorResolver.branchAnnotations(
                         nodeID: node.id,
                         anchor: $0,
                         document: model.document
                     )
-                }
+                } ?? []
             }
         return branches + discussions
     }
@@ -1271,10 +1269,10 @@ struct CoursePageEditorView: View {
     ) -> [CourseEditorLF51AnnotationStoreProvenance] {
         store.unresolvedSelectionDiscussions(courseID: course.id, pageID: pageID)
             .compactMap { discussion in
-                guard let annotation = CourseSelectionAnchorResolver.annotation(
+                guard let annotation = CourseSelectionAnchorResolver.annotations(
                     for: discussion,
                     document: model.document
-                ) else { return nil }
+                ).first else { return nil }
                 return CourseEditorLF51AnnotationStoreProvenance(
                     discussion: discussion,
                     annotation: annotation,
@@ -3718,8 +3716,8 @@ private struct CoursePageEditorCanvas: View {
                     if !selection.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         readingSelection = selection
                     } else {
-                        // Only one block holds the selection at a time, so an
-                        // empty one means nothing is highlighted anywhere.
+                        // Only one text view holds the selection at a time, so
+                        // an empty one means nothing is highlighted anywhere.
                         // Matching the path first left a selection from the
                         // previous block armed, and the Ask button then sent
                         // that stale passage as the question's context.
@@ -3851,9 +3849,9 @@ private struct CoursePageEditorCanvas: View {
             }
             if !isEditing, let explorationStatus {
                 explorationStatus
-            } else if readingSelection == nil {
-                Text(isEditing ? "Editing" : "Reading")
-                    .font(.system(size: 11, weight: .medium))
+            } else if isEditing {
+                Text("Editing")
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
@@ -4053,53 +4051,84 @@ enum CourseSelectionAnchorResolver {
         document: BlockDocument
     ) -> CourseTextReference? {
         let selectedText = selection.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !selectedText.isEmpty,
-              let block = matchingBlock(
-                blockID: selection.blockID,
-                path: selection.path,
+        guard !selectedText.isEmpty else { return nil }
+        // Every block the reader selected must still be on the page; a
+        // passage missing one of its parts would mislead the agent.
+        var segments: [CourseTextSegment] = []
+        for part in selection.segments {
+            let text = part.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            if part.isWholeBlock {
+                // An image or table has no text to find; it only has to exist.
+                guard let block = matchingBlock(blockID: part.blockID, path: part.path, document: document) else {
+                    return nil
+                }
+                segments.append(CourseTextSegment(
+                    blockID: block.node.stableBlockID,
+                    pathIndices: block.path.indices,
+                    rangeLocation: 0,
+                    rangeLength: 0,
+                    text: text,
+                    isWholeBlock: true
+                ))
+                continue
+            }
+            guard let segment = resolvedSegment(
+                blockID: part.blockID,
+                path: part.path,
+                preferred: part.range,
+                text: text,
                 document: document
-              ),
-              let range = anchoredRange(
-                preferred: selection.range,
-                selectedText: selectedText,
-                blockText: block.node.delta?.plainText ?? ""
-              ) else { return nil }
+            ) else { return nil }
+            segments.append(segment)
+        }
+        guard let first = segments.first else { return nil }
 
         return CourseTextReference(
             courseID: courseID,
             pageID: pageID,
             pageTitle: pageTitle,
-            blockID: block.node.stableBlockID,
-            pathIndices: block.path.indices,
-            rangeLocation: range.location,
-            rangeLength: range.length,
-            selectedText: selectedText
+            blockID: first.blockID,
+            pathIndices: first.pathIndices,
+            rangeLocation: first.rangeLocation,
+            rangeLength: first.rangeLength,
+            selectedText: selectedText,
+            segments: segments
+        )
+    }
+
+    /// An exploration anchor for the passage `reference` describes.
+    static func explorationAnchor(for reference: CourseTextReference) -> CourseExplorationAnchor {
+        CourseExplorationAnchor(
+            blockID: reference.blockID,
+            pathIndices: reference.pathIndices,
+            rangeLocation: reference.rangeLocation,
+            rangeLength: reference.rangeLength,
+            selectedText: reference.selectedText,
+            segments: reference.segments.isEmpty ? nil : reference.segments
         )
     }
 
     private static let branchIDPrefix = "exploration:"
 
-    static func branchAnnotation(
+    /// Marks where a branch starts, once in each block its passage covers.
+    static func branchAnnotations(
         nodeID: String,
         anchor: CourseExplorationAnchor,
         document: BlockDocument
-    ) -> NativeBlockEditorTextAnnotation? {
-        guard let block = matchingBlock(
+    ) -> [NativeBlockEditorTextAnnotation] {
+        let parts = anchor.segments ?? [CourseTextSegment(
             blockID: anchor.blockID,
-            path: BlockPath(anchor.pathIndices),
-            document: document
-        ), let range = anchoredRange(
-            preferred: NSRange(location: anchor.rangeLocation, length: anchor.rangeLength),
-            selectedText: anchor.selectedText,
-            blockText: block.node.delta?.plainText ?? ""
-        ) else { return nil }
-        return NativeBlockEditorTextAnnotation(
-            id: branchIDPrefix + nodeID,
-            blockID: block.node.stableBlockID,
-            path: block.path,
-            range: range,
-            style: .branch
-        )
+            pathIndices: anchor.pathIndices,
+            rangeLocation: anchor.rangeLocation,
+            rangeLength: anchor.rangeLength,
+            text: anchor.selectedText
+        )]
+        return parts.filter { !$0.coversWholeBlock }.compactMap { part in
+            resolvedSegment(part, document: document).map {
+                annotation(id: branchIDPrefix + nodeID, segment: $0, style: .branch)
+            }
+        }
     }
 
     static func branchNodeID(of annotation: NativeBlockEditorTextAnnotation) -> String? {
@@ -4107,31 +4136,80 @@ enum CourseSelectionAnchorResolver {
         return String(annotation.id.dropFirst(branchIDPrefix.count))
     }
 
-    static func annotation(
+    /// Highlights a discussion's passage, once in each block of text it
+    /// covers. All parts share the discussion's ID, so tapping any of them
+    /// opens it. Images and other blocks without text are not marked.
+    static func annotations(
         for discussion: CourseSelectionDiscussion,
         document: BlockDocument
-    ) -> NativeBlockEditorTextAnnotation? {
-        let storedPath = BlockPath(discussion.pathIndices)
-        guard let block = matchingBlock(
+    ) -> [NativeBlockEditorTextAnnotation] {
+        if let segments = discussion.segments {
+            return segments.filter { !$0.coversWholeBlock }.compactMap { part in
+                resolvedSegment(part, document: document).map {
+                    annotation(id: discussion.id.uuidString, segment: $0, style: .discussion)
+                }
+            }
+        }
+        guard let segment = resolvedSegment(
             blockID: discussion.blockID,
-            path: storedPath,
+            path: BlockPath(discussion.pathIndices),
+            preferred: NSRange(location: discussion.rangeLocation, length: discussion.rangeLength),
+            text: discussion.selectedText,
+            acceptsSelectedTextPrefix: discussion.wasTruncated,
             document: document
-        ) else { return nil }
-        let preferred = NSRange(
-            location: discussion.rangeLocation,
-            length: discussion.rangeLength
+        ) else { return [] }
+        return [annotation(id: discussion.id.uuidString, segment: segment, style: .discussion)]
+    }
+
+    private static func annotation(
+        id: String,
+        segment: CourseTextSegment,
+        style: NativeBlockEditorTextAnnotation.Style
+    ) -> NativeBlockEditorTextAnnotation {
+        NativeBlockEditorTextAnnotation(
+            id: id,
+            blockID: segment.blockID,
+            path: BlockPath(segment.pathIndices),
+            range: NSRange(location: segment.rangeLocation, length: segment.rangeLength),
+            style: style
         )
-        guard let range = anchoredRange(
-            preferred: preferred,
-            selectedText: discussion.selectedText,
-            blockText: block.node.delta?.plainText ?? "",
-            acceptsSelectedTextPrefix: discussion.wasTruncated
-        ) else { return nil }
-        return NativeBlockEditorTextAnnotation(
-            id: discussion.id.uuidString,
+    }
+
+    private static func resolvedSegment(
+        _ segment: CourseTextSegment,
+        document: BlockDocument
+    ) -> CourseTextSegment? {
+        resolvedSegment(
+            blockID: segment.blockID,
+            path: BlockPath(segment.pathIndices),
+            preferred: NSRange(location: segment.rangeLocation, length: segment.rangeLength),
+            text: segment.text,
+            document: document
+        )
+    }
+
+    /// Finds `text` in its block now, following the block if it moved.
+    private static func resolvedSegment(
+        blockID: String?,
+        path: BlockPath,
+        preferred: NSRange,
+        text: String,
+        acceptsSelectedTextPrefix: Bool = false,
+        document: BlockDocument
+    ) -> CourseTextSegment? {
+        guard let block = matchingBlock(blockID: blockID, path: path, document: document),
+              let range = anchoredRange(
+                preferred: preferred,
+                selectedText: text,
+                blockText: block.node.delta?.plainText ?? "",
+                acceptsSelectedTextPrefix: acceptsSelectedTextPrefix
+              ) else { return nil }
+        return CourseTextSegment(
             blockID: block.node.stableBlockID,
-            path: block.path,
-            range: range
+            pathIndices: block.path.indices,
+            rangeLocation: range.location,
+            rangeLength: range.length,
+            text: text
         )
     }
 

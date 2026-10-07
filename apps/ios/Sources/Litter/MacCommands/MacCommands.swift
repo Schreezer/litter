@@ -121,9 +121,8 @@ private func openNewWindow() {
 }
 
 /// Catalyst window setup: keeps the underlying NSWindow opaque (so the
-/// desktop can't bleed through sidebar Liquid Glass), installs a
-/// compact unified titlebar with an NSToolbar carrying the settings
-/// button next to the traffic lights, and declares the window's
+/// desktop can't bleed through sidebar Liquid Glass), keeps the window
+/// title visible in the unified toolbar, and declares the window's
 /// resize bounds.
 struct MacWindowTitleBarStyler: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
@@ -149,10 +148,10 @@ struct MacWindowTitleBarStyler: UIViewRepresentable {
 
             DispatchQueue.main.async { [weak self] in
                 guard let windowScene = self?.window?.windowScene else { return }
-                if let titlebar = windowScene.titlebar {
-                    titlebar.titleVisibility = .hidden
-                    titlebar.toolbar = nil
-                }
+                // Leave the titlebar to SwiftUI: the split view installs the
+                // unified toolbar and each screen's navigationTitle becomes
+                // the window title.
+                windowScene.titlebar?.titleVisibility = .visible
                 let restrictions = windowScene.sizeRestrictions
                 restrictions?.minimumSize = CGSize(width: 760, height: 560)
                 restrictions?.maximumSize = CGSize(

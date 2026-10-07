@@ -90,7 +90,7 @@ final class StarterCourseUITests: XCTestCase {
         app.swipeUp()
         XCTAssertTrue(waitForHittable(next))
         next.tap()
-        let paragraph = app.textViews.matching(NSPredicate(
+        let paragraph = app.staticTexts.matching(NSPredicate(
             format: "value BEGINSWITH %@", "Imagine learning a short recipe."
         )).firstMatch
         XCTAssertTrue(waitForHittable(paragraph), app.debugDescription)
@@ -143,7 +143,7 @@ final class StarterCourseUITests: XCTestCase {
 
     @MainActor
     private func assertPracticeParagraphIsVisible(in app: XCUIApplication) {
-        let paragraph = app.textViews.matching(NSPredicate(
+        let paragraph = app.staticTexts.matching(NSPredicate(
             format: "value BEGINSWITH %@ OR label BEGINSWITH %@",
             "You can ask questions while you read.", "You can ask questions while you read."
         )).firstMatch

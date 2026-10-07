@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import ImageIO
 import NativeBlockEditorCore
+import NativeBlockEditorUI
 import NativeEditorMCP
 import Observation
 import UIKit
@@ -1331,6 +1332,29 @@ struct CoursePageChatContext: Identifiable, Equatable {
     }
 }
 
+/// One block's part of a passage selected across several blocks.
+struct CourseTextSegment: Codable, Equatable, Sendable {
+    var blockID: String?
+    var pathIndices: [Int]
+    var rangeLocation: Int
+    var rangeLength: Int
+    var text: String
+    /// Set for a block without text, such as an image or a table, selected
+    /// whole. `text` then describes it and the range is empty.
+    var isWholeBlock: Bool?
+
+    var coversWholeBlock: Bool { isWholeBlock == true }
+
+    private enum CodingKeys: String, CodingKey {
+        case blockID = "block_id"
+        case pathIndices = "path"
+        case rangeLocation = "location"
+        case rangeLength = "length"
+        case text
+        case isWholeBlock = "whole_block"
+    }
+}
+
 struct CourseTextReference: Identifiable, Equatable {
     static let maximumLength = 12_000
 
@@ -1344,6 +1368,10 @@ struct CourseTextReference: Identifiable, Equatable {
     let rangeLength: Int
     let selectedText: String
     let wasTruncated: Bool
+    /// Each block's part when the passage spans several blocks or covers an
+    /// image or similar block; empty when the block fields above describe
+    /// the whole passage.
+    let segments: [CourseTextSegment]
 
     init?(
         id: UUID = UUID(),
@@ -1355,7 +1383,8 @@ struct CourseTextReference: Identifiable, Equatable {
         rangeLocation: Int = 0,
         rangeLength: Int? = nil,
         selectedText: String,
-        wasTruncatedOverride: Bool? = nil
+        wasTruncatedOverride: Bool? = nil,
+        segments: [CourseTextSegment] = []
     ) {
         let normalized = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }
@@ -1369,6 +1398,9 @@ struct CourseTextReference: Identifiable, Equatable {
         self.rangeLength = max(0, rangeLength ?? normalized.utf16.count)
         wasTruncated = wasTruncatedOverride ?? (normalized.count > Self.maximumLength)
         self.selectedText = String(normalized.prefix(Self.maximumLength))
+        self.segments = segments.count > 1 || segments.contains(where: \.coversWholeBlock)
+            ? segments
+            : []
     }
 
     var fileName: String {
@@ -1470,6 +1502,9 @@ struct CourseSelectionDiscussion: Identifiable, Codable, Equatable, Sendable {
     let rangeLength: Int
     let selectedText: String
     let wasTruncated: Bool
+    /// Set when the passage spans several blocks. Older builds ignore it and
+    /// anchor to the first block.
+    let segments: [CourseTextSegment]?
     let createdAt: Date
     var agentRuntimeKind: String?
     var agentModelID: String?
@@ -1502,6 +1537,7 @@ struct CourseSelectionDiscussion: Identifiable, Codable, Equatable, Sendable {
         rangeLength = reference.rangeLength
         selectedText = reference.selectedText
         wasTruncated = reference.wasTruncated
+        segments = reference.segments.isEmpty ? nil : reference.segments
         self.createdAt = createdAt
         agentRuntimeKind = target?.runtimeID
         agentModelID = target?.modelID
@@ -1537,6 +1573,7 @@ struct CourseSelectionDiscussion: Identifiable, Codable, Equatable, Sendable {
         rangeLength = 0
         selectedText = ""
         wasTruncated = false
+        segments = nil
         self.createdAt = createdAt
         agentRuntimeKind = target?.runtimeID
         agentModelID = target?.modelID
@@ -1567,7 +1604,8 @@ struct CourseSelectionDiscussion: Identifiable, Codable, Equatable, Sendable {
             rangeLocation: rangeLocation,
             rangeLength: rangeLength,
             selectedText: selectedText,
-            wasTruncatedOverride: wasTruncated
+            wasTruncatedOverride: wasTruncated,
+            segments: segments ?? []
         )
     }
 
@@ -1579,7 +1617,8 @@ struct CourseSelectionDiscussion: Identifiable, Codable, Equatable, Sendable {
             pathIndices == reference.pathIndices &&
             rangeLocation == reference.rangeLocation &&
             rangeLength == reference.rangeLength &&
-            selectedText == reference.selectedText
+            selectedText == reference.selectedText &&
+            (segments ?? []) == reference.segments
     }
 
     var executionTarget: CourseAgentExecutionTarget? {
@@ -1786,8 +1825,6 @@ struct CoursePlanOutlineEntry: Equatable, Identifiable {
 enum CoursePlanHierarchyPolicy {
     static let currentStructureVersion = 2
     static let maximumDepth = 4
-    static let maximumDirectChildren = 6
-    static let maximumNodeCount = 48
     static let maximumNodeTitleLength = 160
     static let maximumPlanTitleLength = 160
     static let maximumNarrativeFieldLength = 1_200
@@ -1881,8 +1918,8 @@ enum CoursePlanHierarchyPolicy {
             }
             hierarchy = plannedLearningPath(for: brief)
         }
-        guard (1...8).contains(hierarchy.count) else {
-            return "learning_path must contain between 1 and 8 chapter roots"
+        guard !hierarchy.isEmpty else {
+            return "learning_path must contain at least one chapter root"
         }
         guard hierarchy.count == brief.chapters.count else {
             return "learning_path must have exactly one root for every chapter"
@@ -1896,15 +1933,9 @@ enum CoursePlanHierarchyPolicy {
         let idPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$/
         let reservedIDs = reservedContextNodeIDs.union([brief.planID])
         var seenIDs: Set<String> = []
-        var nodeCount = 0
         var issue: String?
         func validate(_ node: CourseLearningNode, depth: Int) {
             guard issue == nil else { return }
-            nodeCount += 1
-            guard nodeCount <= maximumNodeCount else {
-                issue = "learning_path may contain at most \(maximumNodeCount) nodes"
-                return
-            }
             guard depth <= maximumDepth else {
                 issue = "learning_path may be at most \(maximumDepth) levels deep"
                 return
@@ -1937,8 +1968,8 @@ enum CoursePlanHierarchyPolicy {
                     issue = "only chapter roots and nested subchapters may contain children"
                     return
                 }
-                guard (1...maximumDirectChildren).contains(node.children.count) else {
-                    issue = "every chapter or subchapter needs 1 to \(maximumDirectChildren) children"
+                guard !node.children.isEmpty else {
+                    issue = "every chapter or subchapter needs at least one child"
                     return
                 }
             } else if !node.children.isEmpty {
@@ -2796,6 +2827,8 @@ final class CourseExperienceStore {
         let sources: [CourseSource]
         let target: CourseAgentExecutionTarget
         let optimisticMessageID: UUID?
+        /// The passage this message first asks about, whose images go along.
+        var selectionReference: CourseTextReference? = nil
     }
 
     private struct HermesRecoveryScope: Hashable {
@@ -5458,7 +5491,8 @@ final class CourseExperienceStore {
             learnerText: isDurableSubmission ? trimmed : nil,
             sources: submittedSources,
             target: dispatchTarget,
-            optimisticMessageID: optimisticMessage?.id
+            optimisticMessageID: optimisticMessage?.id,
+            selectionReference: reference
         )
         if isDurableSubmission {
             // A new attempt invalidates whatever the last status check found.
@@ -7799,31 +7833,138 @@ final class CourseExperienceStore {
         )
     }
 
+    /// The pictures of image blocks a selected passage covers. The prompt
+    /// already describes each image, so one that can't be read is skipped.
+    private func selectedPassageImages(
+        _ reference: CourseTextReference?,
+        workspaceID: String
+    ) async -> [PreparedImageAttachment] {
+        guard let reference, reference.segments.contains(where: \.coversWholeBlock),
+              let repository = try? await CourseDocumentRegistry.shared.repository(
+                workspaceID: workspaceID,
+                databaseURL: courseDatabaseURL(workspaceID: workspaceID),
+                rootTitle: courses.first(where: { $0.workspaceID == workspaceID })?.title ?? "Course"
+              ),
+              let page = try? await repository.pageSnapshot(id: reference.pageID) else { return [] }
+        return await Self.passageImages(for: reference, document: page.document)
+    }
+
+    static func passageImages(
+        for reference: CourseTextReference,
+        document: BlockDocument
+    ) async -> [PreparedImageAttachment] {
+        let blocks = document.flattenedNodes()
+        var images: [PreparedImageAttachment] = []
+        for segment in reference.segments where segment.coversWholeBlock {
+            let match = segment.blockID.flatMap { id in blocks.first { $0.node.stableBlockID == id } }
+                ?? blocks.first { $0.path == BlockPath(segment.pathIndices) }
+            guard let node = match?.node, node.type == "image",
+                  let source = node.data["url"]?.stringValue,
+                  let data = await NativeBlockEditorImageSource.data(source),
+                  let image = UIImage(data: data),
+                  let prepared = ConversationAttachmentSupport.prepareImage(image) else { continue }
+            images.append(prepared)
+        }
+        return images
+    }
+
+    /// Apple models read attachments from files, and the session transcript
+    /// keeps referring to them, so the pictures are saved in the workspace.
+    private func selectedPassageImageFiles(
+        _ reference: CourseTextReference?,
+        workspaceID: String
+    ) async -> [URL] {
+        let images = await selectedPassageImages(reference, workspaceID: workspaceID)
+        guard !images.isEmpty else { return [] }
+        let directory = coursesRootURL
+            .appendingPathComponent(workspaceID, isDirectory: true)
+            .appendingPathComponent("sources/passage-images", isDirectory: true)
+        return images.compactMap { image in
+            let name = SHA256.hash(data: image.data).map { String(format: "%02x", $0) }.joined()
+            let fileExtension = image.mimeType == "image/png" ? "png" : "jpg"
+            let url = directory.appendingPathComponent("\(name).\(fileExtension)")
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    try image.data.write(to: url, options: .atomic)
+                }
+                return url
+            } catch {
+                LLog.warn("CourseChat", "passage image not saved", fields: ["error": error.localizedDescription])
+                return nil
+            }
+        }
+    }
+
     private static func selectionReferenceIsCurrent(
         _ reference: CourseTextReference,
         document: BlockDocument
     ) -> Bool {
+        guard reference.segments.isEmpty else {
+            return reference.segments.allSatisfy { segment in
+                if segment.coversWholeBlock {
+                    return blockIsCurrent(
+                        blockID: segment.blockID,
+                        pathIndices: segment.pathIndices,
+                        document: document
+                    )
+                }
+                return passageIsCurrent(
+                    blockID: segment.blockID,
+                    pathIndices: segment.pathIndices,
+                    range: NSRange(location: segment.rangeLocation, length: segment.rangeLength),
+                    selectedText: segment.text,
+                    wasTruncated: false,
+                    document: document
+                )
+            }
+        }
+        return passageIsCurrent(
+            blockID: reference.blockID,
+            pathIndices: reference.pathIndices,
+            range: NSRange(location: reference.rangeLocation, length: reference.rangeLength),
+            selectedText: reference.selectedText,
+            wasTruncated: reference.wasTruncated,
+            document: document
+        )
+    }
+
+    private static func blockIsCurrent(
+        blockID: String?,
+        pathIndices: [Int],
+        document: BlockDocument
+    ) -> Bool {
         let blocks = document.flattenedNodes()
-        let storedPath = BlockPath(reference.pathIndices)
-        guard let block = reference.blockID.flatMap({ blockID in
+        if let blockID {
+            return blocks.contains { $0.node.stableBlockID == blockID }
+        }
+        return blocks.contains { $0.path == BlockPath(pathIndices) }
+    }
+
+    private static func passageIsCurrent(
+        blockID: String?,
+        pathIndices: [Int],
+        range preferred: NSRange,
+        selectedText: String,
+        wasTruncated: Bool,
+        document: BlockDocument
+    ) -> Bool {
+        let blocks = document.flattenedNodes()
+        let storedPath = BlockPath(pathIndices)
+        guard let block = blockID.flatMap({ blockID in
             blocks.first(where: { $0.node.stableBlockID == blockID })
         }) ?? blocks.first(where: { $0.path == storedPath }),
               let blockText = block.node.delta?.plainText else {
             return false
         }
-        let selectedText = reference.selectedText
         let selected = selectedText as NSString
         guard selected.length > 0 else { return false }
         let fullText = blockText as NSString
-        let preferred = NSRange(
-            location: reference.rangeLocation,
-            length: reference.rangeLength
-        )
         if preferred.location >= 0,
            preferred.length > 0,
            NSMaxRange(preferred) <= fullText.length {
             let preferredText = fullText.substring(with: preferred)
-            if reference.wasTruncated {
+            if wasTruncated {
                 if preferredText.hasPrefix(selectedText) {
                     return true
                 }
@@ -7862,7 +8003,7 @@ final class CourseExperienceStore {
         let instruction = """
         Generate only the existing exploration page ‘\(node.title)’ (node ID: \(node.id)). Its native editor page ID is \(pageID).\(parent) The learner forked it from the Learn screen to follow their curiosity, so work autonomously without asking for confirmation unless blocked. Learnfold already created this page; it is not a planned lesson.
         \(guidance)
-        Use native-editor-fetch to reread the learner-profile, course-design, agent-notes, the page it forks from, and this exact page. Write a complete, self-contained lesson that picks up where the parent page left off and fits the learner's level; do not repeat the parent page. Fetch this exact page immediately before changing it, pass its latest revision as expected_revision, and save the complete content, properties.generation_status=generated, and a specific properties.title that names the idea it explores together in the same native-editor-update-page call. If your runtime exposes learnfold_generate_lesson instead, use that tool and wait for its successful saved result. If using allow_async, poll native-editor-get-async-task until the mutation completes. Fetch the exact page again and verify both the content and generation_status=generated before reporting completion. Never report success from a chat reply alone. Update only this page: never create other pages, and never change the root, context pages, the planned chapters and lessons, or any other page. Never create Markdown lesson files.
+        Use native-editor-fetch to reread the learner-profile, course-design, agent-notes, the page it forks from, and this exact page. Write a complete, self-contained lesson that picks up where the parent page left off and fits the learner's level; do not repeat the parent page. Fetch this exact page immediately before changing it, pass its latest revision as expected_revision, and save the complete content, properties.generation_status=generated, and a specific properties.title that names the idea it explores together in the same native-editor-update-page call. If your runtime exposes learnfold_generate_lesson instead, use that tool, pass that specific title as its title argument, and wait for its successful saved result. If using allow_async, poll native-editor-get-async-task until the mutation completes. Fetch the exact page again and verify both the content and generation_status=generated before reporting completion. Never report success from a chat reply alone. Update only this page: never create other pages, and never change the root, context pages, the planned chapters and lessons, or any other page. Never create Markdown lesson files.
         """
         return CourseAgentInternalPromptPolicy.wrap(
             """
@@ -9480,7 +9621,9 @@ final class CourseExperienceStore {
             parentPageID: request.parentPageID,
             pageID: node.pageID,
             title: node.title,
-            phase: .queued
+            phase: .queued,
+            ask: request.statusTitle,
+            source: request.statusSource
         ))
         pumpExplorationJobs(appModel: appModel, appState: appState)
         return node
@@ -10916,8 +11059,13 @@ final class CourseExperienceStore {
                 }
                 appleChatKey = Self.appleChatKey(sessionID: sessionID)
                 appleTurnAwaitingSettle = true
+                let passageImages = await selectedPassageImageFiles(
+                    attempt.selectionReference,
+                    workspaceID: workspaceID
+                )
                 try await forwardToAppleAgent(
                     text: preparedAgentText,
+                    images: passageImages,
                     runtimeID: runtimeID,
                     workspaceID: workspaceID,
                     sessionID: sessionID,
@@ -11219,10 +11367,14 @@ final class CourseExperienceStore {
                 )
             )
             try requireHermesLeaseIfNeeded()
+            let passageImageInputs = runtimeID == .codex
+                ? await selectedPassageImages(attempt.selectionReference, workspaceID: workspaceID)
+                    .map(\.userInput)
+                : []
             let imageInputs = submittedSources.compactMap { source in
                 let image = source.image ?? restoredImageData[source.id].flatMap(UIImage.init(data:))
                 return image.flatMap(ConversationAttachmentSupport.prepareImage)?.userInput
-            }
+            } + passageImageInputs
             let newThreadModelID = startsNewThread || threadWasRebuilt ? attempt.target.modelID : nil
             let newThreadReasoningEffortID = startsNewThread || threadWasRebuilt
                 ? attempt.target.reasoningEffortID
@@ -11817,6 +11969,7 @@ final class CourseExperienceStore {
 
     private func forwardToAppleAgent(
         text: String,
+        images: [URL] = [],
         runtimeID: String,
         workspaceID: String,
         sessionID: UUID,
@@ -11864,6 +12017,7 @@ final class CourseExperienceStore {
                 providerID: runtimeID,
                 workspaceID: workspaceID,
                 prompt: text,
+                images: images,
                 lessonTarget: lessonTarget,
                 onAccepted: onAccepted,
                 onPartialResponse: { [weak self] partial in
