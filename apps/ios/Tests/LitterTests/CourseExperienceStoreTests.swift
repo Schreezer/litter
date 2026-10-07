@@ -2111,7 +2111,7 @@ final class CourseExperienceStoreTests: XCTestCase {
         )
         XCTAssertEqual(store.preferredSetupAgentID, CourseAgentProvider.hosted)
         XCTAssertTrue(store.hostedAvailability.available)
-        XCTAssertEqual(store.hostedAvailability.reason, "Ready to use during the beta. No login needed.")
+        XCTAssertEqual(store.hostedAvailability.reason, "Ready to use. No login needed.")
     }
 
     func testHostedGuestIdentityIsStableAndScopedToService() throws {

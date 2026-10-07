@@ -73,7 +73,7 @@ describe("hosted agent worker", () => {
     const budget = env.GuestUsage.getByName(`turns:${subject}`)
     for (let index = 0; index < 59; index++) expect(await budget.consume(60)).toBe(true)
     await enforceGuestTurnLimit(`guest-${subject}-${crypto.randomUUID()}`, env)
-    await expect(enforceGuestTurnLimit(`guest-${subject}-${crypto.randomUUID()}`, env)).rejects.toThrow("today's Hosted beta limit")
+    await expect(enforceGuestTurnLimit(`guest-${subject}-${crypto.randomUUID()}`, env)).rejects.toThrow("today's Hosted usage limit")
     await expect(enforceGuestTurnLimit(crypto.randomUUID(), env)).resolves.toBeUndefined()
   })
 

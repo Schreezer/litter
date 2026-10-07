@@ -60,7 +60,7 @@ export async function guestSession(request: Request, env: Env, signingSecret: st
   const ip = request.headers.get("cf-connecting-ip") ?? "local"
   const ipID = await hashIdentity(ip)
   if (!await env.GuestUsage.getByName(`bootstrap:${ipID}`).consume(120)) {
-    return Response.json({ error: "Hosted beta connection limit reached. Please try again tomorrow." }, { status: 429 })
+    return Response.json({ error: "Hosted is busy right now. Please try again tomorrow." }, { status: 429 })
   }
   const subject = await hashIdentity(secret)
   return Response.json({ accessToken: await mintGuestToken(signingSecret, subject, session) }, {
@@ -85,9 +85,9 @@ export async function enforceGuestTurnLimit(name: string, env: Env): Promise<voi
   if (!subject) return
   if (env.GUEST_BETA_ENABLED !== "true") throw new Error("Hosted guest access is temporarily unavailable.")
   if (!await env.GuestUsage.getByName(`turns:${subject}`).consume(60)) {
-    throw new Error("You've reached today's Hosted beta limit. Your course is saved. Please continue tomorrow.")
+    throw new Error("You've reached today's Hosted usage limit. Your course is saved. Please continue tomorrow.")
   }
   if (!await env.GuestUsage.getByName("turns:global").consume(1000)) {
-    throw new Error("Hosted has reached today's beta capacity. Your course is saved. Please continue tomorrow.")
+    throw new Error("Hosted has reached today's capacity. Your course is saved. Please continue tomorrow.")
   }
 }

@@ -1037,7 +1037,7 @@ private struct CourseAgentSetupConnectionControls: View {
 
             Label {
                 Text(agentID == CourseAgentProvider.hosted
-                    ? "No login needed during the beta. Your prompts are processed in the cloud. Daily usage limits apply."
+                    ? "No login needed. Your prompts and sources are sent to Learnfold’s cloud service and an AI model provider to write your course. Daily usage limits apply."
                     : agentID == CourseAgentProvider.codex && LitterPlatform.isDirectDistMac
                         ? "Uses your Mac’s Codex login, skills, and configured tools. Learnfold adds instructions for this course."
                         : "You can change your course agent later in Course Settings.")

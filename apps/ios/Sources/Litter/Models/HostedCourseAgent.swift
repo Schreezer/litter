@@ -123,7 +123,7 @@ final class SystemHostedCourseAgentRuntime: HostedCourseAgentRuntime {
         return .init(
             available: true,
             reason: accessToken == nil
-                ? "Ready to use during the beta. No login needed."
+                ? "Ready to use. No login needed."
                 : "Cloud-hosted · \(Self.modelID) · durable session"
         )
     }
