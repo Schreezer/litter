@@ -5,7 +5,9 @@
   "compatibility_date": "2026-07-29",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
-  "vars": { "GUEST_BETA_ENABLED": "true" },
+  // REQUIRE_SUBSCRIPTION stays "false" until the App Store products are live and
+  // a build that sends signed transactions has shipped. See README.md.
+  "vars": { "GUEST_BETA_ENABLED": "true", "REQUIRE_SUBSCRIPTION": "false" },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
