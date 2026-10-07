@@ -3615,7 +3615,7 @@ final class CourseExperienceStoreTests: XCTestCase {
     }
 #endif
 
-    func testApplePlanValidatorRejectsPlaceholderChapterExplosion() {
+    func testApplePlanValidatorAcceptsManyChaptersButRejectsPlaceholders() {
         var plan = CourseBrief(
             planID: "sky-course",
             revision: 1,
@@ -3637,6 +3637,19 @@ final class CourseExperienceStoreTests: XCTestCase {
 
         XCTAssertNil(AppleCoursePlanValidator.issue(in: plan))
 
+        var manyChapters = plan
+        manyChapters.chapters.append(
+            contentsOf: (2...12).map {
+                CourseChapter(
+                    id: "light-\($0)",
+                    title: "Light topic \($0)",
+                    objective: "Understand light topic \($0).",
+                    deliverables: ["Visual explanation \($0)"]
+                )
+            }
+        )
+        XCTAssertNil(AppleCoursePlanValidator.issue(in: manyChapters))
+
         plan.chapters.append(
             contentsOf: (2...9).map {
                 CourseChapter(
@@ -3647,9 +3660,12 @@ final class CourseExperienceStoreTests: XCTestCase {
                 )
             }
         )
+        XCTAssertNotNil(AppleCoursePlanValidator.issue(in: plan))
+
+        plan.chapters = []
         XCTAssertEqual(
             AppleCoursePlanValidator.issue(in: plan),
-            "the plan must contain between 1 and 8 chapters"
+            "the plan must contain at least one chapter"
         )
     }
 
@@ -6166,6 +6182,118 @@ final class CourseExperienceStoreTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertNil(store.submissionRecoveryState(for: discussion.id))
+    }
+
+    func testAppleSelectionSendsSelectedImagesAsWorkspaceFiles() async throws {
+        let defaults = try makeDefaults()
+        let coursesRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "AppleSelectionImages-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let workspaceID = "selection-images-\(UUID().uuidString.lowercased())"
+        let workspaceURL = coursesRoot.appendingPathComponent(workspaceID, isDirectory: true)
+        let protectedMetadataURL = AppleCourseApprovalPolicy.protectedMetadataDirectory(
+            courseDirectory: workspaceURL
+        )
+        defer {
+            try? FileManager.default.removeItem(at: coursesRoot)
+            try? FileManager.default.removeItem(at: protectedMetadataURL)
+        }
+        let fixture = try await makeApprovedAppleSelectionFixture(
+            coursesRoot: coursesRoot,
+            workspaceID: workspaceID,
+            courseID: "selection-images-course",
+            courseTitle: "Selection images"
+        )
+
+        // The lesson gains a picture right after the selected text.
+        let png = UIGraphicsImageRenderer(size: CGSize(width: 24, height: 24)).pngData { context in
+            UIColor.systemRed.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 24, height: 24))
+        }
+        let repository = try await CourseDocumentRegistry.shared.repository(
+            workspaceID: workspaceID,
+            databaseURL: CourseExperienceStore(
+                defaults: try makeDefaults(), environment: [:], coursesRootURL: coursesRoot
+            ).courseDatabaseURL(workspaceID: workspaceID),
+            rootTitle: "Selection images"
+        )
+        let page = try await repository.pageSnapshot(id: fixture.reference.pageID)
+        var document = page.document
+        var image = BlockNode(type: "image", data: [
+            "url": .string("data:image/png;base64," + png.base64EncodedString()),
+            "alt": .string("Red square"),
+        ])
+        image.data["block_id"] = .string("selected-image")
+        document.root.children.append(image)
+        try await repository.stageUserEdit(pageID: page.id, document: document)
+        _ = try await repository.flushPendingUserEdits()
+
+        let text = fixture.reference
+        let reference = try XCTUnwrap(CourseTextReference(
+            courseID: text.courseID,
+            pageID: text.pageID,
+            pageTitle: text.pageTitle,
+            blockID: text.blockID,
+            pathIndices: text.pathIndices,
+            rangeLocation: text.rangeLocation,
+            rangeLength: text.rangeLength,
+            selectedText: text.selectedText + "\n[Image: Red square]",
+            segments: [
+                CourseTextSegment(
+                    blockID: text.blockID,
+                    pathIndices: text.pathIndices,
+                    rangeLocation: text.rangeLocation,
+                    rangeLength: text.rangeLength,
+                    text: text.selectedText
+                ),
+                CourseTextSegment(
+                    blockID: "selected-image",
+                    pathIndices: [document.root.children.count - 1],
+                    rangeLocation: 0,
+                    rangeLength: 0,
+                    text: "[Image: Red square]",
+                    isWholeBlock: true
+                ),
+            ]
+        ))
+        let discussion = CourseSelectionDiscussion(
+            reference: reference,
+            target: CourseAgentExecutionTarget(
+                runtimeID: CourseAgentProvider.applePrivateCloud,
+                serverID: nil,
+                modelID: nil
+            )
+        )
+        defaults.set(try JSONEncoder().encode([fixture.course]), forKey: "snappy.course.savedCourses")
+        defaults.set(try JSONEncoder().encode([discussion]), forKey: "snappy.course.selectionDiscussions")
+        let runtime = TestAppleCourseAgentRuntime()
+        let store = CourseExperienceStore(
+            defaults: defaults,
+            environment: [:],
+            appleRuntime: runtime,
+            coursesRootURL: coursesRoot
+        )
+
+        XCTAssertTrue(store.sendMessage(
+            "What does the picture show?",
+            reference: reference,
+            selectionDiscussionID: discussion.id,
+            appModel: AppModel(),
+            appState: AppState()
+        ))
+        for _ in 0..<300 where store.isAgentRequestPending(for: discussion.id) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertTrue(runtime.sendStarted, store.selectionDiscussionErrors[discussion.id] ?? "")
+        XCTAssertEqual(runtime.lastProviderID, CourseAgentProvider.applePrivateCloud)
+        XCTAssertTrue(try XCTUnwrap(runtime.lastPrompt).contains("[Image: Red square]"),
+                      "Models that can't see images still read the description.")
+        let saved = try XCTUnwrap(runtime.lastImages.first)
+        XCTAssertEqual(runtime.lastImages.count, 1)
+        XCTAssertTrue(saved.path.hasPrefix(workspaceURL.path), saved.path)
+        XCTAssertNotNil(UIImage(data: try Data(contentsOf: saved)))
     }
 
     func testLegacyAcceptedSelectionAttemptRemainsDurableWithoutBecomingComposerDraft() throws {
@@ -8785,10 +8913,10 @@ final class CourseExperienceStoreTests: XCTestCase {
             CoursePlanHierarchyPolicy.maximumChapterObjectiveLength
         )
         XCTAssertEqual(deliverables["minItems"] as? Int, 1)
-        XCTAssertEqual(
-            deliverables["maxItems"] as? Int,
-            CoursePlanHierarchyPolicy.maximumDirectChildren
-        )
+        XCTAssertNil(deliverables["maxItems"])
+        XCTAssertNil(chapters["maxItems"])
+        XCTAssertNil(learningPath["maxItems"])
+        XCTAssertNil(depthOneChildren["maxItems"])
         XCTAssertEqual(
             deliverableItems["maxLength"] as? Int,
             CoursePlanHierarchyPolicy.maximumDeliverableLength
@@ -10825,13 +10953,222 @@ final class CourseExperienceStoreTests: XCTestCase {
             root: BlockNode(type: "page", children: [movedBlock])
         )
         let annotation = try XCTUnwrap(
-            CourseSelectionAnchorResolver.annotation(for: discussion, document: moved)
+            CourseSelectionAnchorResolver.annotations(for: discussion, document: moved).first
         )
 
         XCTAssertEqual(annotation.blockID, "stable-await")
         XCTAssertEqual(annotation.path, BlockPath([0]))
         XCTAssertEqual(annotation.range.location, 19)
         XCTAssertEqual(annotation.range.length, 20)
+    }
+
+    func testSelectionAcrossBlocksAnchorsEachBlock() throws {
+        var first = BlockNode.paragraph("Actors serialize access. Await can interleave.")
+        first.data["block_id"] = .string("first")
+        var second = BlockNode.paragraph("Reentrancy means state may change across a suspension.")
+        second.data["block_id"] = .string("second")
+        let document = BlockDocument(root: BlockNode(type: "page", children: [first, second]))
+        let selection = try XCTUnwrap(NativeBlockEditorSelection(segments: [
+            .init(blockID: "first", path: [0], range: NSRange(location: 25, length: 21), text: "Await can interleave."),
+            .init(blockID: "second", path: [1], range: NSRange(location: 0, length: 10), text: "Reentrancy"),
+        ]))
+
+        let reference = try XCTUnwrap(CourseSelectionAnchorResolver.reference(
+            courseID: "swift",
+            pageID: "lesson",
+            pageTitle: "Reentrancy",
+            selection: selection,
+            document: document
+        ))
+        XCTAssertEqual(reference.selectedText, "Await can interleave.\nReentrancy")
+        XCTAssertEqual(reference.blockID, "first")
+        XCTAssertEqual(reference.rangeLocation, 25)
+        XCTAssertEqual(reference.rangeLength, 21)
+        XCTAssertEqual(reference.segments.map(\.blockID), ["first", "second"])
+
+        // Saved and reloaded, the discussion still highlights both blocks.
+        let saved = try JSONEncoder().encode(CourseSelectionDiscussion(reference: reference))
+        let discussion = try JSONDecoder().decode(CourseSelectionDiscussion.self, from: saved)
+        XCTAssertEqual(discussion.reference, reference)
+        let annotations = CourseSelectionAnchorResolver.annotations(for: discussion, document: document)
+        XCTAssertEqual(annotations.map(\.blockID), ["first", "second"])
+        XCTAssertEqual(annotations.map(\.range), [
+            NSRange(location: 25, length: 21),
+            NSRange(location: 0, length: 10),
+        ])
+        XCTAssertEqual(Set(annotations.map(\.id)), [discussion.id.uuidString],
+                       "Every part opens the same discussion.")
+
+        // Exploration anchors travel as page properties and keep every part.
+        let anchor = CourseSelectionAnchorResolver.explorationAnchor(for: reference)
+        let restored = try XCTUnwrap(CourseExplorationAnchor(propertyValue: anchor.propertyValue))
+        XCTAssertEqual(restored, anchor)
+        let branches = CourseSelectionAnchorResolver.branchAnnotations(
+            nodeID: "explore-1", anchor: restored, document: document
+        )
+        XCTAssertEqual(branches.map(\.blockID), ["first", "second"])
+        XCTAssertTrue(branches.allSatisfy { $0.style == .branch })
+
+        // A passage whose second block was edited away no longer resolves.
+        var edited = second
+        edited.delta = TextDelta([.insert("Something else entirely.")])
+        let editedDocument = BlockDocument(root: BlockNode(type: "page", children: [first, edited]))
+        XCTAssertNil(CourseSelectionAnchorResolver.reference(
+            courseID: "swift", pageID: "lesson", pageTitle: "Reentrancy",
+            selection: selection, document: editedDocument
+        ))
+    }
+
+    @MainActor
+    func testReadingSelectionRunsAcrossTextImagesAndCode() async throws {
+        let png = UIGraphicsImageRenderer(size: CGSize(width: 40, height: 20)).pngData { context in
+            UIColor.systemTeal.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 40, height: 20))
+        }
+        var heading = BlockNode.heading("A challenge", level: 2)
+        heading.data["block_id"] = .string("heading")
+        var paragraph = BlockNode.paragraph("Try describing a verification step.")
+        paragraph.data["block_id"] = .string("paragraph")
+        var image = BlockNode(type: "image", data: [
+            "url": .string("data:image/png;base64," + png.base64EncodedString()),
+            "alt": .string("Teal square"),
+            "width": .number(200),
+        ])
+        image.data["block_id"] = .string("image")
+        var code = BlockNode.code("let proof = verify()")
+        code.data["block_id"] = .string("code")
+        var closing = BlockNode.paragraph("Then compare answers.")
+        closing.data["block_id"] = .string("closing")
+        let document = BlockDocument(root: BlockNode(
+            type: "page",
+            children: [heading, paragraph, image, code, closing]
+        ))
+
+        var reported: [NativeBlockEditorSelection] = []
+        let host = UIHostingController(rootView: NativeBlockEditorView(
+            document: .constant(document),
+            configuration: NativeBlockEditorConfiguration(isEditable: false),
+            onSelectionChange: { reported.append($0) }
+        ))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+
+        func textViews(in view: UIView) -> [UITextView] {
+            ((view as? UITextView).map { [$0] } ?? []) + view.subviews.flatMap(textViews)
+        }
+        var flow: UITextView?
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+            flow = textViews(in: host.view).first { $0.text.hasPrefix("A challenge") }
+            if let flow, flow.subviews.contains(where: { $0.frame.height > 40 }) { break }
+        }
+        let page = try XCTUnwrap(flow)
+        XCTAssertEqual(
+            page.text,
+            "A challenge\nTry describing a verification step.\n\u{FFFC}\n\u{FFFC}\nThen compare answers.",
+            "The whole page shares one text view; the image and code hold a place in it."
+        )
+
+        // The image's view covers its placeholder, between the paragraphs.
+        let paragraphBottom = page.layoutManager.boundingRect(
+            forGlyphRange: page.layoutManager.glyphRange(
+                forCharacterRange: NSRange(location: 12, length: 35), actualCharacterRange: nil
+            ),
+            in: page.textContainer
+        ).maxY
+        let imageView = try XCTUnwrap(page.subviews.first {
+            $0.frame.minY >= paragraphBottom - 1 && $0.frame.height > 40
+        })
+        XCTAssertGreaterThan(imageView.frame.height, 60, "The image view keeps its own height.")
+
+        XCTAssertTrue(page.becomeFirstResponder())
+        // From "describing" through "Then".
+        page.selectedRange = NSRange(location: 16, length: (page.text as NSString).length - 16 - 17)
+        page.delegate?.textViewDidChangeSelection?(page)
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        let snapshot = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+        }
+        let attachment = XCTAttachment(image: snapshot)
+        attachment.name = "Selection across an image and code"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+
+        let selection = try XCTUnwrap(reported.last)
+        XCTAssertEqual(selection.segments.map(\.blockID), ["paragraph", "image", "code", "closing"])
+        XCTAssertEqual(selection.segments.map(\.text), [
+            "describing a verification step.",
+            "[Image: Teal square]",
+            "let proof = verify()",
+            "Then",
+        ])
+        XCTAssertTrue(selection.segments[1].isWholeBlock)
+
+        let reference = try XCTUnwrap(CourseSelectionAnchorResolver.reference(
+            courseID: "course", pageID: "page", pageTitle: "Proofs",
+            selection: selection, document: document
+        ))
+        XCTAssertEqual(reference.segments.map(\.coversWholeBlock), [false, true, false, false])
+        let images = await CourseExperienceStore.passageImages(for: reference, document: document)
+        XCTAssertEqual(images.count, 1, "Codex receives the selected picture.")
+
+        UIPasteboard.general.items = []
+        page.copy(nil)
+        XCTAssertEqual(
+            UIPasteboard.general.string,
+            "describing a verification step.\nlet proof = verify()\nThen",
+            "Plain-text copies keep the text around the image."
+        )
+
+        page.selectedRange = NSRange(location: 4, length: 0)
+        page.delegate?.textViewDidChangeSelection?(page)
+        XCTAssertEqual(reported.last?.text, "")
+    }
+
+    func testImageOnlySelectionKeepsItsWholeBlockAnchor() throws {
+        var image = BlockNode(type: "image", data: ["url": .string("https://example.com/a.png")])
+        image.data["block_id"] = .string("image")
+        let document = BlockDocument(root: BlockNode(type: "page", children: [image]))
+        let selection = try XCTUnwrap(NativeBlockEditorSelection(segments: [.init(
+            blockID: "image", path: [0], range: NSRange(location: 0, length: 0),
+            text: "[Image]", isWholeBlock: true, imageSource: "https://example.com/a.png"
+        )]))
+        let reference = try XCTUnwrap(CourseSelectionAnchorResolver.reference(
+            courseID: "c", pageID: "p", pageTitle: "Page", selection: selection, document: document
+        ))
+        XCTAssertEqual(reference.segments.count, 1, "A lone image keeps its segment so it can be sent.")
+        XCTAssertTrue(reference.segments[0].coversWholeBlock)
+
+        let saved = try JSONEncoder().encode(CourseSelectionDiscussion(reference: reference))
+        let discussion = try JSONDecoder().decode(CourseSelectionDiscussion.self, from: saved)
+        XCTAssertEqual(discussion.reference, reference)
+        XCTAssertEqual(
+            CourseSelectionAnchorResolver.annotations(for: discussion, document: document), [],
+            "There is no text to highlight in an image."
+        )
+        let emptyPage = BlockDocument(root: BlockNode(type: "page", children: []))
+        XCTAssertNil(CourseSelectionAnchorResolver.reference(
+            courseID: "c", pageID: "p", pageTitle: "Page", selection: selection, document: emptyPage
+        ))
+    }
+
+    func testSingleBlockDiscussionsDecodeWithoutSegments() throws {
+        let reference = try XCTUnwrap(CourseTextReference(
+            courseID: "c", pageID: "p", pageTitle: "Page",
+            blockID: "b", pathIndices: [0], rangeLocation: 0, rangeLength: 4, selectedText: "Text"
+        ))
+        let encoded = try JSONEncoder().encode(CourseSelectionDiscussion(reference: reference))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertNil(json["segments"], "Single-block discussions keep the format older builds read.")
+        let decoded = try JSONDecoder().decode(CourseSelectionDiscussion.self, from: encoded)
+        XCTAssertNil(decoded.segments)
+        XCTAssertEqual(decoded.reference?.segments, [])
     }
 
     func testCourseChatWorkingStateIncludesStartupAndLiveTurns() {
@@ -14321,8 +14658,8 @@ final class CourseExperienceStoreTests: XCTestCase {
             "learning_path may be at most 4 levels deep"
         )
 
-        var tooWide = makeTypedHierarchyBrief()
-        tooWide.learningPath?[0].children = (1...7).map { index in
+        var wide = makeTypedHierarchyBrief()
+        wide.learningPath?[0].children = (1...12).map { index in
             CourseLearningNode(
                 id: "wide-lesson-\(index)",
                 title: "Wide Lesson \(index)",
@@ -14331,40 +14668,37 @@ final class CourseExperienceStoreTests: XCTestCase {
                 role: .lesson
             )
         }
-        XCTAssertEqual(
-            CoursePlanHierarchyPolicy.validationIssue(in: tooWide, requiresTypedHierarchy: true),
-            "every chapter or subchapter needs 1 to 6 children"
+        XCTAssertNil(
+            CoursePlanHierarchyPolicy.validationIssue(in: wide, requiresTypedHierarchy: true)
         )
 
-        for invalidDeliverables in [
-            [String](),
-            (1...7).map { "Legacy deliverable \($0)" },
-        ] {
-            var invalidLegacy = makeLegacyHierarchyBrief()
-            invalidLegacy.chapters[0].deliverables = invalidDeliverables
-            XCTAssertEqual(
-                AppleCoursePlanValidator.issue(in: invalidLegacy),
-                "every chapter needs 1 to 6 natural-language deliverables"
-            )
-        }
+        var emptyLegacy = makeLegacyHierarchyBrief()
+        emptyLegacy.chapters[0].deliverables = []
+        XCTAssertEqual(
+            AppleCoursePlanValidator.issue(in: emptyLegacy),
+            "every chapter needs at least one natural-language deliverable"
+        )
+        var manyDeliverables = makeLegacyHierarchyBrief()
+        manyDeliverables.chapters[0].deliverables = (1...9).map { "Legacy deliverable \($0)" }
+        XCTAssertNil(AppleCoursePlanValidator.issue(in: manyDeliverables))
 
-        var tooMany = makeTypedHierarchyBrief()
-        tooMany.chapters = (1...8).map { index in
+        var large = makeTypedHierarchyBrief()
+        large.chapters = (1...12).map { index in
             CourseChapter(
                 id: "chapter-\(index)",
                 title: "Chapter Number \(index)",
                 objective: "Teach bounded topic \(index).",
-                deliverables: (1...6).map { "Lesson number \($0)" }
+                deliverables: (1...8).map { "Lesson number \($0)" }
             )
         }
-        tooMany.learningPath = tooMany.chapters.map { chapter in
+        large.learningPath = large.chapters.map { chapter in
             CourseLearningNode(
                 id: chapter.id,
                 title: chapter.title,
                 kind: .folder,
                 status: .pendingGeneration,
                 role: .chapter,
-                children: (1...6).map { index in
+                children: (1...8).map { index in
                     CourseLearningNode(
                         id: "\(chapter.id)-leaf-\(index)",
                         title: "Bounded Lesson \(index)",
@@ -14375,9 +14709,8 @@ final class CourseExperienceStoreTests: XCTestCase {
                 }
             )
         }
-        XCTAssertEqual(
-            CoursePlanHierarchyPolicy.validationIssue(in: tooMany, requiresTypedHierarchy: true),
-            "learning_path may contain at most 48 nodes"
+        XCTAssertNil(
+            CoursePlanHierarchyPolicy.validationIssue(in: large, requiresTypedHierarchy: true)
         )
 
         var longTitle = makeTypedHierarchyBrief()
@@ -14445,7 +14778,7 @@ final class CourseExperienceStoreTests: XCTestCase {
                 in: emptyMaximumDepthSubchapter,
                 requiresTypedHierarchy: true
             ),
-            "every chapter or subchapter needs 1 to 6 children"
+            "every chapter or subchapter needs at least one child"
         )
     }
 
@@ -20146,6 +20479,7 @@ private final class TestAppleCourseAgentRuntime: AppleCourseAgentRuntime {
     var lastProviderID: String?
     var lastPrompt: String?
     var lastLessonTarget: PreparedCourseLessonTarget?
+    var lastImages: [URL] = []
     var restored: [AppleCourseAgentStoredMessage] = []
     var failsBeforeAcceptance = false
     var failureAfterAcceptance: Error?
@@ -20173,6 +20507,30 @@ private final class TestAppleCourseAgentRuntime: AppleCourseAgentRuntime {
             try? await Task.sleep(for: .milliseconds(10))
         }
         return restored
+    }
+
+    func send(
+        sessionID: UUID,
+        providerID: String,
+        workspaceID: String,
+        prompt: String,
+        images: [URL],
+        lessonTarget: PreparedCourseLessonTarget?,
+        onAccepted: @escaping @MainActor () -> Void,
+        onPartialResponse: @escaping @MainActor (String) -> Void,
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
+    ) async throws {
+        lastImages = images
+        try await send(
+            sessionID: sessionID,
+            providerID: providerID,
+            workspaceID: workspaceID,
+            prompt: prompt,
+            lessonTarget: lessonTarget,
+            onAccepted: onAccepted,
+            onPartialResponse: onPartialResponse,
+            onCoursePlan: onCoursePlan
+        )
     }
 
     func send(

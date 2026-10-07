@@ -216,7 +216,8 @@ final class CourseExplorationUITests: XCTestCase {
 
     @MainActor
     private func paragraph(in app: XCUIApplication) -> XCUIElement {
-        app.textViews.matching(NSPredicate(
+        // Reading pages render passages as static text, editing as text views.
+        app.descendants(matching: .any).matching(NSPredicate(
             format: "value BEGINSWITH %@", "Try describing a verification step"
         )).firstMatch
     }

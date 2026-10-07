@@ -524,8 +524,8 @@ enum AppleCoursePlanValidator {
         if !isNaturalLanguage(brief.estimatedDuration, minimumWords: 1) {
             return "estimated_duration must be natural language, not a serialized schema fragment"
         }
-        if !(1...8).contains(brief.chapters.count) {
-            return "the plan must contain between 1 and 8 chapters"
+        if brief.chapters.isEmpty {
+            return "the plan must contain at least one chapter"
         }
         let chapterIDs = brief.chapters.map(\.id)
         if Set(chapterIDs).count != chapterIDs.count {
@@ -552,10 +552,8 @@ enum AppleCoursePlanValidator {
             }) {
                 return "every chapter deliverable must be at most \(CoursePlanHierarchyPolicy.maximumDeliverableLength) characters"
             }
-            if !(1...CoursePlanHierarchyPolicy.maximumDirectChildren).contains(
-                chapter.deliverables.count
-            ) {
-                return "every chapter needs 1 to \(CoursePlanHierarchyPolicy.maximumDirectChildren) natural-language deliverables"
+            if chapter.deliverables.isEmpty {
+                return "every chapter needs at least one natural-language deliverable"
             }
             if let deliverable = chapter.deliverables.first(where: {
                 !isNaturalLanguage($0, minimumWords: 1)
@@ -1323,6 +1321,11 @@ enum AppleCoursePlanningProfile: String, Codable, CaseIterable, Equatable, Senda
 
     static let selectionOrder: [Self] = [.full, .focused]
 
+    /// On-device context budgets bound the plan Apple's model can emit.
+    /// Hosted agents have no such limits.
+    static let maximumDirectChildren = 6
+    static let maximumFullLearningNodes = 48
+
     var maximumChapters: Int {
         switch self {
         case .full: 8
@@ -1332,13 +1335,13 @@ enum AppleCoursePlanningProfile: String, Codable, CaseIterable, Equatable, Senda
 
     var maximumLearningNodes: Int {
         switch self {
-        case .full: CoursePlanHierarchyPolicy.maximumNodeCount
+        case .full: Self.maximumFullLearningNodes
         case .focused: 24
         }
     }
 
     var maximumDeliverablesPerChapter: Int {
-        CoursePlanHierarchyPolicy.maximumDirectChildren
+        Self.maximumDirectChildren
     }
 
     var responseTokenCap: Int {
@@ -1456,14 +1459,14 @@ struct AppleCoursePlanningSchemaContract: Codable, Equatable, Sendable {
             maximumChapters = requestedExactChapterCount ?? profile.maximumChapters
             exactChapterCount = requestedExactChapterCount
             minimumChapterChildren = 1
-            maximumChapterChildren = CoursePlanHierarchyPolicy.maximumDirectChildren
+            maximumChapterChildren = AppleCoursePlanningProfile.maximumDirectChildren
             allowedChildVariants = [.leaf, .subchapter]
             minimumTotalNodes = max(2, requestedMinimumTotalNodes)
             exactTotalNodes = requestedExactTotalNodes
             allowedLeafRoles = [.lesson, .module, .explainer]
         }
         minimumSubchapterChildren = 1
-        maximumSubchapterChildren = CoursePlanHierarchyPolicy.maximumDirectChildren
+        maximumSubchapterChildren = AppleCoursePlanningProfile.maximumDirectChildren
         maximumSubchapterLevels = 1
         maximumTotalNodes = profile.maximumLearningNodes
     }
@@ -1722,7 +1725,7 @@ enum AppleCoursePlanningRequestPolicy {
                 explicitFolderNodes == nil,
                 explicitFolderNodesPerChapter == nil,
                 (1...8).contains(chapterCount),
-                (1...CoursePlanHierarchyPolicy.maximumDirectChildren).contains(
+                (1...AppleCoursePlanningProfile.maximumDirectChildren).contains(
                     directLeafCount
                 )
             else {
@@ -1733,7 +1736,7 @@ enum AppleCoursePlanningRequestPolicy {
                 saturatedAdd(1, directLeafCount)
             )
             guard
-                totalNodeCount <= CoursePlanHierarchyPolicy.maximumNodeCount,
+                totalNodeCount <= AppleCoursePlanningProfile.maximumFullLearningNodes,
                 explicitTotalNodes.map({ $0 == totalNodeCount }) ?? true
             else {
                 return nil
@@ -3332,6 +3335,20 @@ protocol AppleCourseAgentRuntime: AnyObject {
         onPartialResponse: @escaping @MainActor (String) -> Void,
         onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
     ) async throws
+    /// Sends `prompt` with pictures the learner selected. Runtimes whose
+    /// model cannot read images send the prompt alone; it already
+    /// describes each image.
+    func send(
+        sessionID: UUID,
+        providerID: String,
+        workspaceID: String,
+        prompt: String,
+        images: [URL],
+        lessonTarget: PreparedCourseLessonTarget?,
+        onAccepted: @escaping @MainActor () -> Void,
+        onPartialResponse: @escaping @MainActor (String) -> Void,
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
+    ) async throws
     func cancel(sessionID: UUID)
     func remove(sessionID: UUID, workspaceID: String)
 }
@@ -3363,6 +3380,29 @@ extension AppleCourseAgentRuntime {
             workspaceID: workspaceID,
             prompt: prompt,
             lessonTarget: nil,
+            onAccepted: onAccepted,
+            onPartialResponse: onPartialResponse,
+            onCoursePlan: onCoursePlan
+        )
+    }
+
+    func send(
+        sessionID: UUID,
+        providerID: String,
+        workspaceID: String,
+        prompt: String,
+        images: [URL],
+        lessonTarget: PreparedCourseLessonTarget?,
+        onAccepted: @escaping @MainActor () -> Void,
+        onPartialResponse: @escaping @MainActor (String) -> Void,
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
+    ) async throws {
+        try await send(
+            sessionID: sessionID,
+            providerID: providerID,
+            workspaceID: workspaceID,
+            prompt: prompt,
+            lessonTarget: lessonTarget,
             onAccepted: onAccepted,
             onPartialResponse: onPartialResponse,
             onCoursePlan: onCoursePlan
@@ -3536,6 +3576,30 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
         providerID: String,
         workspaceID: String,
         prompt: String,
+        lessonTarget: PreparedCourseLessonTarget?,
+        onAccepted: @escaping @MainActor () -> Void,
+        onPartialResponse: @escaping @MainActor (String) -> Void,
+        onCoursePlan: @escaping @MainActor @Sendable (CourseBrief) async throws -> Void
+    ) async throws {
+        try await send(
+            sessionID: sessionID,
+            providerID: providerID,
+            workspaceID: workspaceID,
+            prompt: prompt,
+            images: [],
+            lessonTarget: lessonTarget,
+            onAccepted: onAccepted,
+            onPartialResponse: onPartialResponse,
+            onCoursePlan: onCoursePlan
+        )
+    }
+
+    func send(
+        sessionID: UUID,
+        providerID: String,
+        workspaceID: String,
+        prompt: String,
+        images: [URL],
         lessonTarget: PreparedCourseLessonTarget?,
         onAccepted: @escaping @MainActor () -> Void,
         onPartialResponse: @escaping @MainActor (String) -> Void,
@@ -3902,6 +3966,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     "generation attempt started",
                     fields: [
                         "attempt": attemptNumber,
+                        "images": images.count,
                         "provider": providerID,
                         "session_id": sessionID.uuidString.lowercased(),
                     ]
@@ -3909,10 +3974,16 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
 #if LEARNFOLD_PRIVATE_CLOUD_COMPUTE_SDK
                 if providerID == CourseAgentProvider.applePrivateCloud,
                    #available(iOS 27.0, *) {
-                    let stream = activeSession.streamResponse(
-                        to: runtimePrompt,
-                        contextOptions: ContextOptions(reasoningLevel: .light)
-                    )
+                    let contextOptions = ContextOptions(reasoningLevel: .light)
+                    let stream = if let imagePrompt = Self.prompt(
+                        runtimePrompt,
+                        images: images,
+                        model: PrivateCloudComputeLanguageModel()
+                    ) {
+                        activeSession.streamResponse(to: imagePrompt, contextOptions: contextOptions)
+                    } else {
+                        activeSession.streamResponse(to: runtimePrompt, contextOptions: contextOptions)
+                    }
                     for try await snapshot in stream {
                         try Task.checkCancellation()
                         if snapshot.content != latest {
@@ -3940,10 +4011,16 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     toolMode: toolMode,
                     planningProfile: planningProfile
                 )
-                let stream = activeSession.streamResponse(
-                    to: runtimePrompt,
-                    options: GenerationOptions(maximumResponseTokens: responseTokenCap)
-                )
+                let options = GenerationOptions(maximumResponseTokens: responseTokenCap)
+                let stream = if #available(iOS 27.0, *), let imagePrompt = Self.prompt(
+                    runtimePrompt,
+                    images: images,
+                    model: SystemLanguageModel.default
+                ) {
+                    activeSession.streamResponse(to: imagePrompt, options: options)
+                } else {
+                    activeSession.streamResponse(to: runtimePrompt, options: options)
+                }
                 for try await snapshot in stream {
                     try Task.checkCancellation()
                     if snapshot.content != latest {
@@ -4543,6 +4620,24 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
             .appendingPathComponent("apple-agent-\(sessionID.uuidString.lowercased()).json")
     }
 }
+
+#if canImport(FoundationModels)
+extension SystemAppleCourseAgentRuntime {
+    /// `text` with the learner's selected pictures attached, or nil when
+    /// there are none or `model` cannot read images.
+    @available(iOS 27.0, *)
+    static func prompt(_ text: String, images: [URL], model: some LanguageModel) -> Prompt? {
+        guard !images.isEmpty, model.capabilities.contains(.vision) else { return nil }
+        let attachments = images.enumerated().map { index, url in
+            Attachment(imageURL: url).label("Selected image \(index + 1)")
+        }
+        return Prompt {
+            text
+            attachments
+        }
+    }
+}
+#endif
 
 #if canImport(FoundationModels)
 @available(iOS 26.0, *)

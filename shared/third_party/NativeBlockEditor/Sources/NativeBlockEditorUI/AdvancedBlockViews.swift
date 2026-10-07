@@ -7,6 +7,7 @@ import WebKit
 struct DocumentImageBlockView: View {
     let node: BlockNode
     let identifier: String
+    var showsResizeControls = true
     let onResize: (Double) -> Void
 
     private var source: String { node.data["url"]?.stringValue ?? "" }
@@ -19,29 +20,33 @@ struct DocumentImageBlockView: View {
                 .frame(maxWidth: .infinity, alignment: alignment)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
 
-            HStack(spacing: 8) {
-                Button { onResize(max(96, width - 48)) } label: {
-                    Image(systemName: "minus.magnifyingglass")
-                }
-                .accessibilityLabel("Make image smaller")
-                .accessibilityIdentifier("image-smaller-\(identifier)")
-
-                Text("\(Int(width)) pt")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-
-                Button { onResize(min(680, width + 48)) } label: {
-                    Image(systemName: "plus.magnifyingglass")
-                }
-                .accessibilityLabel("Make image larger")
-                .accessibilityIdentifier("image-larger-\(identifier)")
-            }
-            .buttonStyle(.borderless)
-            .frame(maxWidth: .infinity, alignment: alignment)
+            if showsResizeControls { resizeControls }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(node.data["alt"]?.stringValue ?? "Image block")
         .accessibilityIdentifier("image-block-\(identifier)")
+    }
+
+    private var resizeControls: some View {
+        HStack(spacing: 8) {
+            Button { onResize(max(96, width - 48)) } label: {
+                Image(systemName: "minus.magnifyingglass")
+            }
+            .accessibilityLabel("Make image smaller")
+            .accessibilityIdentifier("image-smaller-\(identifier)")
+
+            Text("\(Int(width)) pt")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            Button { onResize(min(680, width + 48)) } label: {
+                Image(systemName: "plus.magnifyingglass")
+            }
+            .accessibilityLabel("Make image larger")
+            .accessibilityIdentifier("image-larger-\(identifier)")
+        }
+        .buttonStyle(.borderless)
+        .frame(maxWidth: .infinity, alignment: alignment)
     }
 
     @ViewBuilder
@@ -68,19 +73,7 @@ struct DocumentImageBlockView: View {
     }
 
     private var localImage: UIImage? {
-        if source.lowercased().hasPrefix("data:image/"),
-           let comma = source.firstIndex(of: ","),
-           let data = Data(base64Encoded: String(source[source.index(after: comma)...])) {
-            return UIImage(data: data)
-        }
-        if let url = URL(string: source), url.isFileURL,
-           let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) {
-            return UIImage(data: data)
-        }
-        if source.hasPrefix("/"), let data = try? Data(contentsOf: URL(fileURLWithPath: source), options: [.mappedIfSafe]) {
-            return UIImage(data: data)
-        }
-        return nil
+        NativeBlockEditorImageSource.localData(source).flatMap(UIImage.init(data:))
     }
 
     private var alignment: Alignment {
@@ -89,6 +82,39 @@ struct DocumentImageBlockView: View {
         case "right": .trailing
         default: .center
         }
+    }
+}
+
+/// Reads the picture an image block's `url` names: a data URL, a file, or a
+/// web address.
+public enum NativeBlockEditorImageSource {
+    /// The bytes of a data URL or local file, read without the network.
+    public static func localData(_ source: String) -> Data? {
+        if source.lowercased().hasPrefix("data:image/"),
+           let comma = source.firstIndex(of: ",") {
+            return Data(base64Encoded: String(source[source.index(after: comma)...]))
+        }
+        if let url = URL(string: source), url.isFileURL {
+            return try? Data(contentsOf: url, options: [.mappedIfSafe])
+        }
+        if source.hasPrefix("/") {
+            return try? Data(contentsOf: URL(fileURLWithPath: source), options: [.mappedIfSafe])
+        }
+        return nil
+    }
+
+    /// The image's bytes, downloading a web image. Returns nil when it
+    /// cannot be read.
+    public static func data(_ source: String) async -> Data? {
+        if let data = localData(source) { return data }
+        guard let url = URL(string: source),
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              let (data, response) = try? await URLSession.shared.data(
+                for: URLRequest(url: url, timeoutInterval: 20)
+              ),
+              (response as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true
+        else { return nil }
+        return data
     }
 }
 

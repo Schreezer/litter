@@ -400,12 +400,6 @@ struct CoursePlanMarkdown: Equatable, Sendable {
             )
         }
 
-        guard chapters.count <= 8 else {
-            return .failure(Issue(
-                message: "The plan has \(chapters.count) chapters; use at most 8 by merging related chapters."
-            ))
-        }
-
         var courseChapters: [CourseChapter] = []
         var learningPath: [CourseLearningNode] = []
         for chapter in chapters {
@@ -422,7 +416,7 @@ struct CoursePlanMarkdown: Equatable, Sendable {
                 id: id,
                 title: title,
                 objective: objective,
-                deliverables: children.prefix(Policy.maximumDirectChildren).map {
+                deliverables: children.map {
                     clipped($0.title, Policy.maximumDeliverableLength)
                 }
             ))
@@ -456,18 +450,13 @@ struct CoursePlanMarkdown: Equatable, Sendable {
         return .success(brief)
     }
 
-    /// Names the offending chapter or section for the limits agents most
-    /// often exceed, so a corrected plan can target the right place.
+    /// Names the offending section when nesting exceeds the native depth,
+    /// so a corrected plan can target the right place.
     private static func structureIssue(in roots: [CourseLearningNode]) -> String? {
         typealias Policy = CoursePlanHierarchyPolicy
-        var total = 0
         func visit(_ node: CourseLearningNode, depth: Int) -> String? {
-            total += 1
             if depth > Policy.maximumDepth {
                 return "“\(node.title)” is nested \(depth) levels deep; use at most \(Policy.maximumDepth) levels"
-            }
-            if node.children.count > Policy.maximumDirectChildren {
-                return "“\(node.title)” has \(node.children.count) items; give each chapter or section at most \(Policy.maximumDirectChildren) direct items"
             }
             for child in node.children {
                 if let issue = visit(child, depth: depth + 1) { return issue }
@@ -476,9 +465,6 @@ struct CoursePlanMarkdown: Equatable, Sendable {
         }
         for root in roots {
             if let issue = visit(root, depth: 1) { return issue }
-        }
-        if total > Policy.maximumNodeCount {
-            return "the plan has \(total) chapters, sections, and lessons in total; use at most \(Policy.maximumNodeCount) by combining lessons"
         }
         return nil
     }
@@ -529,7 +515,7 @@ enum CoursePlanMarkdownPromptPolicy {
     """
 
     static let instructions = """
-    When you have enough evidence, briefly introduce the proposal in one or two sentences, then end the reply with a fenced block tagged `\(CoursePlanMarkdown.fenceLanguage)`. Learnfold renders it as the native plan card the learner approves. It is literal text in your reply, not a tool call. Inside the block write, in order: `# Course title`; the lines `Summary:`, `Outcome:`, `Starting point:`, `Focus:`, and `Duration:`, where the starting point and focus reflect your evidence about the learner; then one `## Chapter title` per chapter, each followed by an `Objective:` line and a bulleted list of its lessons. Indent bullets two spaces to group lessons under a section. Append `(explainer)` or `(module)` to a lesson title for those page types. Limits: at most 8 chapters, at most \(CoursePlanHierarchyPolicy.maximumDirectChildren) direct items under any chapter or section, at most \(CoursePlanHierarchyPolicy.maximumDepth) levels including the chapter, and at most \(CoursePlanHierarchyPolicy.maximumNodeCount) chapters, sections, and lessons in total. Titles have no numbering. Put nothing after the closing fence, and never describe the plan as a table or JSON outside the block.
+    When you have enough evidence, briefly introduce the proposal in one or two sentences, then end the reply with a fenced block tagged `\(CoursePlanMarkdown.fenceLanguage)`. Learnfold renders it as the native plan card the learner approves. It is literal text in your reply, not a tool call. Inside the block write, in order: `# Course title`; the lines `Summary:`, `Outcome:`, `Starting point:`, `Focus:`, and `Duration:`, where the starting point and focus reflect your evidence about the learner; then one `## Chapter title` per chapter, each followed by an `Objective:` line and a bulleted list of its lessons. Indent bullets two spaces to group lessons under a section. Append `(explainer)` or `(module)` to a lesson title for those page types. Use as many chapters and lessons as the course needs; nesting goes at most \(CoursePlanHierarchyPolicy.maximumDepth) levels including the chapter. Titles have no numbering. Put nothing after the closing fence, and never describe the plan as a table or JSON outside the block.
 
     If Learnfold reports that a plan block can’t be used, send a corrected complete block. If the learner requests changes, discuss them and send a new complete block; Learnfold keeps the plan identity and increments the revision itself. Never tell the learner a plan card is ready unless the reply contains the block. Example:
 

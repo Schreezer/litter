@@ -40,3 +40,17 @@ When asked to continue creating content, start with one researched Wait, How? ex
 When asked to package the existing work, download the three galleries and preserve their exact prompts locally. Verify slide order and readability before marking the exports complete.
 
 When the user provides post results, record the account, post link, topic, version, publication time and measurement time alongside available metrics. Separate observed results from interpretation. Use results to choose the next topic, cover or length experiment.
+
+## 2026-10-06 launch film
+
+Completed [Follow the question](videos/learnfold-follow-the-question/README.md): two 40.000-second MP4s, 1920×1080 and 1080×1920, both H.264 at 30 fps with stereo AAC audio. The existing current iOS build succeeded, both film UI-test flows passed, and both HyperFrames layouts passed lint, runtime, layout, and contrast validation. Exported video frames and audio streams were checked. Final master audio measured -15.3 LUFS integrated and -1.7 dBFS true peak.
+
+Native UI footage uses the existing seeded simulator demo, with waits trimmed and typing accelerated. The single Flow Music generation, exact prompt, untouched source recordings, six-scene plan, editable compositions, validation logs, and contact sheets are retained in the project on Codex Storage. No app source change, store-availability claim, or publication was made. Simulators were shut down after capture.
+
+### Learnfold door-driven recreation — 2026-10-06
+
+Completed and verified: 45.000 seconds, 1920×1080 at 60 fps, H.264/AAC stereo. Runtime/layout/contrast checks passed; exported frames inspected; iCloud upload and direct download verified. Source and review: [project](videos/learnfold-doors-recreated/README.md). Original Opus project preserved. This uses staged test-fixture footage; no application source changes or release work.
+
+### Product-led rabbit-hole film — 2026-10-06
+
+[Down the rabbit hole](videos/learnfold-curiosity-to-course/README.md) rendered and export-verified: 72.000 seconds, 1920×1080 at 60 fps, H.264/AAC stereo, 18,239,908-byte phone-friendly copy and a retained full master. Strict runtime/layout/contrast checks passed, root motion assertions passed over 300 samples, and 48 exported proof frames were inspected. Final audio: -14.0 LUFS integrated / -2.5 dBFS true peak. Native UI shows an interactive lesson, assessment feedback, explorations, own question, goal, branched map and reading resume. Capture uses an isolated prepared demo course and deterministic exploration runtime; goal/trail persistence was checked after relaunch. No application source edits or release; simulators shut down. iCloud upload completed; a remote HTTP206 download returned the expected full size and a byte-identical MP4 header. Copy checksum and link proof are retained in the project.

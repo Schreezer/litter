@@ -90,8 +90,31 @@ final class CoursePlanMarkdownTests: XCTestCase {
         )
     }
 
-    func testOversizedSectionNamesTheSection() throws {
-        let lessons = (1...7).map { "- Lesson topic \($0)" }.joined(separator: "\n")
+    func testLargePlanHasNoChapterOrLessonLimit() throws {
+        let chapters = (1...10).map { chapter in
+            let lessons = (1...8).map { "- Topic \(chapter) lesson \($0)" }.joined(separator: "\n")
+            return "## Chapter topic \(chapter)\nObjective: Learn topic \(chapter).\n\(lessons)"
+        }.joined(separator: "\n")
+        let reply = """
+        ```learnfold-plan
+        # Bonds
+        Summary: A long course on bonds.
+        Outcome: Price bonds.
+        Starting point: New to bonds.
+        Focus: Pricing math.
+        \(chapters)
+        ```
+        """
+        guard case .plan(let plan) = CoursePlanMarkdown.extract(from: reply).blocks.first else {
+            return XCTFail("Expected a parsed plan")
+        }
+        let brief = try plan.brief(planID: "bonds", revision: 1).get()
+        XCTAssertEqual(brief.learningPath?.count, 10)
+        XCTAssertEqual(brief.learningPath?.allSatisfy { $0.children.count == 8 }, true)
+        XCTAssertEqual(brief.chapters.first?.deliverables.count, 8)
+    }
+
+    func testOverlyDeepSectionNamesTheSection() throws {
         let reply = """
         ```learnfold-plan
         # Bonds
@@ -100,16 +123,19 @@ final class CoursePlanMarkdownTests: XCTestCase {
         Starting point: New to bonds.
         Focus: Pricing math.
         ## Pricing
-        \(lessons)
+        - Cash flows
+          - Coupons
+            - Coupon timing
+              - Odd first coupons
         ```
         """
         guard case .plan(let plan) = CoursePlanMarkdown.extract(from: reply).blocks.first else {
             return XCTFail("Expected a parsed plan")
         }
         guard case .failure(let issue) = plan.brief(planID: "bonds", revision: 1) else {
-            return XCTFail("Expected an oversized section to be rejected")
+            return XCTFail("Expected an overly deep section to be rejected")
         }
-        XCTAssertTrue(issue.message.contains("“Pricing” has 7 items"), issue.message)
+        XCTAssertTrue(issue.message.contains("“Odd first coupons” is nested 5 levels deep"), issue.message)
     }
 
     func testChapterWithoutLessonsGetsOneLesson() throws {

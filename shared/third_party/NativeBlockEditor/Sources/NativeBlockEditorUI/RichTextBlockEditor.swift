@@ -596,52 +596,9 @@ struct RichTextBlockEditor: UIViewRepresentable {
             isEditable: isEditable
         )
         for run in runs {
-            output.addAttributes(Self.attributes(for: run, traits: traits), range: run.range)
+            output.addAttributes(RichTextCodec.annotationAttributes(for: run, traits: traits), range: run.range)
         }
         return output
-    }
-
-    /// Colors for one annotation run. The ID marks the run as annotated; taps
-    /// read the covering annotations from their ranges, not from this key.
-    private static func attributes(
-        for run: NativeBlockEditorAnnotationComposer.Run,
-        traits: UITraitCollection
-    ) -> [NSAttributedString.Key: Any] {
-        let token = run.token
-        let isDark = traits.userInterfaceStyle == .dark
-        let contrast: CGFloat = traits.accessibilityContrast == .high ? 1.5 : 1
-        let hue: UIColor = token.underlineHue == .branch ? .systemPurple : .systemBlue
-        var attributes: [NSAttributedString.Key: Any] = [RichTextCodec.annotationIDKey: run.primaryID]
-
-        let fillAlpha: CGFloat? = switch token.fill {
-        case .none: nil
-        case .branchNew: isDark ? 0.22 : 0.14
-        case .branch: isDark ? 0.10 : 0.06
-        case .discussion: 0.20
-        }
-        if let fillAlpha {
-            let color: UIColor = token.fill == .discussion ? .systemBlue : .systemPurple
-            let stacked: CGFloat = token.isStacked ? 0.04 : 0
-            attributes[.backgroundColor] = color.withAlphaComponent(min(1, (fillAlpha + stacked) * contrast))
-        }
-
-        let underlineAlpha: CGFloat
-        if token.isInert {
-            underlineAlpha = 0.35
-        } else if contrast > 1 {
-            underlineAlpha = 1
-        } else if token.underlineHue == .discussion {
-            underlineAlpha = 0.65
-        } else if token.underlinePattern == .dashed {
-            underlineAlpha = 0.6
-        } else {
-            underlineAlpha = token.isUnderlineStrong ? 0.8 : 0.45
-        }
-        var style: NSUnderlineStyle = token.isStacked && !token.isInert ? .double : .single
-        if token.underlinePattern == .dashed, !token.isInert { style.insert(.patternDash) }
-        attributes[.underlineStyle] = style.rawValue
-        attributes[.underlineColor] = hue.withAlphaComponent(underlineAlpha)
-        return attributes
     }
 
     func sizeThatFits(
@@ -856,24 +813,7 @@ struct RichTextBlockEditor: UIViewRepresentable {
         }
 
         private func characterIndex(at point: CGPoint, in textView: UITextView) -> Int? {
-            guard textView.textStorage.length > 0 else { return nil }
-            let containerPoint = CGPoint(
-                x: point.x - textView.textContainerInset.left,
-                y: point.y - textView.textContainerInset.top
-            )
-            let glyphIndex = textView.layoutManager.glyphIndex(
-                for: containerPoint,
-                in: textView.textContainer
-            )
-            guard glyphIndex < textView.layoutManager.numberOfGlyphs else { return nil }
-            let glyphRect = textView.layoutManager.boundingRect(
-                forGlyphRange: NSRange(location: glyphIndex, length: 1),
-                in: textView.textContainer
-            )
-            guard glyphRect.insetBy(dx: -6, dy: -6).contains(containerPoint) else { return nil }
-            let characterIndex = textView.layoutManager.characterIndexForGlyph(at: glyphIndex)
-            guard characterIndex < textView.textStorage.length else { return nil }
-            return characterIndex
+            textView.nbeCharacterIndex(at: point)
         }
 
         func gestureRecognizer(
@@ -1323,6 +1263,50 @@ enum RichTextCodec {
             )
         }
         return output
+    }
+
+    /// Colors for one annotation run. The ID marks the run as annotated; taps
+    /// read the covering annotations from their ranges, not from this key.
+    /// The reading flow draws its runs the same way.
+    static func annotationAttributes(
+        for run: NativeBlockEditorAnnotationComposer.Run,
+        traits: UITraitCollection
+    ) -> [NSAttributedString.Key: Any] {
+        let token = run.token
+        let isDark = traits.userInterfaceStyle == .dark
+        let contrast: CGFloat = traits.accessibilityContrast == .high ? 1.5 : 1
+        let hue: UIColor = token.underlineHue == .branch ? .systemPurple : .systemBlue
+        var attributes: [NSAttributedString.Key: Any] = [annotationIDKey: run.primaryID]
+
+        let fillAlpha: CGFloat? = switch token.fill {
+        case .none: nil
+        case .branchNew: isDark ? 0.22 : 0.14
+        case .branch: isDark ? 0.10 : 0.06
+        case .discussion: 0.20
+        }
+        if let fillAlpha {
+            let color: UIColor = token.fill == .discussion ? .systemBlue : .systemPurple
+            let stacked: CGFloat = token.isStacked ? 0.04 : 0
+            attributes[.backgroundColor] = color.withAlphaComponent(min(1, (fillAlpha + stacked) * contrast))
+        }
+
+        let underlineAlpha: CGFloat
+        if token.isInert {
+            underlineAlpha = 0.35
+        } else if contrast > 1 {
+            underlineAlpha = 1
+        } else if token.underlineHue == .discussion {
+            underlineAlpha = 0.65
+        } else if token.underlinePattern == .dashed {
+            underlineAlpha = 0.6
+        } else {
+            underlineAlpha = token.isUnderlineStrong ? 0.8 : 0.45
+        }
+        var style: NSUnderlineStyle = token.isStacked && !token.isInert ? .double : .single
+        if token.underlinePattern == .dashed, !token.isInert { style.insert(.patternDash) }
+        attributes[.underlineStyle] = style.rawValue
+        attributes[.underlineColor] = hue.withAlphaComponent(underlineAlpha)
+        return attributes
     }
 
     static func delta(from attributed: NSAttributedString) -> TextDelta {

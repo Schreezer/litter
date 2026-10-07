@@ -235,7 +235,16 @@ struct CourseExplorationRequest: Equatable, Sendable {
     private static func clipped(_ text: String, limit: Int = titleLimit) -> String {
         let singleLine = text.split(whereSeparator: \.isNewline).joined(separator: " ")
         guard singleLine.count > limit else { return singleLine }
-        return String(singleLine.prefix(limit - 1)).trimmingCharacters(in: .whitespaces) + "…"
+        var kept = singleLine.prefix(limit - 1)
+        // End on a whole word unless that would throw away most of the text.
+        if singleLine[kept.endIndex] != " ", let space = kept.lastIndex(of: " "),
+           kept.distance(from: kept.startIndex, to: space) > limit / 2 {
+            kept = kept[..<space]
+        }
+        while let last = kept.last, last == " " || last == "," || last == ";" || last == ":" {
+            kept = kept.dropLast()
+        }
+        return kept + "…"
     }
 }
 
@@ -247,6 +256,8 @@ struct CourseExplorationAnchor: Codable, Equatable, Sendable {
     var rangeLocation: Int
     var rangeLength: Int
     var selectedText: String
+    /// Each block's part when the passage spans several blocks.
+    var segments: [CourseTextSegment]?
 
     private enum CodingKeys: String, CodingKey {
         case blockID = "block_id"
@@ -254,6 +265,7 @@ struct CourseExplorationAnchor: Codable, Equatable, Sendable {
         case rangeLocation = "location"
         case rangeLength = "length"
         case selectedText = "text"
+        case segments
     }
 
     /// Page properties hold strings, so the anchor travels as compact JSON.
@@ -263,12 +275,20 @@ struct CourseExplorationAnchor: Codable, Equatable, Sendable {
         return (try? encoder.encode(self)).map { String(decoding: $0, as: UTF8.self) }
     }
 
-    init(blockID: String?, pathIndices: [Int], rangeLocation: Int, rangeLength: Int, selectedText: String) {
+    init(
+        blockID: String?,
+        pathIndices: [Int],
+        rangeLocation: Int,
+        rangeLength: Int,
+        selectedText: String,
+        segments: [CourseTextSegment]? = nil
+    ) {
         self.blockID = blockID
         self.pathIndices = pathIndices
         self.rangeLocation = rangeLocation
         self.rangeLength = rangeLength
         self.selectedText = selectedText
+        self.segments = segments
     }
 
     init?(propertyValue: String?) {

@@ -37,3 +37,17 @@ These ChatGPT conversations contain the generated images. Click the gallery thum
 Generated image files have not been downloaded into this folder. The Saved for Someday draft has not been image-generated. Account names are suggestions with unchecked handle availability; this work has not created TikTok accounts or published posts.
 
 Moved from `docs/marketing/` on 2026-09-07. Product-source links in the scripts index have been updated for this location.
+
+## Launch film
+
+[Follow the question](videos/learnfold-follow-the-question/README.md), completed 2026-10-06: a 40-second Learnfold launch film with native iOS simulator footage, kinetic typography, and a generated Flow Music score. Includes a [1920×1080 master](videos/learnfold-follow-the-question/renders/learnfold-launch-1080p.mp4), a [1080×1920 vertical version](videos/learnfold-follow-the-question/vertical/renders/learnfold-launch-vertical.mp4), and an [export contact sheet](videos/learnfold-follow-the-question/renders/export-master-sheet.jpg).
+
+The editable project and exports live on the Codex Storage external volume, linked from this directory. Simulator content and AI responses use the existing deterministic demo fixture; capture provenance and validation are recorded in the project. No publication is implied.
+
+### Opus-style launch recreation — 2026-10-06
+
+[Every lesson has a door — editable recreation](videos/learnfold-doors-recreated/README.md), a faithful 45-second source-based recreation using the original simulator takes, Flow Music arrangement and 3D rig, with native ready-state pixels and improved copy framing.
+
+### Down the rabbit hole — 2026-10-06
+
+[Product-led launch film](videos/learnfold-curiosity-to-course/README.md): 72 seconds of actual native Learnfold UI, following one question through an interactive lesson, native quiz and feedback, deeper explorations, a personal question, a pinned goal, the connected course map, and resume. Includes an [18 MB 1080p60 delivery](videos/learnfold-curiosity-to-course/renders/learnfold-rabbit-hole-1080p.mp4), full master, editable HyperFrames source, captured takes and provenance. Uses prepared demo content and deterministic exploration responses; no live course-generation claim.

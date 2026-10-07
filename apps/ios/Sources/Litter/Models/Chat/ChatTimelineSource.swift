@@ -34,4 +34,11 @@ protocol ChatTimelineSource: AnyObject {
 
     /// Answers a question row.
     func answer(_ answer: ChatQuestionAnswer)
+
+    /// Makes the next update a full `.snapshot` of the current state.
+    func resync()
+}
+
+extension ChatTimelineSource {
+    func resync() {}
 }

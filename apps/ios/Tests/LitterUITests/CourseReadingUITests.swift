@@ -214,6 +214,13 @@ final class CourseReadingUITests: XCTestCase {
                 .matching(NSPredicate(format: "label == %@", "Round 1: prover sends a commitment."))
                 .firstMatch.exists
         )
+        // Reading lays the visualization inside the page's text; the next
+        // heading must start below it, not under it.
+        let firstHeading = app.staticTexts.matching(NSPredicate(
+            format: "identifier BEGINSWITH 'native-editor-block-' AND value == %@", "Idea 1"
+        )).firstMatch
+        XCTAssertTrue(firstHeading.waitForExistence(timeout: 10), app.debugDescription)
+        XCTAssertGreaterThanOrEqual(firstHeading.frame.minY, webView.frame.maxY - 1, app.debugDescription)
         capture("Interactive visualization initial state", app)
 
         advance.tap()

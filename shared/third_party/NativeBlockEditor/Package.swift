@@ -47,5 +47,9 @@ let package = Package(
             name: "NativeEditorMCPTests",
             dependencies: ["NativeBlockEditorCore", "NativeEditorMCP"]
         ),
+        .testTarget(
+            name: "NativeBlockEditorUITests",
+            dependencies: ["NativeBlockEditorEngine", "NativeBlockEditorUI"]
+        ),
     ]
 )

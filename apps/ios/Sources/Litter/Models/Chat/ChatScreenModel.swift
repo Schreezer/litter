@@ -119,6 +119,8 @@ final class ChatScreenModel {
     @ObservationIgnored private var rows: [ChatTimelineRow] = []
     @ObservationIgnored private var buffers: [String: LiveTextBuffer] = [:]
     @ObservationIgnored private var updatesTask: Task<Void, Never>?
+    /// Between `start()` and `tearDown()`: the screen wants updates.
+    @ObservationIgnored private var isStarted = false
     /// Updates at or below this sequence number predate the applied snapshot.
     @ObservationIgnored private var snapshotSeq: UInt64?
     @ObservationIgnored private var previewCount = 0
@@ -136,6 +138,7 @@ final class ChatScreenModel {
     /// Starts consuming the source. Safe to call more than once.
     func start() {
         guard updatesTask == nil, let source else { return }
+        isStarted = true
         let stream = source.updates()
         updatesTask = Task { [weak self] in
             for await update in stream {
@@ -145,12 +148,30 @@ final class ChatScreenModel {
                 guard !Task.isCancelled, let self else { return }
                 self.apply(update)
             }
+            // The stream ended on its own. Forget it so the next `start()` or
+            // `resync()` subscribes again instead of leaving the screen on
+            // its last update.
+            guard !Task.isCancelled else { return }
+            self?.updatesTask = nil
+        }
+    }
+
+    /// Brings the screen up to date with the source: a full snapshot from a
+    /// live subscription, or a new subscription if the last one ended.
+    /// Missed updates of any kind are repaired by this.
+    func resync() {
+        guard isStarted, let source else { return }
+        if updatesTask == nil {
+            start()
+        } else {
+            source.resync()
         }
     }
 
     /// Stops consuming the source and releases every streaming renderer this
     /// screen created.
     func tearDown() {
+        isStarted = false
         updatesTask?.cancel()
         updatesTask = nil
         snapshotSeq = nil
@@ -356,6 +377,10 @@ final class ChatScreenModel {
                 // The sent message is staged before its turn starts; it owns
                 // the reserve the preview had.
                 live = stagedPreviewID
+            } else if let newUserID, !previousUserIDs.isEmpty {
+                // A resync found a turn the screen missed; it is the newest,
+                // as it would have been had its rows arrived as diffs.
+                live = newUserID
             } else if let current = live, !turns.contains(where: { $0.id == current }) {
                 live = nil
             }

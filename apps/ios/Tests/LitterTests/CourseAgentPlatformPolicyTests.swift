@@ -1,5 +1,8 @@
 import XCTest
 @testable import Litter
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 final class CourseAgentPlatformPolicyTests: XCTestCase {
     func testDirectDistributionMacPrefersInstalledCodexOverHostedAndApple() {
@@ -128,4 +131,39 @@ final class CourseAgentPlatformPolicyTests: XCTestCase {
             CourseAgentOption(id: CourseAgentProvider.codex, title: "Codex", available: true),
         ]
     }
+
+#if canImport(FoundationModels)
+    /// Runs the real on-device model. Set TEST_RUNNER_LEARNFOLD_RUN_APPLE_LIVE=1.
+    @MainActor
+    func testAppleOnDeviceReadsASelectedImageWhenItHasVision() async throws {
+        guard ProcessInfo.processInfo.environment["LEARNFOLD_RUN_APPLE_LIVE"] == "1" else {
+            throw XCTSkip("Live Apple model runs are opt-in.")
+        }
+        guard #available(iOS 27.0, *) else { throw XCTSkip("Image prompts need iOS 27.") }
+        let model = SystemLanguageModel.default
+        let hasVision = model.capabilities.contains(.vision)
+        print("APPLE-LIVE|on-device available=\(model.isAvailable) vision=\(hasVision)")
+        let png = UIGraphicsImageRenderer(size: CGSize(width: 64, height: 64)).pngData { context in
+            UIColor.systemRed.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID()).png")
+        try png.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let prompt = SystemAppleCourseAgentRuntime.prompt(
+            "What single color fills the attached image? Answer with one word.",
+            images: [url],
+            model: model
+        )
+        guard hasVision else {
+            XCTAssertNil(prompt, "A model without vision gets the text prompt alone.")
+            throw XCTSkip("This Mac's on-device model reports no vision.")
+        }
+        let session = LanguageModelSession(model: model)
+        let response = try await session.respond(to: try XCTUnwrap(prompt))
+        print("APPLE-LIVE|on-device image answer=\(response.content)")
+        XCTAssertTrue(response.content.lowercased().contains("red"), response.content)
+    }
+#endif
 }
