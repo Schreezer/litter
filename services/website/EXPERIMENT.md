@@ -4,22 +4,22 @@ The September 18, 2026 test (v3) compares a product-literal headline with a scro
 
 | | A: Product-literal | B: Less scrolling |
 |---|---|---|
-| Headline | Turn any question into a course. | Less scrolling. More understanding. |
-| Motivation | Bring a question, link, or document; the course grows as you ask. | Give something you would scroll past the time to become understanding. |
-| Product | A course that grows through questions and linked pages. | The same course behavior. |
+| Headline | Turn anything into a course. | Less scrolling. More understanding. |
+| Motivation | Bring a question, link, or PDF; every lesson ends with a way to go deeper. | Give something you would scroll past the time to become understanding. |
+| Product | A course that grows through questions, explorations, and checks. | The same course behavior. |
 
 Only the marked copy changes (hero headline, lede and focus line; the mid-page "why" card; the closing card). Layout, demo examples, navigation, waitlist form, consent and CTA destinations remain shared. This tests the overall copy direction; it cannot isolate the effect of one sentence.
 
 ## Measurement
 
-- Eligible browsers are assigned 50/50 with Web Crypto. An HttpOnly, first-party cookie keeps the assignment for 30 days. Cross-device visits and cleared cookies count as different browsers.
+- Eligible browsers are assigned 50/50 with Web Crypto. Two HttpOnly, first-party cookies, a random token and the assigned copy, keep the assignment for 30 days. Return visits with both cookies skip the database. A new assignment is written while the page streams; the document finishes only after the row is saved, so measurement events cannot arrive before it. Cross-device visits and cleared cookies count as different browsers.
 - The primary metric is unique browsers completing a new waitlist signup divided by unique exposed browsers. A conversion is recorded in the same transaction as the new email entry. Duplicate emails never produce another conversion. This measures saved signups, not verified mailbox ownership, installs or active learners.
 - Exposure is recorded when the document is visible. A click also confirms exposure so network ordering cannot produce a numerator without a denominator.
 - The secondary metric is unique browsers choosing a question in the interactive demo. Merely scrolling to the demo does not count.
 - Repeat events are deduplicated in D1. Unknown events, other origins, forced previews, known bot user agents, prefetches, DNT and GPC headers are excluded. This is basic bot filtering, not proof that every remaining visit is human.
 - Only the configured production hostname measures traffic. Cloudflare deployment aliases remain untracked. Use the normal root URL for campaigns; forced-variant preview links are never measurement links.
 - Experiment records store a hashed random token, assigned copy, and event timestamps. The separate waitlist table stores email, consent version and signup attribution. Analytics never receives emails, IP addresses, full referrers, user agents, or browsing histories. Infrastructure providers still process request metadata as described in the privacy policy.
-- Assignment failure serves A without counting the request. Measurement failure does not block navigation. Disabled JavaScript or blocked measurement requests can cause undercounting.
+- Assignment failure before streaming serves A without counting the request. If saving a new assignment fails after the page has started streaming, the visitor keeps the assigned copy but no event or signup is attributed to it. Measurement failure does not block navigation. Disabled JavaScript or blocked measurement requests can cause undercounting.
 - Records are excluded from reporting after 90 days and pruned during later site use. Save a report when ending the test.
 
 ## Preview

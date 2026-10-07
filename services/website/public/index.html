@@ -3,15 +3,19 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Learnfold | Turn any question into a course</title>
-  <meta name="description" content="Paste a link, a PDF, or a thought. Learnfold builds a short course on your iPhone. Ask questions as you read, and keep the answers that deserve a place in it.">
+  <meta name="color-scheme" content="light dark">
+  <script>(function(){var d=document.documentElement;d.classList.add('js');try{var t=localStorage.getItem('lf-theme');if(t==='light'||t==='dark')d.setAttribute('data-theme',t)}catch(e){}})()</script>
+  <title>Learnfold | Turn anything into a course</title>
+  <meta name="description" content="Bring a question, a link, or a PDF. Learnfold builds a course on your iPhone, then lets you go deeper, sideways, or zoom out from any lesson, check what you understood, and pick up where you left off.">
   <meta name="theme-color" content="#000000">
-  <meta property="og:title" content="Learnfold | Turn any question into a course">
-  <meta property="og:description" content="Paste a link, a PDF, or a thought. Learnfold builds a short course on your iPhone. Ask questions as you read, and keep the answers that deserve a place in it.">
+  <meta property="og:title" content="Learnfold | Turn anything into a course">
+  <meta property="og:description" content="Bring a question, a link, or a PDF. Learnfold builds a course you can explore, question, and build on.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://learnfold.pages.dev/">
   <link rel="canonical" href="https://learnfold.pages.dev/">
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/favicon.png" type="image/png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="preload" as="image" href="/assets/app/interactive.webp" imagesrcset="/assets/app/interactive-400.webp 400w, /assets/app/interactive.webp 603w" imagesizes="(max-width: 620px) 62vw, (max-width: 900px) 300px, 340px" type="image/webp" fetchpriority="high">
   <link rel="stylesheet" href="/landing.css">
   <script src="/landing.js" defer></script>
   <script src="/experiment.js" defer></script>
@@ -21,68 +25,110 @@
   <a class="skip-link" href="#top">Skip to content</a>
   <header class="site-header">
     <div class="shell nav-shell">
-      <a class="brand" href="#top" aria-label="Learnfold home"><img src="/brand_logo.svg" alt="" width="30" height="30"><span>Learnfold</span></a>
-      <button id="menu-toggle" class="menu-toggle" type="button" aria-label="Toggle navigation" aria-controls="site-nav" aria-expanded="false" hidden><span></span><span></span></button>
-      <nav id="site-nav" class="site-nav" aria-label="Primary navigation">
-        <a href="#how">How it works</a>
-        <a href="#try">Try it</a>
-        <a href="#faq">FAQ</a>
-        <a class="nav-cta" data-early-access href="#waitlist">Join the waitlist</a>
-      </nav>
+      <a class="brand" href="#top" aria-label="Learnfold home"><img src="/brand-mark.png" alt="" width="32" height="32"><span>Learnfold</span></a>
+      <div class="nav-tools">
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation">
+          <a href="#how">How it works</a>
+          <a href="#explore">Explore</a>
+          <a href="#agents">AI choices</a>
+          <a href="#faq">FAQ</a>
+          <a class="nav-cta" data-early-access href="#waitlist">Join the waitlist</a>
+        </nav>
+        <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Switch to dark mode">
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"/></svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        </button>
+        <button id="menu-toggle" class="menu-toggle" type="button" aria-label="Toggle navigation" aria-controls="site-nav" aria-expanded="false" hidden><span></span><span></span></button>
+      </div>
     </div>
   </header>
   <main id="top">
-    <section class="hero shell" aria-labelledby="hero-title">
-      <div class="hero-copy">
-        <p class="status-line"><span class="status-pulse" aria-hidden="true"></span><span>iOS beta</span><span aria-hidden="true">·</span><span>Waitlist open</span></p>
-        <h1 id="hero-title" data-copy="headline">Turn any question into <em>a course.</em></h1>
-        <p class="hero-lede" data-copy="introduction">Paste a link, a PDF, or a half-formed thought. Learnfold builds a short course on your iPhone. Ask questions as you read, and the answers that deserve a place in the course can get one.</p>
-        <div class="hero-actions">
-          <a class="button button-primary" data-early-access href="#waitlist">Join the waitlist</a>
-          <a class="text-link" href="#how">See how it works ↓</a>
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="shell hero-grid">
+        <div class="hero-copy">
+          <p class="status-line"><span class="status-pulse" aria-hidden="true"></span><span>iOS beta</span><span aria-hidden="true">·</span><span>Waitlist open</span></p>
+          <h1 id="hero-title" data-copy="headline">Turn anything into <em>a course.</em></h1>
+          <p class="hero-lede" data-copy="introduction">Bring a question, a link, or a PDF. Learnfold builds a course on your iPhone. Every lesson ends with a way to go deeper, so the course follows your curiosity instead of a fixed syllabus.</p>
+          <div class="hero-actions">
+            <a class="button button-primary" data-early-access href="#waitlist">Join the waitlist <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></a>
+            <a class="text-link" href="#how">See how it works ↓</a>
+          </div>
+          <p class="focus-line" data-copy="invitation">Your sources. Your questions. One course you can come back to.</p>
         </div>
-        <p class="focus-line" data-copy="invitation">Your sources. Your questions. One course you can come back to.</p>
-      </div>
-      <div class="hero-stage" aria-label="Screens from the Learnfold iOS app">
-        <figure class="device-shot device-shot-main">
-          <img src="/assets/app/learning-path.png" width="402" height="874" alt="Learnfold course overview showing a three-chapter learning path and a Start course button" fetchpriority="high">
-          <figcaption>Learning path</figcaption>
-        </figure>
-        <figure class="device-shot device-shot-side">
-          <img src="/assets/app/lesson-page.png" width="402" height="874" alt="A Learnfold lesson page with reading and an Ask AI button" loading="lazy">
-        </figure>
+        <div class="hero-stage" aria-label="Screens from the Learnfold iOS app">
+          <figure class="phone phone-back">
+            <img src="/assets/app/trail-map.webp" srcset="/assets/app/trail-map-400.webp 400w, /assets/app/trail-map.webp 603w" sizes="(max-width: 620px) 52vw, (max-width: 900px) 260px, 300px" width="603" height="1311" decoding="async" alt="Course map showing side trails branching off a lesson, with the current page marked You are here">
+          </figure>
+          <figure class="phone phone-front">
+            <img src="/assets/app/interactive.webp" srcset="/assets/app/interactive-400.webp 400w, /assets/app/interactive.webp 603w" sizes="(max-width: 620px) 62vw, (max-width: 900px) 300px, 340px" width="603" height="1311" decoding="async" alt="A lesson called What bees see with an interactive flower that switches between the human view and the ultraviolet pattern" fetchpriority="high">
+          </figure>
+          <span class="hero-tag hero-tag-a" aria-hidden="true"><i>↘</i>Go deeper</span>
+          <span class="hero-tag hero-tag-b" aria-hidden="true"><i>▶</i>Continue exploring</span>
+        </div>
       </div>
     </section>
 
-    <section id="how" class="steps-section shell" aria-labelledby="how-title">
-      <div class="section-intro">
+    <section id="how" class="section shell" aria-labelledby="how-title">
+      <div class="section-intro" data-reveal>
         <p class="eyebrow">How it works</p>
-        <h2 id="how-title">From a question to a course in four steps.</h2>
+        <h2 id="how-title">From one question to a course you can shape.</h2>
         <p>You stay in charge at every step. Learnfold does the building.</p>
       </div>
       <div class="step-grid">
-        <article class="step-card">
-          <div class="step-frame"><img src="/assets/app/source-prompt.png" width="402" height="874" alt="New Course screen with a sourdough reference link and a prompt asking for a short three-lesson course" loading="lazy"></div>
-          <div class="step-copy"><p class="step-label">01 · Start anywhere</p><h3>A question is enough.</h3><p>Type what you want to understand. Add a link or a document if you have one, and Learnfold builds from it.</p></div>
+        <article class="step-card" data-reveal>
+          <div class="step-frame"><figure class="phone phone-sm"><img src="/assets/app/ask.webp" srcset="/assets/app/ask-400.webp 400w, /assets/app/ask.webp 603w" sizes="(max-width: 620px) calc(100vw - 96px), (max-width: 1080px) 42vw, 240px" width="603" height="1311" decoding="async" alt="New Course screen with the question What do bees see that I can't? typed in" loading="lazy"></figure></div>
+          <div class="step-copy"><p class="step-label">01 · Start anywhere</p><h3>Ask, paste, or attach.</h3><p>A question is enough. Add a link or a PDF if you have one. You see the plan, and approve it, before anything is written.</p></div>
         </article>
-        <article class="step-card">
-          <div class="step-frame"><img src="/assets/app/course-brief-review.png" width="1206" height="2622" alt="Course Draft review showing the planned outcome, starting point, focus gap, and estimated time" loading="lazy"></div>
-          <div class="step-copy"><p class="step-label">02 · Review the plan</p><h3>Approve the course before it is built.</h3><p>See the outcome, the assumed starting point, and the time it will take. Nothing gets built until you say so.</p></div>
+        <article class="step-card" data-reveal>
+          <div class="step-frame"><figure class="phone phone-sm"><img src="/assets/app/course-path.webp" srcset="/assets/app/course-path-400.webp 400w, /assets/app/course-path.webp 603w" sizes="(max-width: 620px) calc(100vw - 96px), (max-width: 1080px) 42vw, 240px" width="603" height="1311" decoding="async" alt="Course overview for Senses You Don't Have, with a learning path, an Up next lesson, and a Continue course button" loading="lazy"></figure></div>
+          <div class="step-copy"><p class="step-label">02 · Get a path</p><h3>A course, written as you go.</h3><p>Chapters appear on a learning path. Lessons are written section by section, so you can start reading while the rest is still on its way.</p></div>
         </article>
-        <article class="step-card">
-          <div class="step-frame"><img src="/assets/app/lesson-page.png" width="402" height="874" alt="Native Learnfold lesson page with reading, a short exercise, and an Ask AI action" loading="lazy"></div>
-          <div class="step-copy"><p class="step-label">03 · Read in pages</p><h3>Learn in short native pages.</h3><p>Lessons and small exercises, with a course map for jumping around and a Continue button for picking up where you stopped.</p></div>
+        <article class="step-card" data-reveal>
+          <div class="step-frame"><figure class="phone phone-sm"><img src="/assets/app/interactive.webp" srcset="/assets/app/interactive-400.webp 400w, /assets/app/interactive.webp 603w" sizes="(max-width: 620px) calc(100vw - 96px), (max-width: 1080px) 42vw, 240px" width="603" height="1311" decoding="async" alt="A lesson with an interactive flower comparing what humans and bees see" loading="lazy"></figure></div>
+          <div class="step-copy"><p class="step-label">03 · Read and play</p><h3>Lessons you can touch.</h3><p>Short native pages, with interactive visuals where a picture explains it better than a paragraph.</p></div>
         </article>
-        <article class="step-card">
-          <div class="step-frame"><img src="/assets/app/ask-ai.png" width="402" height="874" alt="Ask AI sheet showing the current lesson page attached as context" loading="lazy"></div>
-          <div class="step-copy"><p class="step-label">04 · Ask as you go</p><h3>Ask from the page you are on.</h3><p>The page travels with your question, so the answer starts from what is in front of you instead of from scratch.</p></div>
+        <article class="step-card" data-reveal>
+          <div class="step-frame"><figure class="phone phone-sm"><img src="/assets/app/check.webp" srcset="/assets/app/check-400.webp 400w, /assets/app/check.webp 603w" sizes="(max-width: 620px) calc(100vw - 96px), (max-width: 1080px) 42vw, 240px" width="603" height="1311" decoding="async" alt="Test your understanding card with a multiple-choice question about ultraviolet and Well understood feedback" loading="lazy"></figure></div>
+          <div class="step-copy"><p class="step-label">04 · Check yourself</p><h3>Find out what stuck.</h3><p>Optional checks at the end of a page: multiple choice, a written answer, or a guided discussion, with feedback on what you got right.</p></div>
         </article>
       </div>
-      <p class="proof-note">Screens from the current iOS build with example course content. Learnfold uses AI to write explanations, so check anything important against a reliable source.</p>
+      <p class="proof-note">Screens from the current iOS build with an example course. Learnfold uses AI to write explanations, so check anything important against a reliable source.</p>
     </section>
 
-    <section class="why-section shell" aria-labelledby="why-title">
-      <div class="why-card">
+    <section id="explore" class="section explore-section" aria-labelledby="explore-title">
+      <div class="shell">
+        <div class="explore-lead">
+          <div class="section-intro" data-reveal>
+            <p class="eyebrow">New · Open-ended exploration</p>
+            <h2 id="explore-title">Every lesson has a door.</h2>
+            <p>Most courses are a straight line. In Learnfold, the end of every page asks where you want to go next, and the course grows in that direction.</p>
+          </div>
+          <ul class="door-list" data-reveal>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 9v9H9"/></svg><strong>Go deeper</strong><span>The mechanism or detail this page only touched on.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h15M15 4l4 4-4 4M20 16H5M9 12l-4 4 4 4"/></svg><strong>Go sideways</strong><span>A neighboring or contrasting idea that sheds new light.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4l-7 7M10 20H4v-6M4 20l7-7"/></svg><strong>Zoom out</strong><span>The bigger picture this fits into, and why it matters.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg><strong>Or your own question</strong><span>Type it, or select a passage and ask Why? How? or for an example.</span></li>
+          </ul>
+        </div>
+        <div class="explore-grid">
+          <article class="explore-card" data-reveal>
+            <div class="shot"><figure class="phone phone-sm"><img src="/assets/app/where-next.webp" srcset="/assets/app/where-next-400.webp 400w, /assets/app/where-next.webp 603w" sizes="(max-width: 900px) min(440px, calc(100vw - 104px)), 300px" width="603" height="1311" decoding="async" alt="The end of a lesson with a Where next? section offering Go deeper, Go sideways, Zoom out, and your own question" loading="lazy"></figure></div>
+            <div class="explore-copy"><h3>Choose the next page.</h3><p>Pick a door and Learnfold writes that page for you, linked to the lesson it came from.</p></div>
+          </article>
+          <article class="explore-card" data-reveal>
+            <div class="shot show-bottom"><figure class="phone phone-sm"><img src="/assets/app/lesson-writing.webp" srcset="/assets/app/lesson-writing-400.webp 400w, /assets/app/lesson-writing.webp 603w" sizes="(max-width: 900px) min(440px, calc(100vw - 104px)), 300px" width="603" height="1311" decoding="async" alt="A lesson with a small banner saying a new trail is still being written, with an Open button" loading="lazy"></figure></div>
+            <div class="explore-copy"><h3>Keep reading while it writes.</h3><p>New pages are written in the background. A small banner tells you when one is ready, so you never wait on a spinner.</p></div>
+          </article>
+          <article class="explore-card" data-reveal>
+            <div class="shot"><figure class="phone phone-sm"><img src="/assets/app/goals.webp" srcset="/assets/app/goals-400.webp 400w, /assets/app/goals.webp 603w" sizes="(max-width: 900px) min(440px, calc(100vw - 104px)), 300px" width="603" height="1311" decoding="async" alt="Course screen with Your goals, Open threads, and a Tie it together button above the learning path" loading="lazy"></figure></div>
+            <div class="explore-copy"><h3>Never lose the thread.</h3><p>Side trails branch off the map with a “You are here” marker. Pin a page as a goal, see open threads, or tie them together in one page.</p></div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="shell" aria-labelledby="why-title">
+      <div class="why-card" data-reveal>
         <div>
           <p class="eyebrow" data-copy="whyEyebrow">Ask mid-lesson</p>
           <h2 id="why-title" data-copy="whyHeadline">The question you did not see coming is the point.</h2>
@@ -91,32 +137,32 @@
       </div>
     </section>
 
-    <section id="try" class="demo-section" aria-labelledby="try-title">
+    <section id="try" class="section" aria-labelledby="try-title">
       <div class="shell demo-grid">
-        <div class="demo-copy">
+        <div class="demo-copy" data-reveal>
           <p class="eyebrow">Try it here</p>
           <h2 id="try-title">One question leads to another.</h2>
-          <p>Read a short page, tap one of the questions it leaves you with, and watch the answer become a new page in the course. Then follow the next one.</p>
+          <p>Read a short page, pick where to go next, and watch the answer become a new page in the course. Then follow the next one.</p>
           <div id="topic-picker" class="signal-tabs" role="group" aria-label="Choose an example course" hidden>
             <button class="signal-tab active" type="button" data-topic="sound" aria-pressed="true">Sound &amp; music</button>
             <button class="signal-tab" type="button" data-topic="space" aria-pressed="false">Space &amp; starlight</button>
             <button class="signal-tab" type="button" data-topic="bread" aria-pressed="false">The science of bread</button>
           </div>
-          <p class="demo-disclaimer">A prewritten example. In the app, each lesson ends with a few questions to keep going, and you can always type your own.</p>
+          <p class="demo-disclaimer">A prewritten example. In the app, pages are written for you, and you can always type your own question.</p>
         </div>
-        <div class="branch-demo">
+        <div class="branch-demo" data-reveal>
           <div class="receipt-top"><span id="demo-course">Sound &amp; music</span><span class="receipt-status">Example</span></div>
           <div class="branch-demo-body">
             <nav class="course-tree" aria-label="Pages in this example">
-              <p class="rail-label">Your course</p>
+              <p class="rail-label">Your trail</p>
               <ol id="demo-tree"><li><span>What makes a sound?</span></li></ol>
             </nav>
             <div class="branch-reader">
               <p id="demo-breadcrumb" class="reader-breadcrumb">Sound &amp; music</p>
               <h3 id="demo-title" tabindex="-1">Same note. Different sound.</h3>
               <p id="demo-body">A piano and a guitar can play the same note, yet sound different. Part of that difference comes from the mix of harmonics in each sound.</p>
-              <div id="demo-questions" class="question-choices" role="group" aria-label="Choose a question to explore"></div>
-              <p id="demo-end" class="demo-end" hidden>That is one small branch. In Learnfold, you ask your own next question and keep going.</p>
+              <div id="demo-questions" class="question-choices" role="group" aria-label="Choose where to go next"></div>
+              <p id="demo-end" class="demo-end" hidden>That is one small branch. In Learnfold, you can go deeper, sideways, or zoom out from any page.</p>
               <button id="demo-back" class="reader-back" type="button" hidden>Back to the previous page</button>
               <noscript><p>In Learnfold, asking "What is a harmonic?" can open a new page, followed by a deeper look at how a string vibrates. Enable JavaScript to explore the example here.</p></noscript>
             </div>
@@ -126,45 +172,81 @@
       </div>
     </section>
 
-    <section class="features-section shell" aria-labelledby="features-title">
-      <div class="section-intro">
-        <p class="eyebrow">What you keep</p>
-        <h2 id="features-title">Every detour gets a place in the course.</h2>
+    <section class="section shell" aria-labelledby="features-title">
+      <div class="section-intro" data-reveal>
+        <p class="eyebrow">What you get</p>
+        <h2 id="features-title">A course that stays yours.</h2>
       </div>
       <div class="feature-grid">
-        <article class="feature-card">
-          <div class="feature-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h6l2 2h8v12H4z"/><path d="M8 13h8M8 16h5"/></svg></div>
-          <h3>Pages within pages</h3>
-          <p>Explore a concept in a subpage, then something inside that explanation. Nested pages and folders keep every branch findable.</p>
-        </article>
-        <article class="feature-card">
+        <article class="feature-card" data-reveal>
           <div class="feature-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9l-5 4z"/><path d="M8 9h8M8 12h5"/></svg></div>
-          <h3>Ask without leaving</h3>
-          <p>Ask with the whole page or just a selected passage as context. Get a quick answer in chat, or ask for a full explainer page inside the course.</p>
+          <h3>Ask about any passage</h3>
+          <p>Ask with the whole page or a selected sentence as context. Discussions are saved, so you can reopen one later and pick it back up.</p>
         </article>
-        <article class="feature-card">
-          <div class="feature-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h11l3 3v13H5z"/><path d="M9 4v5h6V4"/><circle cx="12" cy="15" r="2.2"/></svg></div>
-          <h3>Come back anytime</h3>
-          <p>Reopen an explanation, return to the lesson it came from, or continue where you left off. The detours you chose to keep are still there.</p>
+        <article class="feature-card" data-reveal>
+          <div class="feature-icon blue" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3 8-8"/><path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg></div>
+          <h3>Test your understanding</h3>
+          <p>Multiple choice, written answers, or a guided discussion. Get feedback, try again, or turn a wrong answer into a conversation.</p>
         </article>
-      </div>
-      <div class="subject-strip" aria-label="Things people bring to Learnfold">
-        <span>Why instruments sound different</span>
-        <span>How starlight is old light</span>
-        <span>What makes bread rise</span>
-        <span>A chapter from a textbook</span>
-        <span>That article you saved</span>
-        <span>Anything you have been wondering about</span>
+        <article class="feature-card" data-reveal>
+          <div class="feature-icon violet" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></div>
+          <h3>Edit any page</h3>
+          <p>Fix a sentence yourself, or ask the AI to rewrite a section. Every lesson and note is an editable page.</p>
+        </article>
+        <article class="feature-card" data-reveal>
+          <div class="feature-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg></div>
+          <h3>Bring your sources</h3>
+          <p>Paste a link, or attach a PDF, notes, or a document, and the course builds on what you brought.</p>
+          <div class="chip-row" aria-label="Supported sources"><span class="chip">Web links</span><span class="chip">PDFs</span><span class="chip">Notes &amp; text</span><span class="chip">Markdown</span></div>
+        </article>
+        <article class="feature-card span-2" data-reveal>
+          <div class="feature-icon green" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 1 0-1.4-8.8A6 6 0 0 0 4.5 12a3.5 3.5 0 0 0 1 7z"/></svg></div>
+          <h3>Pick up where you stopped</h3>
+          <p>Continue drops you back on the exact page, and the spot on it, where you left off. Courses and progress can sync across your devices through iCloud. A Mac version is on the way, with a reading workspace, an outline, and a side discussion.</p>
+        </article>
       </div>
     </section>
 
-    <section id="faq" class="faq-section shell" aria-labelledby="faq-title">
-      <div class="faq-heading"><p class="eyebrow">FAQ</p><h2 id="faq-title">A few answers first.</h2></div>
+    <section id="agents" class="section agent-section" aria-labelledby="agents-title">
+      <div class="shell">
+        <div class="section-intro" data-reveal>
+          <p class="eyebrow">Your course agent</p>
+          <h2 id="agents-title">Choose who writes your course.</h2>
+          <p>Start with the built-in option, or bring your own. You choose when you first open the app, and you can change it for each course.</p>
+        </div>
+        <div class="agent-grid">
+          <article class="agent-card" data-reveal>
+            <span class="agent-badge">Easiest</span>
+            <h3>Hosted</h3>
+            <p>Ready to use. No sign-in or API key needed.</p>
+          </article>
+          <article class="agent-card" data-reveal>
+            <span class="agent-badge">Private</span>
+            <h3>Apple Intelligence</h3>
+            <p>Build courses with Apple’s on-device model on supported iPhones, so the writing happens on your phone.</p>
+          </article>
+          <article class="agent-card" data-reveal>
+            <span class="agent-badge">Your key</span>
+            <h3>Codex</h3>
+            <p>Use your own OpenAI API key or a compatible endpoint. Course files stay in the app’s local workspace.</p>
+          </article>
+          <article class="agent-card" data-reveal>
+            <span class="agent-badge">Your server</span>
+            <h3>Hermes</h3>
+            <p>Connect an agent running on your own server and let it write the course.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="faq" class="section shell faq-section" aria-labelledby="faq-title">
+      <div class="faq-heading" data-reveal><p class="eyebrow">FAQ</p><h2 id="faq-title">A few answers first.</h2></div>
       <div class="faq-list">
-        <details><summary>What is Learnfold, in one line? <span aria-hidden="true">+</span></summary><p>An iOS app that turns a question, link, or document into a short course you can read, question, and expand.</p></details>
+        <details><summary>What is Learnfold, in one line? <span aria-hidden="true">+</span></summary><p>An iOS app that turns a question, link, or document into a course you can read, explore, check yourself on, and expand.</p></details>
         <details><summary>Do I need to bring my own material? <span aria-hidden="true">+</span></summary><p>No. A question is enough. Links and documents give the course something concrete to build from, but they are optional.</p></details>
-        <details><summary>Does every question create a new page? <span aria-hidden="true">+</span></summary><p>No. Quick questions get quick answers in chat. When an answer deserves more room, Learnfold can improve the lesson or give the idea a linked page of its own. It makes that call on its own, and you can override it either way: ask for a page, or ask it to keep the answer in chat.</p></details>
-        <details><summary>Can I get back to the original lesson? <span aria-hidden="true">+</span></summary><p>Yes. Every new page links to the lesson it came from, and the course map shows the whole structure. Continue reading wherever you stopped.</p></details>
+        <details><summary>Does it build the whole course at once? <span aria-hidden="true">+</span></summary><p>No. You approve a short plan first. Then lessons are written section by section, as you need them, and explorations are written in the background while you keep reading.</p></details>
+        <details><summary>Can I get back to the original lesson? <span aria-hidden="true">+</span></summary><p>Yes. Every explored page links back to where it came from, the course map shows each trail with a “You are here” marker, and Continue returns you to the route you were following.</p></details>
+        <details><summary>Which AI writes my course? <span aria-hidden="true">+</span></summary><p>Your choice. Hosted works with no setup, within daily usage limits. You can also use Apple Intelligence on supported devices, Codex with your own API key, or Hermes on your own server.</p></details>
         <details><summary>Can the explanations be wrong? <span aria-hidden="true">+</span></summary><p>Yes. Learnfold uses AI to write explanations, and AI makes mistakes. Treat it as a tutor rather than a textbook, and check important facts against a reliable source.</p></details>
         <details><summary>When can I use it? <span aria-hidden="true">+</span></summary><p>Learnfold is in beta on iOS. <a data-early-access href="#waitlist">Join the waitlist</a> and we will email you when a spot opens.</p></details>
       </div>
@@ -172,6 +254,7 @@
 
     <section id="waitlist" class="final-cta shell" aria-labelledby="waitlist-title">
       <div class="final-copy">
+        <img class="final-mark" src="/brand-mark.png" alt="" width="72" height="72">
         <p class="eyebrow" data-copy="closingEyebrow">There is always another question</p>
         <h2 id="waitlist-title" data-copy="closingHeadline">Bring the first one.</h2>
         <p data-copy="closingBody">Join the waitlist and we will email you when a spot opens on iOS.</p>
@@ -183,15 +266,15 @@
           <p id="waitlist-note" class="waitlist-note">We keep your email for early-access updates only. <a href="/privacy">Privacy policy</a></p>
           <p id="waitlist-status" class="waitlist-status" role="status" aria-live="polite" aria-atomic="true"></p>
         </form>
-        <noscript><p>Enable JavaScript to join the waitlist, or <a href="mailto:chirag@forgeme.xyz">email us about early access</a>.</p></noscript>
+        <noscript><p>Enable JavaScript to join the waitlist, or <a href="mailto:chirag@fitsnap.fun">email us about early access</a>.</p></noscript>
       </div>
     </section>
   </main>
   <footer class="site-footer">
     <div class="shell footer-grid">
-      <a class="brand" href="#top"><img src="/brand_logo.svg" alt="" width="30" height="30"><span>Learnfold</span></a>
+      <a class="brand" href="#top"><img src="/brand-mark.png" alt="" width="32" height="32"><span>Learnfold</span></a>
       <p>A course that grows with your questions.</p>
-      <div><a href="mailto:chirag@forgeme.xyz?subject=Learnfold%20early%20access">Contact</a><a href="/support">Support</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div>
+      <div><a href="mailto:chirag@fitsnap.fun?subject=Learnfold%20early%20access">Contact</a><a href="/support">Support</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div>
     </div>
   </footer>
 </body>

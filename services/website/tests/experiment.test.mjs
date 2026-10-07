@@ -37,7 +37,7 @@ function participant(cookie) {
 test('preview A keeps control copy; B changes framing and both keep real product facts', async () => {
     const a = await get('/?variant=a');
     const b = await get('/?variant=b');
-    assert.match(a.html, /Turn any question into <em>a course\.<\/em>/);
+    assert.match(a.html, /Turn anything into <em>a course\.<\/em>/);
     assert.match(b.html, /Less scrolling\. <em>More understanding\.<\/em>/);
     for (const result of [a,b]) {
         assert.equal(result.response.status, 200);
@@ -45,8 +45,8 @@ test('preview A keeps control copy; B changes framing and both keep real product
         assert.equal(result.response.headers.get('x-learnfold-experiment'), 'untracked');
         assert.match(result.response.headers.get('x-robots-tag'), /noindex/);
         assert.match(result.html, /data-experiment-active="false"/);
-        assert.match(result.html, /\/assets\/app\/learning-path\.png/);
-        assert.match(result.html, /The page travels with your question/);
+        assert.match(result.html, /\/assets\/app\/interactive\.webp/);
+        assert.match(result.html, /Every lesson has a door\./);
         assert.doesNotMatch(result.html, /happy users|testimonials|star rating|30,000|1000 unique/);
         assert.equal((result.html.match(/data-early-access/g) || []).length, 4);
     }
@@ -69,6 +69,14 @@ test('assignment is sticky and private; conditional requests still get complete 
     assert.equal(again.response.headers.get('x-learnfold-variant'), first.response.headers.get('x-learnfold-variant'));
     assert.equal(again.cookie, undefined);
     assert.equal(participant(first.cookie).exposed_at, null, 'HTML assignment alone is not a viewed exposure');
+    // The participant row exists once the document has finished streaming.
+    assert.equal(participant(first.cookie).variant, first.response.headers.get('x-learnfold-variant'));
+    // Return visits carrying the variant cookie keep their copy without another assignment.
+    const variantCookie = first.response.headers.get('set-cookie').match(/lf_copy_v3_variant=[ab]/)[0];
+    const remembered = await get('/', { Cookie: `${first.cookie}; ${variantCookie}` });
+    assert.equal(remembered.response.headers.get('x-learnfold-variant'), first.response.headers.get('x-learnfold-variant'));
+    assert.equal(remembered.cookie, undefined);
+    assert.match(remembered.html, /<style>/);
 });
 
 test('click before exposure, repeats, and demo events count once per participant', async () => {

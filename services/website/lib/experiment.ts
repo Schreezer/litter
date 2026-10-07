@@ -1,5 +1,6 @@
 export const EXPERIMENT = 'learning-motivation-waitlist-v3';
 export const COOKIE = 'lf_copy_v3';
+export const VARIANT_COOKIE = 'lf_copy_v3_variant';
 export const MAX_AGE = 30 * 24 * 60 * 60;
 export type Variant = 'a' | 'b';
 export type Participant = { variant: Variant; expires_at: number };
@@ -37,6 +38,12 @@ export function readToken(request: Request): string | null {
     const token = request.headers.get('Cookie')?.split(';')
         .map((part) => part.trim()).find((part) => part.startsWith(`${COOKIE}=`))?.slice(COOKIE.length + 1);
     return token && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(token) ? token : null;
+}
+
+export function readVariant(request: Request): Variant | null {
+    const value = request.headers.get('Cookie')?.split(';')
+        .map((part) => part.trim()).find((part) => part.startsWith(`${VARIANT_COOKIE}=`))?.slice(VARIANT_COOKIE.length + 1);
+    return value === 'a' || value === 'b' ? value : null;
 }
 
 export async function hashToken(token: string): Promise<string> {

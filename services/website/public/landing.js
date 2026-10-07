@@ -3,7 +3,6 @@
 const menuToggle = document.getElementById('menu-toggle');
 const siteNav = document.getElementById('site-nav');
 menuToggle.hidden = false;
-document.documentElement.classList.add('navigation-ready');
 
 function closeMenu() {
   siteNav.classList.remove('open');
@@ -225,3 +224,49 @@ document.getElementById('demo-reset').addEventListener('click', resetCourse);
 render();
 document.getElementById('topic-picker').hidden = false;
 document.getElementById('demo-controls').hidden = false;
+
+// The header is dark glass over the hero, then takes the page surface once the hero scrolls away.
+const header = document.querySelector('.site-header');
+const hero = document.querySelector('.hero');
+if (header && hero && 'IntersectionObserver' in window) {
+  new IntersectionObserver(([entry]) => {
+    header.classList.toggle('scrolled', !entry.isIntersecting);
+  }, { rootMargin: '-68px 0px 0px 0px' }).observe(hero);
+}
+
+// The page follows the system appearance. A pick that differs from the system is remembered;
+// picking the system's own appearance goes back to following it.
+const themeToggle = document.getElementById('theme-toggle');
+const systemDark = window.matchMedia('(prefers-color-scheme: dark)');
+const systemTheme = () => (systemDark.matches ? 'dark' : 'light');
+const currentTheme = () => document.documentElement.getAttribute('data-theme') || systemTheme();
+function labelThemeToggle() {
+  themeToggle.setAttribute('aria-label', currentTheme() === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
+}
+themeToggle.addEventListener('click', () => {
+  const root = document.documentElement;
+  const next = currentTheme() === 'dark' ? 'light' : 'dark';
+  root.classList.add('theme-switching');
+  try {
+    if (next === systemTheme()) localStorage.removeItem('lf-theme');
+    else localStorage.setItem('lf-theme', next);
+  } catch {}
+  if (next === systemTheme()) root.removeAttribute('data-theme');
+  else root.setAttribute('data-theme', next);
+  labelThemeToggle();
+  requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove('theme-switching')));
+});
+systemDark.addEventListener('change', labelThemeToggle);
+labelThemeToggle();
+
+if ('IntersectionObserver' in window && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+  document.documentElement.classList.add('reveal-ready');
+  const reveal = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      if (!entry.isIntersecting) return;
+      entry.target.classList.add('visible');
+      reveal.unobserve(entry.target);
+    });
+  }, { rootMargin: '0px 0px -8% 0px' });
+  document.querySelectorAll('[data-reveal]').forEach((element) => reveal.observe(element));
+}
