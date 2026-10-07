@@ -28,7 +28,7 @@
   <div class="container">
     <section class="legal">
       <h1>Privacy Policy</h1>
-      <p class="updated">Last updated: September 9, 2026</p>
+      <p class="updated">Last updated: October 7, 2026</p>
 
       <h2>Overview</h2>
       <p>Learnfold is a native learning workspace that turns topics and sources into personal courses. This policy explains what the app stores on your device, what it may sync through Apple, and what it sends when you choose a connected learning agent, model provider, voice feature, pairing service, or notification feature.</p>
@@ -57,10 +57,17 @@
       <ul>
         <li><strong>Apple on-device models:</strong> supported generation runs on your device.</li>
         <li><strong>Apple Private Cloud Compute:</strong> when available and selected, prompts and relevant course context are processed by Apple's Private Cloud Compute service.</li>
-        <li><strong>Hermes or another connected server:</strong> learner messages, link addresses, course context, tool results, and supported attachments are sent to the server you connect. That server may in turn use a model provider configured by its owner.</li>
+        <li><strong>Learnfold Hosted:</strong> learner messages, course context, tool results, and supported attachments are sent to the Hosted service we operate on Cloudflare, which sends them to a third-party model provider to generate the reply. See Learnfold Hosted and Subscriptions below.</li>
+                <li><strong>Hermes or another connected server:</strong> learner messages, link addresses, course context, tool results, and supported attachments are sent to the server you connect. That server may in turn use a model provider configured by its owner.</li>
         <li><strong>Other authenticated providers:</strong> if a build exposes an additional provider and you enable it, requests are sent using the account or API key you supply.</li>
       </ul>
       <p>Learnfold does not control the storage, logging, training, or deletion practices of a user-operated server or its configured model provider. Review those services' policies and do not submit material you are not authorized to share.</p>
+
+      <h2>Learnfold Hosted and Subscriptions</h2>
+      <p>Learnfold Plus and Learnfold Hosted are auto-renewing subscriptions sold through the App Store. Apple processes payment, billing and renewals. We do not receive your Apple Account name, email address, or payment details.</p>
+      <p>Learnfold Plus covers using your own runtime. It is checked on your device through StoreKit and no purchase information is sent to us for it.</p>
+      <p>Learnfold Hosted is processed by a service we operate. To confirm your subscription, the app sends that service the Apple-signed transaction for your subscription together with a random installation identifier that the app keeps in your Keychain. The service verifies Apple's signature and then stores a one-way hash of the installation identifier, the transaction's original transaction number, its expiry date, and daily usage counters used to enforce fair-use limits and prevent one subscription from being shared widely. This links your subscription to that installation, not to your name or Apple Account. Because the identifier syncs through iCloud Keychain, it can follow you to your other devices; a subscription can be used on a limited number of installations.</p>
+      <p>Hosted conversation history is stored by the Hosted service so you can resume a course, and course content you send in Hosted requests is sent to a third-party model provider to generate replies. Our infrastructure providers process network metadata such as IP address and request time to operate and protect the service. When a subscription ends or is refunded, Hosted access stops; we may keep the hashed identifier and usage counters for a limited period for abuse prevention. To ask us to delete Hosted data associated with your installation, contact <a href="mailto:chirag@fitsnap.fun">chirag@fitsnap.fun</a>.</p>
 
       <h2>Voice and Audio</h2>
       <p>Learnfold accesses the microphone only after you start a voice feature and grant permission.</p>
