@@ -24,6 +24,7 @@ jobs:
   testflight:
     runs-on: macos-26
     timeout-minutes: 180
+    environment: release
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       LITTER_SKIP_ALLEYCAT_UPDATE: "1"
