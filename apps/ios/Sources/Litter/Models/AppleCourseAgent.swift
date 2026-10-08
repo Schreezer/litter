@@ -4012,6 +4012,7 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                     planningProfile: planningProfile
                 )
                 let options = GenerationOptions(maximumResponseTokens: responseTokenCap)
+#if LEARNFOLD_IMAGE_PROMPT_SDK
                 let stream = if #available(iOS 27.0, *), let imagePrompt = Self.prompt(
                     runtimePrompt,
                     images: images,
@@ -4021,6 +4022,9 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
                 } else {
                     activeSession.streamResponse(to: runtimePrompt, options: options)
                 }
+#else
+                let stream = activeSession.streamResponse(to: runtimePrompt, options: options)
+#endif
                 for try await snapshot in stream {
                     try Task.checkCancellation()
                     if snapshot.content != latest {
@@ -4621,10 +4625,11 @@ final class SystemAppleCourseAgentRuntime: AppleCourseAgentRuntime {
     }
 }
 
-#if canImport(FoundationModels)
+#if canImport(FoundationModels) && LEARNFOLD_IMAGE_PROMPT_SDK
 extension SystemAppleCourseAgentRuntime {
     /// `text` with the learner's selected pictures attached, or nil when
-    /// there are none or `model` cannot read images.
+    /// there are none or `model` cannot read images. `LanguageModel` and
+    /// `Attachment` exist only in the iOS 27 SDK.
     @available(iOS 27.0, *)
     static func prompt(_ text: String, images: [URL], model: some LanguageModel) -> Prompt? {
         guard !images.isEmpty, model.capabilities.contains(.vision) else { return nil }
