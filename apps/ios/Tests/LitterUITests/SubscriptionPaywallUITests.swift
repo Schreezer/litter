@@ -11,7 +11,21 @@ final class SubscriptionPaywallUITests: XCTestCase {
         app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
         app.launchArguments = ["--ui-test-subscription-paywall"] + extraArguments
         app.launch()
+        dismissSimulatorAccountAlert()
         return app
+    }
+
+    /// A simulator that is signed in to an Apple Account can raise a system
+    /// "Apple Account Verification" alert over any app that has just launched.
+    /// It comes from SpringBoard, not Learnfold, and would otherwise cover the
+    /// paywall in screenshots. Decline it so the evidence shows the real UI.
+    @MainActor
+    private func dismissSimulatorAccountAlert() {
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let alert = springboard.alerts.firstMatch
+        if alert.waitForExistence(timeout: 4), alert.buttons["Not Now"].exists {
+            alert.buttons["Not Now"].tap()
+        }
     }
 
     @MainActor
@@ -33,6 +47,7 @@ final class SubscriptionPaywallUITests: XCTestCase {
         capture("Paywall plans", app)
 
         let restore = app.buttons["paywall.restore"]
+        app.swipeUp()
         for _ in 0..<6 where !restore.isHittable { app.swipeUp() }
         XCTAssertTrue(restore.exists)
         XCTAssertTrue(app.buttons["paywall.manage"].exists)
@@ -79,6 +94,7 @@ final class SubscriptionPaywallUITests: XCTestCase {
 
     @MainActor
     private func capture(_ name: String, _ app: XCUIApplication) {
+        dismissSimulatorAccountAlert()
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = name
         attachment.lifetime = .keepAlways
