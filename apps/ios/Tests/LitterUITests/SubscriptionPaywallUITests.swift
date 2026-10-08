@@ -1,45 +1,35 @@
 import XCTest
 
-/// Drives the real paywall on a bare screen and exports screenshots.
+/// Drives the real paywall on a bare screen and exports screenshots. The
+/// store behind it is the debug fixture (no Apple Account, sandbox or network).
 final class SubscriptionPaywallUITests: XCTestCase {
     override func setUp() { continueAfterFailure = false }
 
     @MainActor
-    func testPaywallShowsHonestPricingRenewalTermsAndRequiredLinks() {
+    private func launch(extraArguments: [String] = []) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["LEARNFOLD_UI_TESTING"] = "1"
-        app.launchArguments = ["--ui-test-subscription-paywall"]
+        app.launchArguments = ["--ui-test-subscription-paywall"] + extraArguments
         app.launch()
+        return app
+    }
+
+    @MainActor
+    func testPaywallShowsPlansPricingRenewalTermsAndRequiredLinks() {
+        let app = launch()
 
         XCTAssertTrue(app.descendants(matching: .any)["paywall.root"].waitForExistence(timeout: 60), app.debugDescription)
         XCTAssertTrue(app.staticTexts["paywall.headline"].exists)
         XCTAssertTrue(app.descendants(matching: .any)["paywall.plan.hosted"].exists)
         XCTAssertTrue(app.descendants(matching: .any)["paywall.plan.plus"].exists)
 
-        // Prices only ever come from StoreKit. With products loaded they show
-        // here; without them (xcodebuild's test action does not attach the
-        // local .storekit file) the paywall must say so and block purchase
-        // rather than invent a price. Either state is acceptable here; the
-        // StoreKitTest integration test pins the real prices.
         let hostedPrice = app.staticTexts["paywall.price.hosted"]
-        let offersError = app.staticTexts["paywall.offers-error"]
-        let deadline = Date().addingTimeInterval(20)
-        while !hostedPrice.exists && !offersError.exists && Date() < deadline {
-            _ = hostedPrice.waitForExistence(timeout: 1)
-        }
-        if hostedPrice.exists {
-            XCTAssertTrue(hostedPrice.label.contains("month"), hostedPrice.label)
-            XCTAssertTrue(app.buttons["paywall.subscribe.hosted"].isEnabled)
-        } else {
-            XCTAssertTrue(offersError.exists, app.debugDescription)
-            XCTAssertFalse(app.buttons["paywall.subscribe.hosted"].isEnabled)
-            XCTAssertFalse(app.buttons["paywall.subscribe.plus"].isEnabled)
-            XCTAssertTrue(app.buttons["paywall.retry"].exists)
-            XCTAssertFalse(
-                app.staticTexts.matching(NSPredicate(format: "label CONTAINS '$'")).firstMatch.exists,
-                "No price may be hardcoded in the UI"
-            )
-        }
+        XCTAssertTrue(hostedPrice.waitForExistence(timeout: 20), app.debugDescription)
+        XCTAssertTrue(hostedPrice.label.contains("month"), hostedPrice.label)
+        XCTAssertTrue(app.staticTexts["paywall.price.plus"].exists)
+        XCTAssertTrue(app.buttons["paywall.subscribe.hosted"].isEnabled)
+        XCTAssertTrue(app.buttons["paywall.subscribe.plus"].isEnabled)
+        XCTAssertFalse(app.staticTexts["paywall.offers-error"].exists)
         capture("Paywall plans", app)
 
         let restore = app.buttons["paywall.restore"]
@@ -54,10 +44,54 @@ final class SubscriptionPaywallUITests: XCTestCase {
     }
 
     @MainActor
+    func testSubscribingClosesThePaywallOnceThePlanCoversWhatWasRequested() {
+        let app = launch()
+        let subscribe = app.buttons["paywall.subscribe.hosted"]
+        XCTAssertTrue(subscribe.waitForExistence(timeout: 60), app.debugDescription)
+        XCTAssertTrue(subscribe.waitForNonExistence(after: { subscribe.tap() }, timeout: 20), app.debugDescription)
+    }
+
+    @MainActor
+    func testWithoutPurchaseSupportThePaywallSaysSoAndDoesNotBreak() {
+        let app = launch(extraArguments: ["--ui-test-subscriptions-unavailable"])
+
+        XCTAssertTrue(app.descendants(matching: .any)["paywall.root"].waitForExistence(timeout: 60), app.debugDescription)
+        let unavailable = app.staticTexts["paywall.offers-error"]
+        XCTAssertTrue(unavailable.waitForExistence(timeout: 20), app.debugDescription)
+        XCTAssertTrue(unavailable.label.contains("Purchases are unavailable"), unavailable.label)
+        XCTAssertFalse(app.buttons["paywall.subscribe.hosted"].isEnabled)
+        XCTAssertFalse(app.buttons["paywall.subscribe.plus"].isEnabled)
+        XCTAssertFalse(app.buttons["paywall.retry"].exists, "Retrying can't help a build with no purchase backend")
+        XCTAssertFalse(
+            app.staticTexts.matching(NSPredicate(format: "label CONTAINS '$'")).firstMatch.exists,
+            "No price may be shown or invented when purchases are unavailable"
+        )
+        capture("Paywall purchases unavailable", app)
+
+        // Restore, terms and legal links remain reachable and don't crash.
+        let restore = app.buttons["paywall.restore"]
+        for _ in 0..<6 where !restore.isHittable { app.swipeUp() }
+        restore.tap()
+        XCTAssertTrue(app.staticTexts["paywall.error"].waitForExistence(timeout: 10), app.debugDescription)
+        XCTAssertTrue(app.staticTexts["paywall.terms"].exists)
+        XCTAssertTrue(app.descendants(matching: .any)["paywall.root"].exists)
+    }
+
+    @MainActor
     private func capture(_ name: String, _ app: XCUIApplication) {
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+}
+
+private extension XCUIElement {
+    /// Runs `action`, then waits for this element to go away.
+    func waitForNonExistence(after action: () -> Void, timeout: TimeInterval) -> Bool {
+        action()
+        let predicate = NSPredicate(format: "exists == false")
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: self)
+        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
     }
 }

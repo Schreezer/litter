@@ -167,9 +167,12 @@ struct SubscriptionPaywallView: View {
         if let error = subscriptions.offersError {
             VStack(alignment: .leading, spacing: 8) {
                 statusText(error, color: LitterTheme.textSecondary, identifier: "paywall.offers-error")
-                Button("Try again") { Task { await subscriptions.loadOffers() } }
-                    .foregroundColor(LitterTheme.accent)
-                    .accessibilityIdentifier("paywall.retry")
+                // Retrying can't help a build that has no purchase backend.
+                if subscriptions.purchasesAvailable {
+                    Button("Try again") { Task { await subscriptions.loadOffers() } }
+                        .foregroundColor(LitterTheme.accent)
+                        .accessibilityIdentifier("paywall.retry")
+                }
             }
         }
         HStack(spacing: 20) {
@@ -258,6 +261,7 @@ struct PlanSettingsView: View {
 
     private var detail: String {
         guard let entitlement = subscriptions.activeEntitlement else {
+            if !subscriptions.purchasesAvailable { return SubscriptionStore.purchasesUnavailableMessage }
             return "You're on the free plan. Apple's on-device agents are included."
         }
         guard let date = entitlement.expirationDate else { return "Active." }

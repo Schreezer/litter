@@ -1,26 +1,24 @@
 import Foundation
 import Observation
-import StoreKit
 
-/// A purchasable plan as StoreKit reports it. Prices are always the
-/// localized `displayPrice` from the App Store; the app never formats one.
+/// A purchasable plan as the store reports it. Prices are always the
+/// localized price string from the App Store (through RevenueCat); the app
+/// never formats or hardcodes one.
 struct PlanOffer: Equatable, Identifiable, Sendable {
     let plan: LearnfoldPlan
     let displayName: String
     let displayPrice: String
-    /// For example "month". Empty if StoreKit gave no period.
+    /// For example "month". Empty if the store gave no period.
     let periodDescription: String
 
     var id: String { plan.id }
 }
 
-/// A subscription the user currently holds, verified by StoreKit on device.
+/// A subscription the user currently holds.
 struct HeldEntitlement: Equatable, Sendable {
     let plan: LearnfoldPlan
     let expirationDate: Date?
     let willAutoRenew: Bool?
-    /// The StoreKit 2 signed transaction (JWS) the Worker verifies.
-    let signedTransaction: String
 }
 
 enum PlanPurchaseResult: Equatable, Sendable {
@@ -30,36 +28,62 @@ enum PlanPurchaseResult: Equatable, Sendable {
     case cancelled
 }
 
-/// The StoreKit seam. The live implementation talks to StoreKit 2; tests
-/// inject a fake so entitlement and gating logic never touches the App Store.
+/// The purchase seam. The live implementation talks to RevenueCat; tests and
+/// local development inject a fake or the local StoreKit configuration, so
+/// entitlement and gating logic never depends on a network.
 protocol SubscriptionBackend: Sendable {
+    /// `false` when this build can't sell anything (for example it was built
+    /// without a RevenueCat SDK key). Gating is not enforced in that case, and
+    /// the paywall says purchases are unavailable instead of failing.
+    var isAvailable: Bool { get }
     func offers() async throws -> [PlanOffer]
     func currentEntitlements() async -> [HeldEntitlement]
     func purchase(_ plan: LearnfoldPlan) async throws -> PlanPurchaseResult
     /// Re-syncs purchases with the App Store (Restore Purchases).
     func restore() async throws
-    /// Yields whenever the transaction set may have changed.
+    /// Yields whenever the entitlement set may have changed.
     func transactionUpdates() -> AsyncStream<Void>
+}
+
+extension SubscriptionBackend {
+    var isAvailable: Bool { true }
 }
 
 enum SubscriptionError: LocalizedError {
     case productUnavailable
-    case unverifiedTransaction
+    case purchasesUnavailable
+    case identityUnavailable
 
     var errorDescription: String? {
         switch self {
         case .productUnavailable:
             "This plan isn't available from the App Store right now. Please try again later."
-        case .unverifiedTransaction:
-            "The App Store couldn't verify this purchase. Please try again."
+        case .purchasesUnavailable:
+            SubscriptionStore.purchasesUnavailableMessage
+        case .identityUnavailable:
+            "Couldn't prepare your Hosted identity. Unlock your device, check iCloud Keychain, and try again."
         }
     }
+}
+
+/// What a build without a RevenueCat SDK key uses. It never touches the
+/// network and never crashes; every purchase surface reports unavailability.
+struct UnavailableSubscriptionBackend: SubscriptionBackend {
+    var isAvailable: Bool { false }
+    func offers() async throws -> [PlanOffer] { throw SubscriptionError.purchasesUnavailable }
+    func currentEntitlements() async -> [HeldEntitlement] { [] }
+    func purchase(_ plan: LearnfoldPlan) async throws -> PlanPurchaseResult { throw SubscriptionError.purchasesUnavailable }
+    func restore() async throws { throw SubscriptionError.purchasesUnavailable }
+    func transactionUpdates() -> AsyncStream<Void> { AsyncStream { $0.finish() } }
 }
 
 @MainActor
 @Observable
 final class SubscriptionStore: EntitlementProviding {
-    static let shared = SubscriptionStore()
+    static let purchasesUnavailableMessage = "Purchases are unavailable right now. Apple's on-device and Private Cloud Compute agents stay free."
+    static let plansUnavailableMessage = "Plans can't be loaded right now. Check your connection and try again."
+
+    static let shared = SubscriptionStore(backend: SubscriptionBackendFactory.live())
 
     private(set) var offers: [PlanOffer] = []
     private(set) var held: [HeldEntitlement] = []
@@ -73,9 +97,14 @@ final class SubscriptionStore: EntitlementProviding {
     @ObservationIgnored private let backend: any SubscriptionBackend
     @ObservationIgnored private var updatesTask: Task<Void, Never>?
 
-    init(backend: any SubscriptionBackend = StoreKitSubscriptionBackend()) {
+    init(backend: any SubscriptionBackend) {
         self.backend = backend
     }
+
+    /// Whether this build can sell plans at all. When `false` the paywall shows
+    /// that purchases are unavailable and gating is not enforced, so a build
+    /// shipped without a SDK key can't lock anyone out of an agent.
+    var purchasesAvailable: Bool { backend.isAvailable }
 
     /// The best plan the user holds right now.
     var activePlan: LearnfoldPlan? {
@@ -86,7 +115,7 @@ final class SubscriptionStore: EntitlementProviding {
         guard let activePlan else { return nil }
         return held
             .filter { $0.plan == activePlan }
-            .max { ($0.expirationDate ?? .distantPast) < ($1.expirationDate ?? .distantPast) }
+            .max { ($0.expirationDate ?? .distantFuture) < ($1.expirationDate ?? .distantFuture) }
     }
 
     func offer(for plan: LearnfoldPlan) -> PlanOffer? {
@@ -126,12 +155,10 @@ final class SubscriptionStore: EntitlementProviding {
         do {
             let loaded = try await backend.offers()
             offers = LearnfoldPlan.allCases.compactMap { plan in loaded.first { $0.plan == plan } }
-            if offers.isEmpty {
-                offersError = "Plans can't be loaded right now. Check your connection and try again."
-            }
+            if offers.isEmpty { offersError = Self.plansUnavailableMessage }
         } catch {
             offers = []
-            offersError = "Plans can't be loaded right now. Check your connection and try again."
+            offersError = backend.isAvailable ? Self.plansUnavailableMessage : Self.purchasesUnavailableMessage
         }
     }
 
@@ -169,136 +196,16 @@ final class SubscriptionStore: EntitlementProviding {
             try await backend.restore()
             await refreshEntitlements()
             notice = activePlan == nil
-                ? "No active subscription was found for this Apple ID."
+                ? "No active subscription was found for this Apple Account."
                 : "Your subscription was restored."
+        } catch SubscriptionError.purchasesUnavailable {
+            actionError = Self.purchasesUnavailableMessage
         } catch {
             actionError = "Couldn't restore purchases: \(error.localizedDescription)"
         }
     }
 
-    func hostedSignedTransaction() async -> String? {
-        // Always ask StoreKit again: the freshest signed transaction carries
-        // the latest renewal, and a revoked one is simply absent.
-        let current = await backend.currentEntitlements()
-        held = current
-        hasLoadedEntitlements = true
-        return current
-            .filter { $0.plan == .hosted }
-            .max { ($0.expirationDate ?? .distantPast) < ($1.expirationDate ?? .distantPast) }?
-            .signedTransaction
-    }
-
     deinit {
         updatesTask?.cancel()
-    }
-}
-
-// MARK: - StoreKit 2
-
-final class StoreKitSubscriptionBackend: SubscriptionBackend, @unchecked Sendable {
-    private let lock = NSLock()
-    private var products: [String: Product] = [:]
-
-    private func cached(_ productID: String) -> Product? {
-        lock.lock()
-        defer { lock.unlock() }
-        return products[productID]
-    }
-
-    private func store(_ loaded: [Product]) {
-        lock.lock()
-        defer { lock.unlock() }
-        for product in loaded { products[product.id] = product }
-    }
-
-    func offers() async throws -> [PlanOffer] {
-        let loaded = try await Product.products(for: LearnfoldPlan.productIDs)
-        store(loaded)
-        return loaded.compactMap { product in
-            guard let plan = LearnfoldPlan.plan(forProductID: product.id) else { return nil }
-            return PlanOffer(
-                plan: plan,
-                displayName: product.displayName,
-                displayPrice: product.displayPrice,
-                periodDescription: Self.periodDescription(product.subscription?.subscriptionPeriod)
-            )
-        }
-    }
-
-    func currentEntitlements() async -> [HeldEntitlement] {
-        var result: [HeldEntitlement] = []
-        for await entry in Transaction.currentEntitlements {
-            // StoreKit verifies the JWS signature chain on device. Anything
-            // unverified is ignored rather than trusted.
-            guard case .verified(let transaction) = entry,
-                  let plan = LearnfoldPlan.plan(forProductID: transaction.productID),
-                  transaction.revocationDate == nil,
-                  transaction.productType == .autoRenewable else { continue }
-            result.append(HeldEntitlement(
-                plan: plan,
-                expirationDate: transaction.expirationDate,
-                willAutoRenew: await willAutoRenew(productID: transaction.productID),
-                signedTransaction: entry.jwsRepresentation
-            ))
-        }
-        return result
-    }
-
-    func purchase(_ plan: LearnfoldPlan) async throws -> PlanPurchaseResult {
-        if cached(plan.productID) == nil { store(try await Product.products(for: LearnfoldPlan.productIDs)) }
-        guard let product = cached(plan.productID) else { throw SubscriptionError.productUnavailable }
-        switch try await product.purchase() {
-        case .success(let verification):
-            guard case .verified(let transaction) = verification else {
-                throw SubscriptionError.unverifiedTransaction
-            }
-            await transaction.finish()
-            return .purchased
-        case .pending:
-            return .pending
-        case .userCancelled:
-            return .cancelled
-        @unknown default:
-            return .cancelled
-        }
-    }
-
-    func restore() async throws {
-        try await StoreKit.AppStore.sync()
-    }
-
-    func transactionUpdates() -> AsyncStream<Void> {
-        AsyncStream { continuation in
-            let task = Task {
-                for await update in Transaction.updates {
-                    if case .verified(let transaction) = update { await transaction.finish() }
-                    continuation.yield()
-                }
-                continuation.finish()
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-    }
-
-    private func willAutoRenew(productID: String) async -> Bool? {
-        guard let product = cached(productID),
-              let statuses = try? await product.subscription?.status else { return nil }
-        for status in statuses {
-            if case .verified(let renewal) = status.renewalInfo { return renewal.willAutoRenew }
-        }
-        return nil
-    }
-
-    private static func periodDescription(_ period: Product.SubscriptionPeriod?) -> String {
-        guard let period else { return "" }
-        let unit: String
-        switch period.unit {
-        case .day: unit = "day"
-        case .week: unit = "week"
-        case .month: unit = "month"
-        case .year: unit = "year"
-        @unknown default: return ""
-        }
-        return period.value == 1 ? unit : "\(period.value) \(unit)s"
     }
 }

@@ -13,6 +13,10 @@ enum LearnfoldPlan: String, CaseIterable, Identifiable, Sendable {
 
     var id: String { rawValue }
 
+    /// The RevenueCat entitlement identifiers. Hosted includes Plus in the app
+    /// regardless of how the dashboard attaches products to entitlements.
+    var entitlementID: String { rawValue }
+
     var productID: String {
         switch self {
         case .plus: Self.plusProductID
@@ -54,9 +58,9 @@ enum LearnfoldPlan: String, CaseIterable, Identifiable, Sendable {
 }
 
 /// Which agents need which plan. This is a thin client-side gate. For Hosted
-/// the Worker is authoritative (it verifies the signed transaction); Plus
-/// covers runtimes that never touch Learnfold servers, so it can only be
-/// enforced here.
+/// the Worker is authoritative (it asks RevenueCat about this install's
+/// pseudonymous app user); Plus covers runtimes that never touch Learnfold
+/// servers, so it can only be enforced here.
 enum AgentAccessPolicy {
     /// `nil` means the agent is free. Apple's on-device and Private Cloud
     /// Compute models stay free; every non-Hosted app-server runtime is BYO.
@@ -71,9 +75,6 @@ enum AgentAccessPolicy {
 @MainActor
 protocol EntitlementProviding: AnyObject {
     func hasAccess(to plan: LearnfoldPlan) -> Bool
-    /// The freshest StoreKit signed transaction (JWS) for a Hosted
-    /// subscription, if the user holds one. The Worker verifies it.
-    func hostedSignedTransaction() async -> String?
 }
 
 struct PaywallRequest: Identifiable, Equatable {
@@ -104,6 +105,30 @@ enum SubscriptionConfiguration {
 
     private static func parse(_ text: String) -> Bool {
         ["1", "yes", "true"].contains(text.trimmingCharacters(in: .whitespaces).lowercased())
+    }
+}
+
+/// The RevenueCat PUBLIC SDK key for this build.
+///
+/// It is a build setting (`LEARNFOLD_REVENUECAT_API_KEY`, surfaced as the
+/// `LearnfoldRevenueCatApiKey` Info.plist key), empty in source. The
+/// environment variable of the same name overrides it for local runs. A secret
+/// key is never accepted here: it lives only in the Worker.
+enum RevenueCatConfiguration {
+    static let environmentKey = "LEARNFOLD_REVENUECAT_API_KEY"
+    static let bundleKey = "LearnfoldRevenueCatApiKey"
+
+    static func publicSDKKey(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        bundle: Bundle = .main
+    ) -> String? {
+        let raw = environment[environmentKey] ?? (bundle.object(forInfoDictionaryKey: bundleKey) as? String)
+        guard let key = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty,
+              // An unexpanded `$(LEARNFOLD_REVENUECAT_API_KEY)` means the build never set it.
+              !key.hasPrefix("$("),
+              // Secret keys start with "sk_" and must never be used in the app.
+              !key.hasPrefix("sk_") else { return nil }
+        return key
     }
 }
 

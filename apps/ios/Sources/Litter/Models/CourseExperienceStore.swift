@@ -3502,7 +3502,7 @@ final class CourseExperienceStore {
         let resolvedAvailability = resolvedAppleRuntime.availability()
         appleAvailability = resolvedAvailability
         let resolvedHostedRuntime = hostedRuntime
-            ?? SystemHostedCourseAgentRuntime(environment: environment, entitlements: entitlements)
+            ?? SystemHostedCourseAgentRuntime(environment: environment)
         self.hostedRuntime = resolvedHostedRuntime
         self.entitlements = entitlements
         self.enforcesEntitlements = enforcesEntitlements && entitlements != nil
@@ -3895,7 +3895,11 @@ final class CourseExperienceStore {
     ) async -> Bool {
         guard connectionState != .connecting else { return false }
         let hadCompletedSetup = setupComplete
-        if gatesEntitlement, presentPaywallIfGated(runtimeID: agentID) {
+        // First-run setup is never paywalled. A learner who picks a paid agent
+        // before any plan still reaches the library and the bundled practice
+        // course (it needs no agent turn), and meets the paywall at their first
+        // send. Switching agents after setup is gated at selection.
+        if gatesEntitlement, hadCompletedSetup, presentPaywallIfGated(runtimeID: agentID) {
             return false
         }
         connectionState = .connecting
@@ -7434,13 +7438,6 @@ final class CourseExperienceStore {
             """
         }
         return "Apple’s model couldn’t complete this request. Please try again."
-    }
-
-    /// Surfaces the paywall when the Worker says Hosted needs a subscription.
-    private func presentPaywallIfSubscriptionRequired(_ error: any Error) {
-        guard let hosted = error as? HostedCourseAgentRuntimeError,
-              case .subscriptionRequired = hosted else { return }
-        paywallRequest = PaywallRequest(requiredPlan: .hosted)
     }
 
     static func hostedAgentFailureMessage(_ error: any Error) -> String {
@@ -11883,7 +11880,6 @@ final class CourseExperienceStore {
                       selectionDiscussionID: selectionDiscussionID
                   ) else { return }
             let nsError = error as NSError
-            presentPaywallIfSubscriptionRequired(error)
             if runtimeID == "hermes", let key = acceptedHermesTurn?.key ?? hermesThreadKey {
                 AppRuntimeController.shared.finishUserInitiatedMultiTurn(
                     key: key,

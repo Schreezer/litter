@@ -58,6 +58,11 @@ packages:
   Nuke:
     url: https://github.com/kean/Nuke.git
     from: "12.8.0"
+  RevenueCat:
+    # Subscription management for the Plus and Hosted plans. Linked into the
+    # iOS app only; the Mac Catalyst build is not gated and stays SDK-free.
+    url: https://github.com/RevenueCat/purchases-ios.git
+    exactVersion: "5.93.0"
 targets:
   Litter:
     type: application
@@ -131,6 +136,8 @@ targets:
     dependencies:
       - package: PostHog
         product: PostHog
+      - package: RevenueCat
+        product: RevenueCat
       - sdk: CarPlay.framework
       - sdk: CoreGraphics.framework
       - sdk: CoreText.framework
@@ -166,6 +173,10 @@ targets:
         INFOPLIST_FILE: Sources/Litter/Info.plist
         LEARNFOLD_HOSTED_AGENT_URL: "https://learnfold-hosted-agent.chiragmgg.workers.dev"
         LEARNFOLD_HOSTED_ACCESS_TOKEN: ""
+        # RevenueCat PUBLIC SDK key (appl_...). Empty in source on purpose: the
+        # release pipeline supplies it (xcodebuild LEARNFOLD_REVENUECAT_API_KEY=...).
+        # With it empty the app builds and runs, and purchases are unavailable.
+        LEARNFOLD_REVENUECAT_API_KEY: ""
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Litter/Bridge/codex_bridge_objc.h
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_KEY_UIBackgroundModes: "audio fetch picture-in-picture"

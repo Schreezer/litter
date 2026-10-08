@@ -229,6 +229,7 @@ enum DebugLaunchSignalAuthorityInventory {
         "--ui-test-generation-recovery-acceptance-unknown",
         "--ui-test-generation-recovery-accepted-reply-incomplete",
         "--ui-test-open-settings",
+        "--ui-test-subscriptions-unavailable",
     ]
 
     /// These spellings are deliberately not fixtures. They document controls
@@ -1952,7 +1953,9 @@ struct ContentView: View {
     @State private var conversationWarmup = ConversationWarmupCoordinator()
     @State private var courseStore = CourseExperienceStore(
         entitlements: SubscriptionStore.shared,
-        enforcesEntitlements: SubscriptionConfiguration.isEnforced()
+        // A build that can't sell anything (no RevenueCat key) must not lock
+        // anyone out of an agent behind a paywall nobody can complete.
+        enforcesEntitlements: SubscriptionConfiguration.isEnforced() && SubscriptionStore.shared.purchasesAvailable
     )
     @State private var petOverlay = PetOverlayController.shared
     @State private var composerBottomInset: CGFloat = 0

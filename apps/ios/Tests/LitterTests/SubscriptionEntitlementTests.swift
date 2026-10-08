@@ -76,17 +76,8 @@ private final class FakeSubscriptionBackend: SubscriptionBackend, @unchecked Sen
     func emitUpdate() { lock.withLock { continuation }?.yield() }
 }
 
-private func held(
-    _ plan: LearnfoldPlan,
-    expires: TimeInterval = 86_400,
-    jws: String? = nil
-) -> HeldEntitlement {
-    HeldEntitlement(
-        plan: plan,
-        expirationDate: Date(timeIntervalSinceNow: expires),
-        willAutoRenew: true,
-        signedTransaction: jws ?? "jws-\(plan.rawValue)-\(Int(expires))"
-    )
+private func held(_ plan: LearnfoldPlan, expires: TimeInterval = 86_400) -> HeldEntitlement {
+    HeldEntitlement(plan: plan, expirationDate: Date(timeIntervalSinceNow: expires), willAutoRenew: true)
 }
 
 private func offer(_ plan: LearnfoldPlan, price: String) -> PlanOffer {
@@ -96,10 +87,8 @@ private func offer(_ plan: LearnfoldPlan, price: String) -> PlanOffer {
 @MainActor
 private final class FakeEntitlements: EntitlementProviding {
     var plans: Set<LearnfoldPlan> = []
-    var hosted: String?
     init(_ plans: Set<LearnfoldPlan> = []) { self.plans = plans }
     func hasAccess(to plan: LearnfoldPlan) -> Bool { plans.contains { $0.includes(plan) } }
-    func hostedSignedTransaction() async -> String? { hosted }
 }
 
 // MARK: - Plans and policy
@@ -288,7 +277,7 @@ final class SubscriptionStoreTests: XCTestCase {
 
     func testFailedPurchaseReportsAnError() async {
         let backend = FakeSubscriptionBackend()
-        backend.purchaseResult = .failure(SubscriptionError.unverifiedTransaction)
+        backend.purchaseResult = .failure(SubscriptionError.productUnavailable)
         let store = SubscriptionStore(backend: backend)
         let result = await store.purchase(.plus)
         XCTAssertNil(result)
@@ -310,7 +299,7 @@ final class SubscriptionStoreTests: XCTestCase {
         let store = SubscriptionStore(backend: FakeSubscriptionBackend())
         await store.restore()
         XCTAssertNil(store.activePlan)
-        XCTAssertEqual(store.notice, "No active subscription was found for this Apple ID.")
+        XCTAssertEqual(store.notice, "No active subscription was found for this Apple Account.")
     }
 
     func testRestoreFailureIsReported() async {
@@ -320,26 +309,6 @@ final class SubscriptionStoreTests: XCTestCase {
         let store = SubscriptionStore(backend: backend)
         await store.restore()
         XCTAssertNotNil(store.actionError)
-    }
-
-    func testHostedSignedTransactionIsTheFreshestHostedOne() async {
-        let backend = FakeSubscriptionBackend()
-        backend.entitlements = [
-            held(.hosted, expires: 100, jws: "old"),
-            held(.hosted, expires: 900, jws: "new"),
-            held(.plus, expires: 5_000, jws: "plus"),
-        ]
-        let store = SubscriptionStore(backend: backend)
-        let jws = await store.hostedSignedTransaction()
-        XCTAssertEqual(jws, "new")
-    }
-
-    func testPlusAloneNeverProducesAHostedTransaction() async {
-        let backend = FakeSubscriptionBackend()
-        backend.entitlements = [held(.plus)]
-        let store = SubscriptionStore(backend: backend)
-        let jws = await store.hostedSignedTransaction()
-        XCTAssertNil(jws)
     }
 
     private func waitUntil(
@@ -379,7 +348,8 @@ final class CourseAgentEntitlementGateTests: XCTestCase {
             hostedRuntime: GateHostedRuntime(),
             entitlements: entitlements,
             enforcesEntitlements: enforced,
-            coursesRootURL: root
+            coursesRootURL: root,
+            courseControlRootURL: root.appendingPathComponent("control", isDirectory: true)
         )
         return (store, {
             defaults.removePersistentDomain(forName: suite)
@@ -420,6 +390,33 @@ final class CourseAgentEntitlementGateTests: XCTestCase {
 
         XCTAssertNil(hosted.0.entitlementDenial(forRuntimeID: CourseAgentProvider.hosted))
         XCTAssertNil(hosted.0.entitlementDenial(forRuntimeID: CourseAgentProvider.codex))
+    }
+
+    func testFirstRunSetupWithAPaidAgentIsNeverPaywalledAndShowsThePracticeCourse() async throws {
+        let (store, cleanup) = try makeStore(selected: CourseAgentProvider.hosted, entitlements: FakeEntitlements(), enforced: true)
+        defer { cleanup() }
+        XCTAssertFalse(store.setupComplete)
+
+        // A reviewer with no plan (and no Apple Intelligence) picks Hosted at setup.
+        let connected = await store.connectLocalAgent(appModel: AppModel(), agentID: CourseAgentProvider.hosted)
+        XCTAssertTrue(connected)
+        XCTAssertNil(store.paywallRequest, "Setup must not open a paywall before any value is shown")
+        XCTAssertTrue(store.setupComplete)
+
+        // The bundled practice course needs no agent turn, so it is readable now.
+        await store.installStarterCourseIfNeeded()
+        XCTAssertTrue(store.courses.contains { $0.workspaceID == LearnfoldStarterCourse.workspaceID })
+        XCTAssertNil(store.paywallRequest)
+
+        // The first send is where the plan is required.
+        XCTAssertFalse(store.sendMessage("Teach me biology", appModel: AppModel(), appState: AppState()))
+        XCTAssertEqual(store.paywallRequest?.requiredPlan, .hosted)
+
+        // After setup, choosing another paid agent is gated at selection.
+        store.paywallRequest = nil
+        let switched = await store.connectLocalAgent(appModel: AppModel(), agentID: CourseAgentProvider.codex)
+        XCTAssertFalse(switched)
+        XCTAssertEqual(store.paywallRequest?.requiredPlan, .plus)
     }
 
     func testUnenforcedBuildsNeverGate() throws {
@@ -464,91 +461,154 @@ private final class GateHostedRuntime: HostedCourseAgentRuntime {
     func cancel(sessionID: UUID) {}
 }
 
-// MARK: - Hosted token exchange
+// MARK: - RevenueCat identity and configuration
 
-final class HostedSubscriptionExchangeTests: XCTestCase {
-    private final class StubProtocol: URLProtocol {
-        nonisolated(unsafe) static var handler: ((URLRequest) -> (Int, Data))?
-        nonisolated(unsafe) static var lastRequest: URLRequest?
-        nonisolated(unsafe) static var lastBody: Data?
+final class HostedSubscriptionIdentityTests: XCTestCase {
+    func testAppUserIDMatchesTheWorkerTestVector() {
+        // Pinned by services/hosted-agent/test/revenuecat.test.ts. If this
+        // fails, the Worker would look subscribers up under a different ID.
+        let secret = String(repeating: "0123456789abcdef", count: 4)
+        XCTAssertEqual(
+            HostedGuestIdentity.revenueCatAppUserID(secret: secret),
+            "lf1_66f345ab9622be22e4a3762e6d7609f6da48c3e45ca3bb1df0246e943d6e0756"
+        )
+    }
 
-        override class func canInit(with request: URLRequest) -> Bool { true }
-        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-        override func startLoading() {
-            Self.lastRequest = request
-            if let stream = request.httpBodyStream {
-                stream.open()
-                var data = Data()
-                var buffer = [UInt8](repeating: 0, count: 4096)
-                while stream.hasBytesAvailable {
-                    let count = stream.read(&buffer, maxLength: buffer.count)
-                    if count <= 0 { break }
-                    data.append(buffer, count: count)
-                }
-                stream.close()
-                Self.lastBody = data
-            } else {
-                Self.lastBody = request.httpBody
-            }
-            let (status, body) = Self.handler?(request) ?? (500, Data())
-            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: body)
-            client?.urlProtocolDidFinishLoading(self)
+    func testAppUserIDIsOneWayAndDiffersFromTheConversationNamespace() {
+        let secret = String(repeating: "ab", count: 32)
+        let id = HostedGuestIdentity.revenueCatAppUserID(secret: secret)
+        XCTAssertFalse(id.contains(secret))
+        XCTAssertFalse(id.contains(HostedGuestIdentity.fingerprint(secret)))
+        XCTAssertNotEqual(id, "guest-\(HostedGuestIdentity.fingerprint(secret))")
+        XCTAssertNotEqual(id, HostedGuestIdentity.revenueCatAppUserID(secret: String(repeating: "cd", count: 32)))
+        XCTAssertNotNil(id.range(of: "^lf1_[0-9a-f]{64}$", options: .regularExpression))
+    }
+
+    func testExistingIdentityNeverCreatesOneAndSeesAPromotedIdentity() throws {
+        let storage = MemoryStorage()
+        let secret = String(repeating: "7", count: 64)
+        let repository = HostedGuestIdentityRepository(storage: storage, makeSecret: { secret })
+        XCTAssertNil(try repository.existingIdentity(serviceURL: "https://agent.example"))
+        XCTAssertTrue(storage.values.isEmpty, "A launch-time lookup must not write to the keychain")
+
+        let created = try repository.identity(serviceURL: "https://agent.example")
+        XCTAssertEqual(created.secret, secret)
+        let existing = try XCTUnwrap(try repository.existingIdentity(serviceURL: "https://agent.example"))
+        XCTAssertEqual(existing.secret, secret)
+        XCTAssertEqual(existing.ownerSubject, created.ownerSubject)
+        XCTAssertNil(try repository.existingIdentity(serviceURL: "https://other.example"))
+    }
+
+    private struct Key: Hashable { let service: String; let account: String }
+    private final class MemoryStorage: HostedGuestIdentityStorage {
+        var values: [Key: Data] = [:]
+        func read(service: String, account: String, synchronizable: Bool) throws -> Data? {
+            values[Key(service: service, account: account)]
         }
-        override func stopLoading() {}
-    }
-
-    private func exchange() -> HostedSubscriptionExchange {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [StubProtocol.self]
-        return HostedSubscriptionExchange(session: URLSession(configuration: configuration))
-    }
-
-    private let secret = String(repeating: "a", count: 64)
-
-    func testEndpointMirrorsTheRustGuestExchange() throws {
-        XCTAssertEqual(
-            try HostedSubscriptionExchange.endpoint(serviceURL: "wss://agent.example/runtime", sessionID: "s1").absoluteString,
-            "https://agent.example/guest-session?sessionId=s1"
-        )
-        XCTAssertEqual(
-            try HostedSubscriptionExchange.endpoint(serviceURL: "http://localhost:8787", sessionID: "s1").absoluteString,
-            "http://localhost:8787/guest-session?sessionId=s1"
-        )
-        XCTAssertThrowsError(try HostedSubscriptionExchange.endpoint(serviceURL: "http://agent.example", sessionID: "s1"))
-    }
-
-    func testSuccessfulExchangeSendsGuestSecretAndTransaction() async throws {
-        StubProtocol.handler = { _ in (200, Data(#"{"accessToken":"minted"}"#.utf8)) }
-        let token = try await exchange().accessToken(
-            serviceURL: "https://agent.example", guestSecret: secret, sessionID: "session-1", signedTransaction: "a.b.c"
-        )
-        XCTAssertEqual(token, "minted")
-        let request = try XCTUnwrap(StubProtocol.lastRequest)
-        XCTAssertEqual(request.httpMethod, "POST")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "authorization"), "Guest \(secret)")
-        let body = try XCTUnwrap(StubProtocol.lastBody)
-        XCTAssertEqual(try JSONDecoder().decode([String: String].self, from: body), ["signedTransaction": "a.b.c"])
-    }
-
-    func testPaymentRequiredMapsToSubscriptionRequired() async {
-        StubProtocol.handler = { _ in (402, Data(#"{"error":"subscription_invalid"}"#.utf8)) }
-        do {
-            _ = try await exchange().accessToken(
-                serviceURL: "https://agent.example", guestSecret: secret, sessionID: "s", signedTransaction: "x"
-            )
-            XCTFail("Expected a subscription error")
-        } catch let error as HostedCourseAgentRuntimeError {
-            guard case .subscriptionRequired = error else { return XCTFail("Wrong error \(error)") }
-        } catch {
-            XCTFail("Wrong error \(error)")
+        func insert(_ data: Data, service: String, account: String, synchronizable: Bool) throws {
+            let key = Key(service: service, account: account)
+            if values[key] == nil { values[key] = data }
         }
     }
+}
 
-    @MainActor
-    func testSubscriptionRefusalKeepsItsMessage() {
-        let error = HostedCourseAgentRuntimeError.subscriptionRequired("needs plan")
-        XCTAssertEqual(CourseExperienceStore.hostedAgentFailureMessage(error), "needs plan")
+final class RevenueCatConfigurationTests: XCTestCase {
+    private let bundle = Bundle(for: RevenueCatConfigurationTests.self)
+
+    func testEmptyOrMissingKeyMeansNoRevenueCat() {
+        XCTAssertNil(RevenueCatConfiguration.publicSDKKey(environment: [:], bundle: bundle))
+        XCTAssertNil(RevenueCatConfiguration.publicSDKKey(environment: ["LEARNFOLD_REVENUECAT_API_KEY": ""], bundle: bundle))
+        XCTAssertNil(RevenueCatConfiguration.publicSDKKey(environment: ["LEARNFOLD_REVENUECAT_API_KEY": "  \n"], bundle: bundle))
+    }
+
+    func testAnUnexpandedBuildSettingIsTreatedAsEmpty() {
+        XCTAssertNil(RevenueCatConfiguration.publicSDKKey(
+            environment: ["LEARNFOLD_REVENUECAT_API_KEY": "$(LEARNFOLD_REVENUECAT_API_KEY)"], bundle: bundle
+        ))
+    }
+
+    func testSecretKeysAreNeverUsedInTheApp() {
+        XCTAssertNil(RevenueCatConfiguration.publicSDKKey(
+            environment: ["LEARNFOLD_REVENUECAT_API_KEY": "sk_not_for_the_app"], bundle: bundle
+        ))
+    }
+
+    func testAPublicKeyIsTrimmedAndAccepted() {
+        XCTAssertEqual(
+            RevenueCatConfiguration.publicSDKKey(environment: ["LEARNFOLD_REVENUECAT_API_KEY": " appl_abc123 \n"], bundle: bundle),
+            "appl_abc123"
+        )
+    }
+
+    func testTheCheckedInProjectShipsNoKey() {
+        // The test bundle inherits the app's build settings; the source tree
+        // must hold an empty key so no secret or real key is ever committed.
+        XCTAssertNil(RevenueCatConfiguration.publicSDKKey(environment: [:], bundle: Bundle(for: SubscriptionStore.self)))
+    }
+
+    func testEntitlementIdentifiersAreStable() {
+        XCTAssertEqual(LearnfoldPlan.plus.entitlementID, "plus")
+        XCTAssertEqual(LearnfoldPlan.hosted.entitlementID, "hosted")
+    }
+}
+
+/// With no RevenueCat key the app must degrade, never crash.
+@MainActor
+final class UnavailablePurchasesTests: XCTestCase {
+    func testWithoutAKeyReleaseStyleBuildsGetTheUnavailableBackend() {
+        // Outside UI-test mode and with no key, the factory returns either the
+        // unavailable backend (release) or the local StoreKit one (debug).
+        let backend = SubscriptionBackendFactory.live(environment: [:], arguments: [], bundle: Bundle(for: SubscriptionStore.self))
+        #if DEBUG
+        XCTAssertTrue(backend is StoreKitSubscriptionBackend)
+        #else
+        XCTAssertTrue(backend is UnavailableSubscriptionBackend)
+        #endif
+    }
+
+    func testUITestingCanForceTheUnavailableBackend() {
+        let backend = SubscriptionBackendFactory.live(
+            environment: ["LEARNFOLD_UI_TESTING": "1"],
+            arguments: [SubscriptionBackendFactory.unavailableArgument],
+            bundle: Bundle(for: SubscriptionStore.self)
+        )
+        #if DEBUG
+        XCTAssertFalse(backend.isAvailable)
+        #endif
+    }
+
+    func testUnavailableStoreSaysSoAndOffersNothing() async {
+        let store = SubscriptionStore(backend: UnavailableSubscriptionBackend())
+        XCTAssertFalse(store.purchasesAvailable)
+        await store.loadOffers()
+        XCTAssertTrue(store.offers.isEmpty)
+        XCTAssertEqual(store.offersError, SubscriptionStore.purchasesUnavailableMessage)
+        XCTAssertNil(store.offer(for: .hosted))
+    }
+
+    func testUnavailablePurchaseAndRestoreReportAndGrantNothing() async {
+        let store = SubscriptionStore(backend: UnavailableSubscriptionBackend())
+        let result = await store.purchase(.plus)
+        XCTAssertNil(result)
+        XCTAssertEqual(store.actionError, SubscriptionStore.purchasesUnavailableMessage)
+        XCTAssertFalse(store.hasAccess(to: .plus))
+        await store.restore()
+        XCTAssertEqual(store.actionError, SubscriptionStore.purchasesUnavailableMessage)
+        XCTAssertNil(store.activePlan)
+        store.start()
+        await store.refreshEntitlements()
+        XCTAssertTrue(store.hasLoadedEntitlements)
+        XCTAssertNil(store.activePlan)
+    }
+
+    func testAnUnavailableBuildNeverEnforcesGating() throws {
+        // Mirrors ContentView: enforcement requires a store that can sell.
+        let store = SubscriptionStore(backend: UnavailableSubscriptionBackend())
+        let enforces = SubscriptionConfiguration.isEnforced(
+            environment: ["LEARNFOLD_SUBSCRIPTIONS_ENFORCED": "1"],
+            bundle: Bundle(for: SubscriptionStore.self),
+            isDirectDistMac: false
+        ) && store.purchasesAvailable
+        XCTAssertFalse(enforces)
     }
 }

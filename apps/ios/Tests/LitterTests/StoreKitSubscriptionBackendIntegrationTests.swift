@@ -1,8 +1,9 @@
+#if DEBUG
 import StoreKitTest
 import XCTest
 @testable import Litter
 
-/// Exercises the real `StoreKitSubscriptionBackend` through StoreKitTest with
+/// Exercises the debug `StoreKitSubscriptionBackend` through StoreKitTest with
 /// `Support/Learnfold.storekit`, the same file the Debug scheme uses.
 @MainActor
 final class StoreKitSubscriptionBackendIntegrationTests: XCTestCase {
@@ -41,30 +42,11 @@ final class StoreKitSubscriptionBackendIntegrationTests: XCTestCase {
         XCTAssertEqual(store.activePlan, .plus)
         XCTAssertTrue(store.hasAccess(to: .plus))
         XCTAssertFalse(store.hasAccess(to: .hosted))
-        let plusHosted = await store.hostedSignedTransaction()
-        XCTAssertNil(plusHosted, "Plus must never yield a Hosted transaction")
 
         let upgrade = await store.purchase(.hosted)
         XCTAssertEqual(upgrade, .purchased)
         XCTAssertEqual(store.activePlan, .hosted)
         XCTAssertTrue(store.hasAccess(to: .plus), "Hosted includes Plus")
-
-        // The signed transaction the Worker verifies: a three-part JWS naming
-        // this bundle and the Hosted product. Local StoreKit signs it in the
-        // "Xcode" environment, which the Worker deliberately rejects.
-        let signed = await store.hostedSignedTransaction()
-        let jws = try XCTUnwrap(signed)
-        let parts = jws.split(separator: ".")
-        XCTAssertEqual(parts.count, 3)
-        var payload = String(parts[1])
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
-        let data = try XCTUnwrap(Data(base64Encoded: payload))
-        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(json["productId"] as? String, "com.chirag.learnfold.hosted.monthly")
-        XCTAssertEqual(json["bundleId"] as? String, Bundle.main.bundleIdentifier)
-        XCTAssertEqual(json["environment"] as? String, "Xcode")
 
         await store.restore()
         XCTAssertEqual(store.activePlan, .hosted)
@@ -82,3 +64,4 @@ final class StoreKitSubscriptionBackendIntegrationTests: XCTestCase {
         XCTAssertNil(store.activePlan, "A refunded subscription must stop granting access: \(store.held)")
     }
 }
+#endif
