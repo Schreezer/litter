@@ -9,7 +9,7 @@ import { HostedTelemetry, observedProviderFetch } from "./telemetry"
 import { isAuthorized, unauthorized } from "./auth"
 import { COURSE_AGENT_PROMPT, COURSE_DISCUSSION_PROMPT, LEGACY_COURSE_AGENT_PROMPT, QUESTION_CHOICE_CAPABILITY } from "./course-prompt"
 import { createHostedModel, DEFAULT_MODEL } from "./provider"
-import { authorizeGuestRoute, enforceGuestTurnLimit, guestSession } from "./guest"
+import { authorizeGuestRoute, enforceGuestTurnLimit, guestSession, revenueCatWebhook } from "./guest"
 import { HostedTurnOwnership, awaitsClientTools, matchesPendingClientTool } from "./turn-ownership"
 export { GuestUsage } from "./guest"
 
@@ -414,6 +414,9 @@ export default {
     if (url.pathname === "/guest-session" && request.method === "POST") {
       return guestSession(request, env, env.LEARNFOLD_HOSTED_ACCESS_TOKEN)
     }
+    if (url.pathname === "/revenuecat/webhook" && request.method === "POST") {
+      return revenueCatWebhook(request, env)
+    }
     if (url.pathname === "/health" && request.method === "GET") {
       if (!await isAuthorized(request, env.LEARNFOLD_HOSTED_ACCESS_TOKEN)) return unauthorized()
       return json({
@@ -426,7 +429,8 @@ export default {
     }
 
     if (!await isAuthorized(request, env.LEARNFOLD_HOSTED_ACCESS_TOKEN)) {
-      if (env.GUEST_BETA_ENABLED !== "true") return unauthorized()
+      // Guest tokens are only minted to entitled subscribers when the free beta is
+      // off, and every turn re-checks the entitlement, so no flag check here.
       const guestRequest = await authorizeGuestRoute(request, env.LEARNFOLD_HOSTED_ACCESS_TOKEN)
       if (!guestRequest) return unauthorized()
       return (await routeAgentRequest(guestRequest, env)) ?? json({ error: "not_found" }, 404)

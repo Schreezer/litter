@@ -1,29 +1,32 @@
 import { DurableObject } from "cloudflare:workers"
 
-import { SubscriptionError, verifySignedTransaction } from "./app-store"
-import type { VerifiedTransaction } from "./app-store"
+import {
+  TERMINAL_EVENT_TYPES,
+  lookupHostedSubscriber,
+  parseWebhook,
+  revenueCatAppUserId,
+  revenueCatConfigured,
+  webhookAuthorized,
+} from "./revenuecat"
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const HEX_SECRET = /^[0-9a-f]{64}$/
 const TOKEN_TTL_SECONDS = 3600
-// A verified transaction buys at most this long of server-side entitlement; the
-// client re-presents its current transaction on every guest token exchange.
-const ENTITLEMENT_MAX_SECONDS = 24 * 3600
-const DEFAULT_GRACE_SECONDS = 3 * 24 * 3600
-const DEFAULT_BUNDLE_ID = "com.chirag.learnfold"
-const DEFAULT_HOSTED_PRODUCT = "com.chirag.learnfold.hosted.monthly"
+// A RevenueCat answer is trusted for at most this long, whatever the config says.
+const MAX_ENTITLEMENT_CACHE_SECONDS = 900
+const DEFAULT_NEGATIVE_CACHE_SECONDS = 60
+// If RevenueCat is unreachable, a subscriber last confirmed within this window
+// keeps working rather than being locked out by someone else's outage.
+const STALE_IF_ERROR_MS = 3600 * 1000
 
 // Optional configuration. All are strings because Workers vars are strings.
 type SubscriptionEnv = Env & {
-  APP_BUNDLE_ID?: string
-  HOSTED_PRODUCT_IDS?: string
-  ACCEPT_SANDBOX_TRANSACTIONS?: string
-  SUBSCRIPTION_GRACE_SECONDS?: string
   FREE_TURNS_PER_DAY?: string
   PAID_TURNS_PER_DAY?: string
   PAID_GLOBAL_TURNS_PER_DAY?: string
   MAX_GUESTS_PER_SUBSCRIPTION?: string
-  APPLE_ROOT_CAS_DER?: string
+  REVENUECAT_CACHE_SECONDS?: string
+  REVENUECAT_NEGATIVE_CACHE_SECONDS?: string
 }
 
 function intVar(value: string | undefined, fallback: number): number {
@@ -36,21 +39,26 @@ export function subscriptionRequired(env: Env): boolean {
   return (env as { REQUIRE_SUBSCRIPTION?: string }).REQUIRE_SUBSCRIPTION === "true"
 }
 
-/** Verifies a StoreKit 2 signed transaction against this deployment's config. */
-export function verifyHostedTransaction(jws: string, env: Env, now = Date.now()): Promise<VerifiedTransaction> {
+function cacheMs(env: Env): { positive: number; negative: number } {
   const config = env as SubscriptionEnv
-  const productIDs = (config.HOSTED_PRODUCT_IDS ?? DEFAULT_HOSTED_PRODUCT).split(",").map((id) => id.trim()).filter(Boolean)
-  return verifySignedTransaction(jws, {
-    bundleId: config.APP_BUNDLE_ID || DEFAULT_BUNDLE_ID,
-    products: Object.fromEntries(productIDs.map((id) => [id, "hosted"])),
-    trustedRootsDER: config.APPLE_ROOT_CAS_DER ? config.APPLE_ROOT_CAS_DER.split(",").map((item) => item.trim()) : undefined,
-    acceptSandbox: config.ACCEPT_SANDBOX_TRANSACTIONS !== "false",
-    graceMs: intVar(config.SUBSCRIPTION_GRACE_SECONDS, DEFAULT_GRACE_SECONDS) * 1000,
-    now,
-  })
+  return {
+    positive: Math.min(intVar(config.REVENUECAT_CACHE_SECONDS, MAX_ENTITLEMENT_CACHE_SECONDS), MAX_ENTITLEMENT_CACHE_SECONDS) * 1000,
+    negative: intVar(config.REVENUECAT_NEGATIVE_CACHE_SECONDS, DEFAULT_NEGATIVE_CACHE_SECONDS) * 1000,
+  }
 }
 
-export type Entitlement = { originalTransactionId: string; validUntil: number }
+/** What the Worker last learned from RevenueCat about one guest's Hosted entitlement. */
+export type CachedEntitlement = {
+  appUserId: string
+  /** RevenueCat's `original_app_user_id`; the key for the per-subscription budget and bind limit. */
+  originalAppUserId: string
+  entitled: boolean
+  /** Entitlement expiry including grace; `null` when it never expires. */
+  expiresAt: number | null
+  checkedAt: number
+}
+
+const ENTITLEMENT_TABLE = "CREATE TABLE IF NOT EXISTS hosted_entitlement (id INTEGER PRIMARY KEY, app_user_id TEXT, original TEXT, entitled INTEGER, expires_at INTEGER, checked_at INTEGER)"
 
 // One durable counter per guest, IP, or global budget. Count turns inside Think,
 // not just socket upgrades, so a persistent connection cannot bypass the cap.
@@ -68,8 +76,9 @@ export class GuestUsage extends DurableObject<Env> {
     })
   }
 
-  // `subscription:<originalTransactionId>`: bind a guest identity to one
-  // subscription. A leaked/shared transaction cannot fan out to unlimited guests.
+  // `subscription:<originalAppUserId>`: bind guest identities to one RevenueCat
+  // customer. An entitlement that RevenueCat aliases across several guest
+  // identities cannot fan out to unlimited guests.
   bindGuest(subject: string, maxGuests: number): boolean {
     const sql = this.ctx.storage.sql
     return this.ctx.storage.transactionSync(() => {
@@ -83,18 +92,46 @@ export class GuestUsage extends DurableObject<Env> {
     })
   }
 
-  // `entitlement:<guest>`: what a verified subscription currently allows.
-  setEntitlement(originalTransactionId: string, validUntil: number): void {
+  // `entitlement:<guest>`: the last RevenueCat answer for this guest. Readers
+  // decide freshness (see `resolveEntitlement`); this only stores and returns it.
+  saveEntitlement(entry: CachedEntitlement): void {
     const sql = this.ctx.storage.sql
-    sql.exec("CREATE TABLE IF NOT EXISTS entitlement (id INTEGER PRIMARY KEY, original TEXT, valid_until INTEGER)")
-    sql.exec("INSERT OR REPLACE INTO entitlement (id, original, valid_until) VALUES (1, ?, ?)", originalTransactionId, validUntil)
+    sql.exec(ENTITLEMENT_TABLE)
+    sql.exec(
+      "INSERT OR REPLACE INTO hosted_entitlement (id, app_user_id, original, entitled, expires_at, checked_at) VALUES (1, ?, ?, ?, ?, ?)",
+      entry.appUserId, entry.originalAppUserId, entry.entitled ? 1 : 0, entry.expiresAt, entry.checkedAt,
+    )
   }
 
-  entitlement(now: number): Entitlement | null {
+  cachedEntitlement(): CachedEntitlement | null {
     const sql = this.ctx.storage.sql
-    sql.exec("CREATE TABLE IF NOT EXISTS entitlement (id INTEGER PRIMARY KEY, original TEXT, valid_until INTEGER)")
-    const row = sql.exec<{ original: string; valid_until: number }>("SELECT original, valid_until FROM entitlement WHERE id = 1").toArray()[0]
-    return row && row.valid_until > now ? { originalTransactionId: row.original, validUntil: row.valid_until } : null
+    sql.exec(ENTITLEMENT_TABLE)
+    const row = sql.exec<{ app_user_id: string; original: string; entitled: number; expires_at: number | null; checked_at: number }>(
+      "SELECT app_user_id, original, entitled, expires_at, checked_at FROM hosted_entitlement WHERE id = 1",
+    ).toArray()[0]
+    return row
+      ? { appUserId: row.app_user_id, originalAppUserId: row.original, entitled: row.entitled === 1, expiresAt: row.expires_at, checkedAt: row.checked_at }
+      : null
+  }
+
+  clearEntitlement(): void {
+    const sql = this.ctx.storage.sql
+    sql.exec(ENTITLEMENT_TABLE)
+    sql.exec("DELETE FROM hosted_entitlement")
+  }
+
+  // `rc-user:<appUserId>`: maps a RevenueCat app user back to the guest it was
+  // derived from, so a webhook can refresh the right entitlement.
+  setSubject(subject: string): void {
+    const sql = this.ctx.storage.sql
+    sql.exec("CREATE TABLE IF NOT EXISTS subject (id INTEGER PRIMARY KEY, value TEXT)")
+    sql.exec("INSERT OR REPLACE INTO subject (id, value) VALUES (1, ?)", subject)
+  }
+
+  subject(): string | null {
+    const sql = this.ctx.storage.sql
+    sql.exec("CREATE TABLE IF NOT EXISTS subject (id INTEGER PRIMARY KEY, value TEXT)")
+    return sql.exec<{ value: string }>("SELECT value FROM subject WHERE id = 1").toArray()[0]?.value ?? null
   }
 }
 
@@ -127,6 +164,67 @@ export async function verifyGuestToken(token: string, secret: string, session: s
   }
 }
 
+function isFresh(entry: CachedEntitlement, env: Env, now: number): boolean {
+  const ttl = cacheMs(env)
+  if (entry.checkedAt > now) return false
+  if (!entry.entitled) return now - entry.checkedAt < ttl.negative
+  if (entry.expiresAt !== null && entry.expiresAt <= now) return false
+  return now - entry.checkedAt < ttl.positive
+}
+
+function isActive(entry: CachedEntitlement, now: number): boolean {
+  return entry.entitled && (entry.expiresAt === null || entry.expiresAt > now)
+}
+
+export type EntitlementResolution =
+  | { kind: "entitled"; entitlement: CachedEntitlement }
+  | { kind: "free" }
+  /** RevenueCat could not be asked or did not answer, and nothing recent is cached. */
+  | { kind: "unavailable" }
+
+/**
+ * Whether this guest currently holds the Hosted entitlement. Answers from the
+ * short-lived cache in the guest's `GuestUsage` object when it is fresh, and
+ * otherwise asks RevenueCat. The result is authoritative for budgets and for
+ * REQUIRE_SUBSCRIPTION; the app's own view of its plan is only a UX hint.
+ */
+export async function resolveEntitlement(
+  env: Env,
+  subject: string,
+  appUserId: string,
+  now = Date.now(),
+): Promise<EntitlementResolution> {
+  const store = env.GuestUsage.getByName(`entitlement:${subject}`)
+  const cached = await store.cachedEntitlement()
+  if (cached && cached.appUserId === appUserId && isFresh(cached, env, now)) {
+    return isActive(cached, now) ? { kind: "entitled", entitlement: cached } : { kind: "free" }
+  }
+  if (!revenueCatConfigured(env)) return { kind: "free" }
+
+  const lookup = await lookupHostedSubscriber(appUserId, env, now)
+  if (lookup.status === "error") {
+    // Keep a recently confirmed subscriber working through a RevenueCat outage.
+    if (cached && cached.appUserId === appUserId && isActive(cached, now) && now - cached.checkedAt < STALE_IF_ERROR_MS) {
+      return { kind: "entitled", entitlement: cached }
+    }
+    return { kind: "unavailable" }
+  }
+
+  const entry: CachedEntitlement = lookup.status === "active"
+    ? { appUserId, originalAppUserId: lookup.originalAppUserId, entitled: true, expiresAt: lookup.expiresAt, checkedAt: now }
+    : { appUserId, originalAppUserId: appUserId, entitled: false, expiresAt: null, checkedAt: now }
+  await store.saveEntitlement(entry)
+  await env.GuestUsage.getByName(`rc-user:${appUserId}`).setSubject(subject)
+  return entry.entitled ? { kind: "entitled", entitlement: entry } : { kind: "free" }
+}
+
+function unavailableResponse(): Response {
+  return Response.json(
+    { error: "subscription_unverifiable" },
+    { status: 503, headers: { "cache-control": "no-store" } },
+  )
+}
+
 export async function guestSession(request: Request, env: Env, signingSecret: string): Promise<Response> {
   if (!signingSecret) {
     return Response.json({ error: "Hosted guest access is temporarily unavailable." }, { status: 503 })
@@ -138,36 +236,20 @@ export async function guestSession(request: Request, env: Env, signingSecret: st
   const ipID = await hashIdentity(ip)
   const subject = await hashIdentity(secret)
 
-  // Optional proof of purchase: {"signedTransaction": "<StoreKit 2 JWS>"}.
-  let signedTransaction: string | undefined
-  if (request.headers.get("content-type")?.includes("application/json")) {
-    try {
-      const value = (await request.json<{ signedTransaction?: unknown }>()).signedTransaction
-      if (typeof value === "string" && value) signedTransaction = value
-    } catch { /* A body that is not JSON carries no transaction. */ }
-  }
-  if (signedTransaction) {
-    let verified: VerifiedTransaction
-    try {
-      verified = await verifyHostedTransaction(signedTransaction, env)
-    } catch (error) {
-      const reason = error instanceof SubscriptionError ? error.reason : "malformed"
-      return Response.json({ error: "subscription_invalid", reason }, { status: 402, headers: { "cache-control": "no-store" } })
-    }
+  // The subscriber is identified by a value derived from the secret this very
+  // request authenticates with, so a caller can only ever look up their own.
+  const resolution = await resolveEntitlement(env, subject, await revenueCatAppUserId(secret))
+  if (resolution.kind === "entitled") {
     const config = env as SubscriptionEnv
-    if (!await env.GuestUsage.getByName(`subscription:${verified.originalTransactionId}`)
+    if (!await env.GuestUsage.getByName(`subscription:${resolution.entitlement.originalAppUserId}`)
       .bindGuest(subject, intVar(config.MAX_GUESTS_PER_SUBSCRIPTION, 3))) {
       return Response.json({ error: "subscription_in_use", reason: "too_many_devices" }, { status: 409, headers: { "cache-control": "no-store" } })
     }
-    const now = Date.now()
-    const graceMs = intVar(config.SUBSCRIPTION_GRACE_SECONDS, DEFAULT_GRACE_SECONDS) * 1000
-    const validUntil = Math.min(verified.expiresDate + graceMs, now + ENTITLEMENT_MAX_SECONDS * 1000)
-    await env.GuestUsage.getByName(`entitlement:${subject}`).setEntitlement(verified.originalTransactionId, validUntil)
-  } else if (subscriptionRequired(env)
-    && !await env.GuestUsage.getByName(`entitlement:${subject}`).entitlement(Date.now())) {
-    return Response.json({ error: "subscription_required" }, { status: 402, headers: { "cache-control": "no-store" } })
-  } else if (env.GUEST_BETA_ENABLED !== "true"
-    && !await env.GuestUsage.getByName(`entitlement:${subject}`).entitlement(Date.now())) {
+  } else if (subscriptionRequired(env)) {
+    return resolution.kind === "unavailable"
+      ? unavailableResponse()
+      : Response.json({ error: "subscription_required" }, { status: 402, headers: { "cache-control": "no-store" } })
+  } else if (env.GUEST_BETA_ENABLED !== "true") {
     return Response.json({ error: "Hosted guest access is temporarily unavailable." }, { status: 503 })
   }
   if (!await env.GuestUsage.getByName(`bootstrap:${ipID}`).consume(120)) {
@@ -194,18 +276,27 @@ export async function enforceGuestTurnLimit(name: string, env: Env): Promise<voi
   const subject = name.match(/^guest-([0-9a-f]{64})-/)?.[1]
   if (!subject) return
   const config = env as SubscriptionEnv
-  // Authoritative entitlement decision. Set only by guestSession() after a
-  // signed App Store transaction verified; it expires on its own.
-  const entitlement = await env.GuestUsage.getByName(`entitlement:${subject}`).entitlement(Date.now())
-  if (entitlement) {
+  // Authoritative entitlement decision. Only guestSession() creates a cache
+  // entry (a guest that never exchanged a token has none and is free). A stale
+  // subscriber entry is re-checked with RevenueCat, so a connection that
+  // outlives the cache still gets the right budget and a lapsed subscription
+  // stops within one cache window.
+  const known = await env.GuestUsage.getByName(`entitlement:${subject}`).cachedEntitlement()
+  const resolution = known && (known.entitled || subscriptionRequired(env))
+    ? await resolveEntitlement(env, subject, known.appUserId)
+    : { kind: "free" } as const
+  if (resolution.kind === "entitled") {
     // Budget is per subscription, so several bound guests cannot multiply it.
-    if (!await env.GuestUsage.getByName(`turns:sub:${entitlement.originalTransactionId}`).consume(intVar(config.PAID_TURNS_PER_DAY, 150))) {
+    if (!await env.GuestUsage.getByName(`turns:sub:${resolution.entitlement.originalAppUserId}`).consume(intVar(config.PAID_TURNS_PER_DAY, 150))) {
       throw new Error("You've reached today's Hosted limit for your subscription. Your course is saved. Please continue tomorrow.")
     }
     if (!await env.GuestUsage.getByName("turns:global:paid").consume(intVar(config.PAID_GLOBAL_TURNS_PER_DAY, 5000))) {
       throw new Error("Hosted has reached today's capacity. Your course is saved. Please continue tomorrow.")
     }
     return
+  }
+  if (resolution.kind === "unavailable") {
+    throw new Error("Hosted couldn't confirm your subscription right now. Your course is saved. Please try again in a few minutes.")
   }
   if (subscriptionRequired(env)) {
     throw new Error("Hosted needs an active Learnfold Hosted subscription. Open Settings > Plan to subscribe, or choose another agent.")
@@ -217,4 +308,49 @@ export async function enforceGuestTurnLimit(name: string, env: Env): Promise<voi
   if (!await env.GuestUsage.getByName("turns:global").consume(1000)) {
     throw new Error("Hosted has reached today's capacity. Your course is saved. Please continue tomorrow.")
   }
+}
+
+/**
+ * `POST /revenuecat/webhook`. RevenueCat calls this on purchases, renewals,
+ * cancellations, expirations, billing issues, refunds and transfers. The body
+ * is never trusted for entitlement state: the event only names app users whose
+ * entitlement the Worker then re-reads from RevenueCat.
+ */
+export async function revenueCatWebhook(request: Request, env: Env): Promise<Response> {
+  if (!await webhookAuthorized(request, env)) {
+    return Response.json({ error: "unauthorized" }, { status: 401, headers: { "cache-control": "no-store" } })
+  }
+  let body: unknown
+  try {
+    body = await request.json()
+  } catch {
+    return Response.json({ error: "invalid_body" }, { status: 400, headers: { "cache-control": "no-store" } })
+  }
+  const event = parseWebhook(body)
+  if (!event) return Response.json({ error: "invalid_body" }, { status: 400, headers: { "cache-control": "no-store" } })
+
+  let refreshed = 0
+  for (const appUserId of event.appUserIds) {
+    const subject = await env.GuestUsage.getByName(`rc-user:${appUserId}`).subject()
+    if (!subject) continue // This user never opened a Hosted session; nothing is cached.
+    const store = env.GuestUsage.getByName(`entitlement:${subject}`)
+    const lookup = revenueCatConfigured(env) ? await lookupHostedSubscriber(appUserId, env) : { status: "error" } as const
+    if (lookup.status === "error") {
+      // Could not read the truth. After an event that ends access, do not leave
+      // the old grant in place; after anything else the short cache covers it.
+      if (TERMINAL_EVENT_TYPES.has(event.type)) await store.clearEntitlement()
+    } else if (lookup.status === "active") {
+      await store.saveEntitlement({
+        appUserId,
+        originalAppUserId: lookup.originalAppUserId,
+        entitled: true,
+        expiresAt: lookup.expiresAt,
+        checkedAt: Date.now(),
+      })
+    } else {
+      await store.saveEntitlement({ appUserId, originalAppUserId: appUserId, entitled: false, expiresAt: null, checkedAt: Date.now() })
+    }
+    refreshed++
+  }
+  return Response.json({ ok: true, refreshed }, { headers: { "cache-control": "no-store" } })
 }

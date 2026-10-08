@@ -34,26 +34,42 @@ Guest access supports only chat WebSocket upgrades. Durable counters allow 120 t
 
 `LEARNFOLD_HOSTED_ACCESS_TOKEN` and the corresponding `LearnfoldHostedAccessToken` Info.plist key remain optional runtime overrides for existing private tests. An explicitly empty environment override clears the bundled value. Never put a real shared token in a shipped build. Guest identity is device-local; account-based sync and guest-to-account migration are separate features.
 
-## Paid tier (App Store subscriptions)
+## Paid tier (RevenueCat subscriptions)
 
-Hosted is the paid `Learnfold Hosted` subscription (`com.chirag.learnfold.hosted.monthly`). The Worker, not the app, decides who may use it. The app sends the StoreKit 2 signed transaction (JWS) to the existing guest exchange as a JSON body, `POST /guest-session?sessionId=<uuid>` with `Authorization: Guest <secret>` and `{"signedTransaction": "<JWS>"}`. `src/app-store.ts` verifies it offline, with no call to Apple: the `x5c` chain must end in the pinned Apple Root CA - G3 (SHA-256 `63343abf...e9179`) and carry Apple's marker OIDs, each certificate must be signed by the next and valid, the ES256 signature must verify under the leaf, `bundleId` must match, `productId` must be a configured Hosted product, the type must be an auto-renewable subscription, there must be no `revocationDate`, and the subscription must not be expired beyond the grace window. Failures return `402 {"error":"subscription_invalid","reason":...}`.
+Hosted is the paid `Learnfold Hosted` subscription (`com.chirag.learnfold.hosted.monthly`), sold through the App Store and managed by RevenueCat. The Worker, not the app, decides who may use it, and the app sends no proof of purchase. At `POST /guest-session` the Worker already receives the installation's guest secret (`Authorization: Guest <secret>`). It derives the subscriber's RevenueCat app user ID from that secret and asks RevenueCat server to server:
 
-A verified transaction stores a server-side entitlement for that guest identity (`entitlement:<guest>` in the `GuestUsage` Durable Object) that lasts until `min(expiresDate + grace, now + 24h)`. The app re-presents its current transaction on every token exchange, so renewals extend it and refunds/revocations/lapses stop it within a day. `enforceGuestTurnLimit` consults it on every turn, including continuations, so a still-valid one-hour token cannot outlive the entitlement by more than that bound. The turn budget is per subscription (`turns:sub:<originalTransactionId>`), and one subscription binds at most `MAX_GUESTS_PER_SUBSCRIPTION` guest identities, so a leaked transaction cannot fan out. The existing per-IP exchange limit still applies. The Worker stores only the hashed guest id, the numeric `originalTransactionId`, the expiry and counters.
+```
+appUserId = "lf1_" + hex(SHA-256("learnfold.revenuecat.app-user.v1:" + guestSecret))
+GET https://api.revenuecat.com/v1/subscribers/{appUserId}     Authorization: Bearer <REVENUECAT_SECRET_API_KEY>
+```
 
-Plus (`com.chirag.learnfold.plus.monthly`, bring-your-own runtime) is not enforced here: those agents never touch this Worker, so the app gates them locally.
+The iOS app computes the same ID (`HostedGuestIdentity.revenueCatAppUserID(secret:)`) and passes it to the RevenueCat SDK, so a purchase made in the app lands on the ID the Worker looks up. A shared test vector pins both sides. The ID is one-way and domain separated: RevenueCat never sees the guest secret or the `guest-<sha256(secret)>` conversation namespace. Because the lookup key comes from the secret that authenticates the request, one install cannot claim another's entitlement. Nothing about the subscriber's name or Apple ID reaches the Worker.
+
+`src/revenuecat.ts` treats the `hosted` entitlement as active when `expires_date` is in the future, or its `grace_period_expires_date` is (billing retry), or `expires_date` is `null` (a non-expiring grant, for example a promotional entitlement for an App Review account). Refunded subscriptions are rejected. Sandbox purchases, which App Review and TestFlight make, are accepted unless `ACCEPT_SANDBOX_TRANSACTIONS` is `"false"`. Plus-only customers have no `hosted` entitlement and are treated as free here.
+
+The answer is cached per guest in the `GuestUsage` Durable Object (`entitlement:<guest>`): at most 15 minutes for a subscriber (`REVENUECAT_CACHE_SECONDS` can only lower that), 60 seconds for a guest with no entitlement so a new purchase is noticed quickly. `enforceGuestTurnLimit` runs on every turn and continuation and re-checks a stale subscriber entry with RevenueCat, so a long-lived connection cannot outlive a lapsed subscription by more than the cache window. If RevenueCat is unreachable, a subscriber confirmed within the last hour keeps working; otherwise the Worker answers `503 subscription_unverifiable` when a subscription is required (never `402`, which would wrongly tell a subscriber to pay again). The turn budget is per RevenueCat customer (`turns:sub:<original_app_user_id>`), and one customer binds at most `MAX_GUESTS_PER_SUBSCRIPTION` guest identities. The Worker stores only hashed IDs, the RevenueCat `original_app_user_id`, the expiry and counters.
+
+`POST /revenuecat/webhook` keeps this fresh. Configure it in RevenueCat (Project settings > Integrations > Webhooks) with the `Authorization` header value set to the same string as `REVENUECAT_WEBHOOK_SECRET`; the Worker accepts that string verbatim or as `Bearer <secret>` and compares it in constant time. The event body is not trusted for entitlement state. It only names app users, and the Worker re-reads each from RevenueCat (so purchases take effect at once, and expirations, cancellations, billing issues and refunds revoke at once). If RevenueCat cannot be read right after one of those events, the cached grant is dropped. Always answers `200` once authenticated so RevenueCat does not retry.
+
+Plus (`com.chirag.learnfold.plus.monthly`, bring-your-own runtime) is not enforced here: those agents never touch this Worker, so the app gates them locally from RevenueCat's `plus` entitlement.
+
+Secrets (`npx wrangler secret put <NAME>`):
+
+- `REVENUECAT_SECRET_API_KEY`: RevenueCat v1 **secret** API key (`sk_...`, Project settings > API keys). Without it the Worker never calls RevenueCat and every guest is on the free path. The public SDK key (`appl_...`) belongs in the iOS build, never here.
+- `REVENUECAT_WEBHOOK_SECRET`: shared secret for `POST /revenuecat/webhook`. Without it the endpoint rejects everything.
 
 Optional vars (all strings; defaults in parentheses):
 
-- `REQUIRE_SUBSCRIPTION` (`"false"`): when `"true"`, free guests get `402 subscription_required` at exchange and are refused at every turn; only entitled guests proceed. Leave `"false"` until a build that sends transactions is live, otherwise you lock out current beta users. When `"false"` behavior is unchanged and a verified transaction simply raises the daily budget.
-- `GUEST_BETA_ENABLED` (`"true"`): now only governs the free (unsubscribed) guest path. Entitled guests keep working when it is `"false"`.
-- `APP_BUNDLE_ID` (`com.chirag.learnfold`), `HOSTED_PRODUCT_IDS` (`com.chirag.learnfold.hosted.monthly`, comma separated, add yearly IDs here).
-- `ACCEPT_SANDBOX_TRANSACTIONS` (`"true"`): App Review and TestFlight purchases are signed with the `Sandbox` environment. Xcode StoreKit-file transactions never verify. Set `"false"` only if sandbox access should stop.
-- `SUBSCRIPTION_GRACE_SECONDS` (`259200`, three days): extra time past `expiresDate` for Apple's billing-retry grace period. The Worker cannot see Apple's grace state without the App Store Server API, so this approximates it.
-- `FREE_TURNS_PER_DAY` (`60`), `PAID_TURNS_PER_DAY` (`150`, per subscription), `PAID_GLOBAL_TURNS_PER_DAY` (`5000`; free guests keep their own `1000` global budget so they cannot starve subscribers).
+- `REQUIRE_SUBSCRIPTION` (`"false"`): when `"true"`, guests without the `hosted` entitlement get `402 subscription_required` at exchange and are refused at every turn; only subscribers proceed. Leave `"false"` until a build with purchases is live, otherwise you lock out current beta users. When `"false"` behavior is unchanged and a subscriber simply gets the larger daily budget.
+- `GUEST_BETA_ENABLED` (`"true"`): only governs the free (unsubscribed) guest path. Subscribers keep working when it is `"false"`.
+- `ACCEPT_SANDBOX_TRANSACTIONS` (`"true"`): App Review and TestFlight purchases are Sandbox. Set `"false"` only if sandbox access should stop.
+- `REVENUECAT_HOSTED_ENTITLEMENT` (`hosted`): the RevenueCat entitlement identifier that grants Hosted.
+- `REVENUECAT_CACHE_SECONDS` (`900`, capped at 900), `REVENUECAT_NEGATIVE_CACHE_SECONDS` (`60`).
+- `REVENUECAT_API_BASE_URL` (`https://api.revenuecat.com/v1`): for tests and proxies only.
+- `FREE_TURNS_PER_DAY` (`60`), `PAID_TURNS_PER_DAY` (`150`, per customer), `PAID_GLOBAL_TURNS_PER_DAY` (`5000`; free guests keep their own `1000` global budget so they cannot starve subscribers).
 - `MAX_GUESTS_PER_SUBSCRIPTION` (`3`).
-- `APPLE_ROOT_CAS_DER`: comma-separated base64 DER roots that replace the pinned Apple root. For test deployments only.
 
-Not implemented: App Store Server Notifications (V2) webhooks and live revocation lookups. Revocation is detected when the client next exchanges a token. That is the main follow-up if refund abuse matters.
+RevenueCat's REST API is rate limited, and `GET /v1/subscribers/{id}` creates the subscriber if RevenueCat has never seen the ID (the app's SDK normally has, so this adds nothing). The caches above keep the call volume to roughly one request per active guest per cache window.
 
 ## Diagnosing slow replies
 

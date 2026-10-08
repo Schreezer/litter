@@ -1,3 +1,7 @@
 # Copy to .dev.vars for local development. Never commit real values.
 OPENCODE_API_KEY=replace-with-a-wrangler-secret
 LEARNFOLD_HOSTED_ACCESS_TOKEN=replace-with-an-independent-client-access-token
+# RevenueCat (optional locally; without the secret key every guest is free).
+# REVENUECAT_SECRET_API_KEY is a v1 secret key (sk_...), never the public SDK key.
+REVENUECAT_SECRET_API_KEY=replace-with-a-wrangler-secret
+REVENUECAT_WEBHOOK_SECRET=replace-with-a-wrangler-secret
