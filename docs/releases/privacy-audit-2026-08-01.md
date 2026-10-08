@@ -61,6 +61,15 @@ Before App Store submission, resolve the remaining import gap by one of these tr
 
 Do not substitute the system SQLite 3.51.0 or claim `E174.1` merely to pass validation.
 
+## Addendum 2026-10-08: RevenueCat SDK (purchases-ios 5.93.0)
+
+The paid-tier work adds RevenueCat as a statically linked SPM dependency. Result: the Required Reason API picture does not change.
+
+- RevenueCat's bundled manifest (`RevenueCat_RevenueCat.bundle/PrivacyInfo.xcprivacy`, copied into the app) declares only User Defaults `CA92.1` and collected Purchase History (App Functionality, not tracking). The app manifest already declares User Defaults `CA92.1`, so the reason set is consistent.
+- Scan of the SDK's compiled object (`RevenueCat.o`, simulator Debug build) for covered-API imports: no `stat`/`fstat`/`statfs`/`statvfs`/`getattrlist`, no `mach_absolute_time`/`systemUptime`/boot-time `sysctl`, no volume-capacity or file-timestamp APIs, no active-keyboard APIs. Only UserDefaults use appears. The existing `_fstatfs`/`_fstatvfs`/`_statfs` gap above (SQLite and the iSH bridge) is unchanged and still open.
+- This was not a Release archive scan. Re-run the symbol check on the next Release archive before submission.
+- App-level `PrivacyInfo.xcprivacy` now also declares User ID and Purchase History as collected, linked, not tracking, App Functionality. The Xcode privacy report for the next archive should list them with Device ID and Product Interaction. The App Store label answers are in `docs/releases/app-review-notes.md`.
+
 ## References
 
 - [Apple: Describing data use in privacy manifests](https://developer.apple.com/documentation/bundleresources/describing-data-use-in-privacy-manifests)
